@@ -1557,7 +1557,10 @@ impl Editor {
     }
 
     /// Replace the current match in interactive replace mode
-    pub(super) fn replace_current_match(&mut self, ir_state: &InteractiveReplaceState) -> std::io::Result<()> {
+    pub(super) fn replace_current_match(
+        &mut self,
+        ir_state: &InteractiveReplaceState,
+    ) -> std::io::Result<()> {
         let match_pos = ir_state.current_match_pos;
         let search_len = ir_state.search.len();
         let range = match_pos..(match_pos + search_len);

@@ -2156,7 +2156,12 @@ impl Editor {
     }
 
     /// Handle mouse wheel scroll event
-    pub(super) fn handle_mouse_scroll(&mut self, col: u16, row: u16, delta: i32) -> std::io::Result<()> {
+    pub(super) fn handle_mouse_scroll(
+        &mut self,
+        col: u16,
+        row: u16,
+        delta: i32,
+    ) -> std::io::Result<()> {
         // Check if scroll is over the file explorer
         if let Some(explorer_area) = self.cached_layout.file_explorer_area {
             if col >= explorer_area.x
@@ -2652,5 +2657,4 @@ impl Editor {
 
         Ok(())
     }
-
 }

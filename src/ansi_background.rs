@@ -64,13 +64,7 @@ impl AnsiBackground {
     }
 
     /// Get a faded background color for the given coordinate, wrapping if necessary
-    pub fn faded_color(
-        &self,
-        x: usize,
-        y: usize,
-        base_bg: Color,
-        opacity: f32,
-    ) -> Option<Color> {
+    pub fn faded_color(&self, x: usize, y: usize, base_bg: Color, opacity: f32) -> Option<Color> {
         if self.width == 0 || self.height == 0 {
             return None;
         }
@@ -94,7 +88,9 @@ impl AnsiBackground {
 fn blend_channel(fg: u8, bg: u8, opacity: f32) -> u8 {
     let fg_f = fg as f32;
     let bg_f = bg as f32;
-    ((fg_f * opacity) + (bg_f * (1.0 - opacity))).round().clamp(0.0, 255.0) as u8
+    ((fg_f * opacity) + (bg_f * (1.0 - opacity)))
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 fn color_to_rgb(color: Color) -> Option<(u8, u8, u8)> {

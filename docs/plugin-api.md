@@ -596,6 +596,22 @@ openFileInSplit(split_id: number, path: string, line: number, column: number): b
 | `line` | `number` | Line number to jump to (0 for no jump) |
 | `column` | `number` | Column number to jump to (0 for no jump) |
 
+#### `sendLspRequest`
+
+Send an arbitrary LSP request and receive the raw JSON response
+
+```typescript
+sendLspRequest(language: string, method: string, params?: unknown | null): Promise<unknown>
+```
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `language` | `string` | Language ID (e.g., "cpp") |
+| `method` | `string` | Full LSP method (e.g., "textDocument/switchSourceHeader") |
+| `params` | `unknown | null` (optional) | Optional request payload |
+
 ### Async Operations
 
 #### `spawnProcess`

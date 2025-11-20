@@ -352,7 +352,8 @@ impl Editor {
                     if let Some(runtime) = &self.tokio_runtime {
                         let path_clone = dir_path.clone();
                         let selected_id = selected_id;
-                        let result = runtime.block_on(async { tokio::fs::create_dir(&path_clone).await });
+                        let result =
+                            runtime.block_on(async { tokio::fs::create_dir(&path_clone).await });
 
                         match result {
                             Ok(_) => {
@@ -431,7 +432,8 @@ impl Editor {
                         .unwrap_or_else(|| old_path.clone());
 
                     if let Some(runtime) = &self.tokio_runtime {
-                        let result = runtime.block_on(async { tokio::fs::rename(&old_path, &new_path).await });
+                        let result = runtime
+                            .block_on(async { tokio::fs::rename(&old_path, &new_path).await });
 
                         match result {
                             Ok(_) => {
@@ -443,7 +445,10 @@ impl Editor {
 
                                 let tree = explorer.tree_mut();
                                 let _ = runtime.block_on(tree.refresh_node(parent_id));
-                                self.set_status_message(format!("Renamed {} to {}", old_name, new_name));
+                                self.set_status_message(format!(
+                                    "Renamed {} to {}",
+                                    old_name, new_name
+                                ));
                             }
                             Err(e) => {
                                 self.set_status_message(format!("Error renaming: {}", e));

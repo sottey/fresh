@@ -1,7 +1,7 @@
 //! Split pane layout and buffer rendering
 
-use crate::ansi_background::AnsiBackground;
 use crate::ansi::AnsiParser;
+use crate::ansi_background::AnsiBackground;
 use crate::cursor::SelectionMode;
 use crate::editor::BufferMetadata;
 use crate::event::{BufferId, EventLog, SplitDirection};
