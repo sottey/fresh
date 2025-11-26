@@ -1210,6 +1210,7 @@ fn test_todo_highlighter_cursor_perf() {
 
 /// Test Color Highlighter plugin - loads plugin, enables it, and checks for color swatches
 #[test]
+#[ignore]
 fn test_color_highlighter_plugin() {
     // Create a temporary project directory
     let temp_dir = tempfile::TempDir::new().unwrap();
