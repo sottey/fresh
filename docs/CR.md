@@ -6,6 +6,7 @@
 - ~~src/app/mod.rs:3284 — `process_async_messages` ~680 lines~~ → Refactored into `src/app/async_messages.rs` with domain-grouped handlers (LSP, file system, file explorer, plugins)
 - ~~src/input/multi_cursor.rs — duplicate add-cursor helpers~~ → Extracted shared helpers (get_cursor_line_info, cursor_position_on_line, success_result, adjust_position_for_newline)
 - ~~src/input/actions.rs:1400+ — repeated collect-and-apply patterns~~ → Extracted `apply_deletions` helper (eliminated 8 duplicate 7-line blocks)
+- ~~src/primitives/highlighter.rs:530 — `highlight_color` ~150 lines~~ → Converted to data-driven lookup with `DEFAULT_HIGHLIGHT_COLORS` and `TYPESCRIPT_HIGHLIGHT_COLORS` arrays
 
 ## Large Functions
 - src/view/ui/split_rendering.rs:1135 — `render_view_lines` is ~750 lines; consider breaking into smaller helpers for different rendering concerns.
@@ -19,7 +20,6 @@
 - src/config.rs:566 — `default_menus` is a 420-line literal definition. Consider moving menu data to structured config or a table to make changes easier to diff/test and to avoid bloating code with data.
 - src/view/viewport.rs:521 — `ensure_visible` runs ~230 lines of layout math and clamping in one method; breaking into smaller helpers (e.g., horizontal/vertical logic, scroll computations) would make correctness checks and future changes safer.
 - src/input/keybindings.rs:1196 — `format_action` spans ~200 lines mirroring `from_str`; another sign a data-driven action registry would reduce duplication and risk of drift.
-- src/primitives/highlighter.rs:530 — `highlight_color` is a 150+ line chain of style cases; converting to data (token -> color face) would reduce branching and help ensure new scopes get covered.
 - src/primitives/ansi.rs:135 — `parse_sgr_params` is a 150+ line parser built as one function; consider splitting handling for color vs modifier codes to simplify reasoning and reduce risk of missing cases.
 - src/view/ui/view_pipeline.rs:134 — `next` is a 160+ line iterator step that handles multiple line types and wrapping; decomposing per-case helpers would make it easier to verify wrapping and newline behaviors.
 - src/model/buffer.rs:575 — `get_text_range_mut` is a 160+ line method with intertwined chunk handling, file streaming, and cache management. The dense control flow increases the risk of off-by-one or range bugs; extract helpers per buffer variant (loaded vs unloaded) and centralize bounds checks.
@@ -27,7 +27,6 @@
 - src/view/ui/file_explorer.rs:148 — renderer calls `view.tree().get_node(node_id).expect("Node should exist")`. A desynced tree (e.g., after FS errors or refresh races) will panic the UI; prefer graceful fallback or placeholder row.
 - src/view/file_tree/tree.rs:138 — `expand_node` uses `self.get_node(id).unwrap()` while doing async FS reads. If the node was removed between calls, this panics instead of returning an IO error; return a proper error for missing nodes to avoid crashing the explorer.
 - src/view/ui/status_bar.rs:149 — `render_status` pulls cursor info with ad-hoc line iteration and cached line numbers in a long method; consider extracting helpers for cursor position and diagnostics summary to reduce the ~200-line render method complexity.
-- src/input/actions.rs:1400+ — large match arms with repeated collect-and-apply patterns for deletion/transposition. Consider helper routines for common selection/range collection to reduce duplication and the risk of inconsistent behavior across actions.
 - src/model/cursor.rs:220 — `primary()`/`primary_mut()` use `expect("Primary cursor should always exist")`. If a bug ever removes the primary cursor (e.g., during multi-cursor deletion), the editor will panic. Prefer returning an error or recreating a primary cursor to keep the UI alive.
 - src/model/marker_tree.rs:494/509/512/517/etc. — AVL rotations and queries use unchecked `unwrap()` on child pointers. Any tree corruption (e.g., from earlier logic bugs) will panic. Consider defensive checks or debug assertions gated for release builds to avoid crashing the editor.
 - src/view/split.rs:162 — `ensure_layout` returns `self.layout.as_ref().unwrap()`. If callers forget to call `ensure_layout` before `get_layout` usage, rendering will panic. Consider returning `Option<&Layout>` or asserting via a Result to make misuse harder in production.

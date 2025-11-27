@@ -5,6 +5,30 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+/// Standard ANSI colors (codes 30-37 for fg, 40-47 for bg)
+const STANDARD_COLORS: [Color; 8] = [
+    Color::Black,   // 0
+    Color::Red,     // 1
+    Color::Green,   // 2
+    Color::Yellow,  // 3
+    Color::Blue,    // 4
+    Color::Magenta, // 5
+    Color::Cyan,    // 6
+    Color::Gray,    // 7
+];
+
+/// Bright ANSI colors (codes 90-97 for fg, 100-107 for bg)
+const BRIGHT_COLORS: [Color; 8] = [
+    Color::DarkGray,     // 0
+    Color::LightRed,     // 1
+    Color::LightGreen,   // 2
+    Color::LightYellow,  // 3
+    Color::LightBlue,    // 4
+    Color::LightMagenta, // 5
+    Color::LightCyan,    // 6
+    Color::White,        // 7
+];
+
 /// Result of parsing a single character or escape sequence
 #[derive(Debug, Clone)]
 pub enum AnsiToken {
@@ -146,11 +170,12 @@ impl AnsiParser {
 
         let mut i = 0;
         while i < params.len() {
-            match params[i] {
+            let code = params[i];
+            match code {
                 // Reset
                 0 => self.current_style = Style::default(),
 
-                // Text attributes
+                // Text attributes (add)
                 1 => self.current_style = self.current_style.add_modifier(Modifier::BOLD),
                 2 => self.current_style = self.current_style.add_modifier(Modifier::DIM),
                 3 => self.current_style = self.current_style.add_modifier(Modifier::ITALIC),
@@ -160,7 +185,7 @@ impl AnsiParser {
                 8 => self.current_style = self.current_style.add_modifier(Modifier::HIDDEN),
                 9 => self.current_style = self.current_style.add_modifier(Modifier::CROSSED_OUT),
 
-                // Reset attributes
+                // Text attributes (remove)
                 21 => self.current_style = self.current_style.remove_modifier(Modifier::BOLD),
                 22 => {
                     self.current_style = self
@@ -173,116 +198,79 @@ impl AnsiParser {
                 25 => self.current_style = self.current_style.remove_modifier(Modifier::SLOW_BLINK),
                 27 => self.current_style = self.current_style.remove_modifier(Modifier::REVERSED),
                 28 => self.current_style = self.current_style.remove_modifier(Modifier::HIDDEN),
-                29 => {
-                    self.current_style = self.current_style.remove_modifier(Modifier::CROSSED_OUT)
-                }
+                29 => self.current_style = self.current_style.remove_modifier(Modifier::CROSSED_OUT),
 
                 // Standard foreground colors (30-37)
-                30 => self.current_style = self.current_style.fg(Color::Black),
-                31 => self.current_style = self.current_style.fg(Color::Red),
-                32 => self.current_style = self.current_style.fg(Color::Green),
-                33 => self.current_style = self.current_style.fg(Color::Yellow),
-                34 => self.current_style = self.current_style.fg(Color::Blue),
-                35 => self.current_style = self.current_style.fg(Color::Magenta),
-                36 => self.current_style = self.current_style.fg(Color::Cyan),
-                37 => self.current_style = self.current_style.fg(Color::Gray),
+                30..=37 => {
+                    self.current_style =
+                        self.current_style.fg(STANDARD_COLORS[(code - 30) as usize])
+                }
+
+                // Extended foreground color (38;5;n or 38;2;r;g;b)
+                38 => i += Self::parse_extended_color(&params[i..], &mut self.current_style, true),
 
                 // Default foreground
                 39 => self.current_style = self.current_style.fg(Color::Reset),
 
                 // Standard background colors (40-47)
-                40 => self.current_style = self.current_style.bg(Color::Black),
-                41 => self.current_style = self.current_style.bg(Color::Red),
-                42 => self.current_style = self.current_style.bg(Color::Green),
-                43 => self.current_style = self.current_style.bg(Color::Yellow),
-                44 => self.current_style = self.current_style.bg(Color::Blue),
-                45 => self.current_style = self.current_style.bg(Color::Magenta),
-                46 => self.current_style = self.current_style.bg(Color::Cyan),
-                47 => self.current_style = self.current_style.bg(Color::Gray),
+                40..=47 => {
+                    self.current_style =
+                        self.current_style.bg(STANDARD_COLORS[(code - 40) as usize])
+                }
+
+                // Extended background color (48;5;n or 48;2;r;g;b)
+                48 => i += Self::parse_extended_color(&params[i..], &mut self.current_style, false),
 
                 // Default background
                 49 => self.current_style = self.current_style.bg(Color::Reset),
 
                 // Bright foreground colors (90-97)
-                90 => self.current_style = self.current_style.fg(Color::DarkGray),
-                91 => self.current_style = self.current_style.fg(Color::LightRed),
-                92 => self.current_style = self.current_style.fg(Color::LightGreen),
-                93 => self.current_style = self.current_style.fg(Color::LightYellow),
-                94 => self.current_style = self.current_style.fg(Color::LightBlue),
-                95 => self.current_style = self.current_style.fg(Color::LightMagenta),
-                96 => self.current_style = self.current_style.fg(Color::LightCyan),
-                97 => self.current_style = self.current_style.fg(Color::White),
-
-                // Bright background colors (100-107)
-                100 => self.current_style = self.current_style.bg(Color::DarkGray),
-                101 => self.current_style = self.current_style.bg(Color::LightRed),
-                102 => self.current_style = self.current_style.bg(Color::LightGreen),
-                103 => self.current_style = self.current_style.bg(Color::LightYellow),
-                104 => self.current_style = self.current_style.bg(Color::LightBlue),
-                105 => self.current_style = self.current_style.bg(Color::LightMagenta),
-                106 => self.current_style = self.current_style.bg(Color::LightCyan),
-                107 => self.current_style = self.current_style.bg(Color::White),
-
-                // 256-color and RGB modes
-                38 => {
-                    // Foreground color
-                    if i + 1 < params.len() {
-                        match params[i + 1] {
-                            5 => {
-                                // 256-color mode: ESC[38;5;nm
-                                if i + 2 < params.len() {
-                                    self.current_style =
-                                        self.current_style.fg(Color::Indexed(params[i + 2]));
-                                    i += 2;
-                                }
-                            }
-                            2 => {
-                                // RGB mode: ESC[38;2;r;g;bm
-                                if i + 4 < params.len() {
-                                    self.current_style = self.current_style.fg(Color::Rgb(
-                                        params[i + 2],
-                                        params[i + 3],
-                                        params[i + 4],
-                                    ));
-                                    i += 4;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+                90..=97 => {
+                    self.current_style =
+                        self.current_style.fg(BRIGHT_COLORS[(code - 90) as usize])
                 }
 
-                48 => {
-                    // Background color
-                    if i + 1 < params.len() {
-                        match params[i + 1] {
-                            5 => {
-                                // 256-color mode: ESC[48;5;nm
-                                if i + 2 < params.len() {
-                                    self.current_style =
-                                        self.current_style.bg(Color::Indexed(params[i + 2]));
-                                    i += 2;
-                                }
-                            }
-                            2 => {
-                                // RGB mode: ESC[48;2;r;g;bm
-                                if i + 4 < params.len() {
-                                    self.current_style = self.current_style.bg(Color::Rgb(
-                                        params[i + 2],
-                                        params[i + 3],
-                                        params[i + 4],
-                                    ));
-                                    i += 4;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+                // Bright background colors (100-107)
+                100..=107 => {
+                    self.current_style =
+                        self.current_style.bg(BRIGHT_COLORS[(code - 100) as usize])
                 }
 
                 _ => {} // Ignore unknown codes
             }
             i += 1;
+        }
+    }
+
+    /// Parse extended color sequences (256-color or RGB)
+    /// Returns the number of additional parameters consumed
+    fn parse_extended_color(params: &[u8], style: &mut Style, is_foreground: bool) -> usize {
+        if params.len() < 2 {
+            return 0;
+        }
+
+        match params[1] {
+            // 256-color mode: code;5;n
+            5 if params.len() >= 3 => {
+                let color = Color::Indexed(params[2]);
+                *style = if is_foreground {
+                    style.fg(color)
+                } else {
+                    style.bg(color)
+                };
+                2
+            }
+            // RGB mode: code;2;r;g;b
+            2 if params.len() >= 5 => {
+                let color = Color::Rgb(params[2], params[3], params[4]);
+                *style = if is_foreground {
+                    style.fg(color)
+                } else {
+                    style.bg(color)
+                };
+                4
+            }
+            _ => 0,
         }
     }
 }
