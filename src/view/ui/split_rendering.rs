@@ -1579,7 +1579,8 @@ impl SplitRenderer {
                             // IMPORTANT: If the cursor is on this ANSI byte, track it
                             if let Some(bp) = byte_pos {
                                 if bp == primary_cursor_position && !have_cursor {
-                                    cursor_screen_x = gutter_width as u16 + visible_char_count as u16;
+                                    cursor_screen_x =
+                                        gutter_width as u16 + visible_char_count as u16;
                                     cursor_screen_y = lines_rendered.saturating_sub(1) as u16;
                                     have_cursor = true;
                                 }
