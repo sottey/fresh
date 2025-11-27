@@ -192,9 +192,15 @@ impl SuggestionsRenderer {
                 // Only show description if we have enough space
                 if used_width < available_width {
                     let remaining_width = available_width.saturating_sub(used_width);
-                    let desc_text = if desc.len() > remaining_width {
+                    // Use char count for truncation to avoid slicing in the middle of
+                    // multi-byte UTF-8 characters (e.g., fancy quotes like ")
+                    let desc_text = if desc.chars().count() > remaining_width {
                         // Truncate description if it's too long
-                        format!("{}...", &desc[..remaining_width.saturating_sub(3)])
+                        let truncated: String = desc
+                            .chars()
+                            .take(remaining_width.saturating_sub(3))
+                            .collect();
+                        format!("{}...", truncated)
                     } else {
                         desc.clone()
                     };
@@ -232,5 +238,117 @@ impl SuggestionsRenderer {
             visible_count,
             prompt.suggestions.len(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::commands::Suggestion;
+    use crate::view::prompt::Prompt;
+    use crate::view::theme::Theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Regression test for UTF-8 truncation bug.
+    ///
+    /// The bug occurred when truncating a description containing multi-byte
+    /// UTF-8 characters (like fancy quotes). The code used byte-based
+    /// slicing which could cut in the middle of a multi-byte character,
+    /// causing a panic.
+    ///
+    /// This test reliably reproduces the issue by:
+    /// 1. Using a description with a fancy quote at a known position
+    /// 2. Setting terminal width to force truncation at exactly that position
+    #[test]
+    fn test_suggestion_description_truncation_with_multibyte_utf8() {
+        // The fancy quote \u{201C} is 3 bytes in UTF-8
+        // Create a description where the quote appears at a position that will be truncated
+        // 60 A's, then a fancy quote, then more text
+        let fancy_quote = "\u{201C}"; // Left double quotation mark "
+        let description = format!("{}{}test content after quote", "A".repeat(60), fancy_quote);
+
+        // Verify the fancy quote is multi-byte
+        assert_eq!(fancy_quote.len(), 3, "Fancy quote should be 3 bytes");
+        assert_eq!(fancy_quote.chars().count(), 1, "Fancy quote should be 1 char");
+
+        // Create a suggestion with this description
+        let mut suggestion = Suggestion::new("Test Command".to_string());
+        suggestion.description = Some(description.clone());
+
+        // Create a prompt with this suggestion
+        let mut prompt = Prompt::new("Test: ".to_string(), crate::view::prompt::PromptType::Command);
+        prompt.suggestions = vec![suggestion];
+
+        // Set up terminal with width that forces truncation at the multi-byte char
+        // Column layout: "  Name  |  Keybinding  |  Description"
+        // left_margin=2, name="Test Command"(12), column_spacing=2, no keybinding
+        // used_width = 2 + 12 + 2 + 0 + 0 = 16
+        // To truncate at position 63 (middle of the 3-byte quote at positions 60-62):
+        // remaining_width = 63 + 3 = 66 (we subtract 3 for "...")
+        // available_width = used_width + remaining_width = 16 + 66 = 82
+        // Inner area width = 82, so total area with borders = 84
+        let backend = TestBackend::new(84, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let theme = Theme::default();
+
+        // This should NOT panic with the fix in place
+        // Before the fix, this would panic with:
+        // "byte index 63 is not a char boundary; it is inside '"' (bytes 60..63)"
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 84, 10);
+                SuggestionsRenderer::render(frame, area, &prompt, &theme);
+            })
+            .unwrap();
+    }
+
+    /// Test that truncation produces valid UTF-8 output
+    #[test]
+    fn test_truncation_preserves_valid_utf8() {
+        // Test with various multi-byte characters at different positions
+        let test_cases = vec![
+            // Fancy quotes (3 bytes each)
+            "Create a \u{201C}virtual buffer\u{201D} for testing",
+            // Emojis (4 bytes each)
+            "Add emoji support \u{1F389} for better UX",
+            // Japanese characters
+            "\u{65E5}\u{672C}\u{8A9E} test with English",
+            // Accented characters (2 bytes each)
+            "Caf\u{00E9} r\u{00E9}sum\u{00E9} na\u{00EF}ve",
+        ];
+
+        for description in test_cases {
+            let mut suggestion = Suggestion::new("Cmd".to_string());
+            suggestion.description = Some(description.to_string());
+
+            let mut prompt = Prompt::new("Test: ".to_string(), crate::view::prompt::PromptType::Command);
+            prompt.suggestions = vec![suggestion];
+
+            // Try various widths to catch any boundary issues
+            for width in 20..100 {
+                let backend = TestBackend::new(width, 5);
+                let mut terminal = Terminal::new(backend).unwrap();
+                let theme = Theme::default();
+
+                // Should never panic regardless of width
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    terminal
+                        .draw(|frame| {
+                            let area = Rect::new(0, 0, width, 5);
+                            SuggestionsRenderer::render(frame, area, &prompt, &theme);
+                        })
+                        .unwrap();
+                }));
+
+                assert!(
+                    result.is_ok(),
+                    "Panic at width {} with description: {}",
+                    width,
+                    description
+                );
+            }
+        }
     }
 }
