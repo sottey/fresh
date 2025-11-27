@@ -33,6 +33,7 @@ def print_usage():
     print("  4. Update Cargo.toml and Cargo.lock")
     print("  5. Optionally generate release notes")
     print("  6. Ask to commit, tag, and push the changes")
+    print("  7. Publish to crates.io")
 
 def run_command(command: List[str], capture_output: bool = False, check: bool = True) -> subprocess.CompletedProcess:
     """Runs a shell command."""
@@ -180,6 +181,7 @@ def main() -> None:
         else:
             print(f"  2. Create tag:     {YELLOW}git tag v{new_version}{NC}")
         print(f"  3. Push:           {YELLOW}git push && git push origin v{new_version}{NC}")
+        print(f"  4. Publish:        {YELLOW}cargo publish{NC}")
         sys.exit(0)
 
     try:
@@ -205,6 +207,11 @@ def main() -> None:
         run_command(["git", "push", "origin", current_branch])
         run_command(["git", "push", "origin", f"v{new_version}"])
         print(f"{GREEN}✓{NC} Pushed")
+
+        print("")
+        print(f"{BLUE}Step 7:{NC} Publishing to crates.io...")
+        run_command(["cargo", "publish"])
+        print(f"{GREEN}✓{NC} Published to crates.io")
 
         print("")
         print(f"{GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{NC}")
