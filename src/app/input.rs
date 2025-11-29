@@ -2181,7 +2181,19 @@ impl Editor {
         let old_target = self.mouse_state.hover_target.clone();
         let new_target = self.compute_hover_target(col, row);
         let changed = old_target != new_target;
-        self.mouse_state.hover_target = new_target;
+        self.mouse_state.hover_target = new_target.clone();
+
+        // If a menu is currently open and we're hovering over a different menu bar item,
+        // switch to that menu automatically
+        if let Some(active_menu_idx) = self.menu_state.active_menu {
+            if let Some(HoverTarget::MenuBarItem(hovered_menu_idx)) = new_target {
+                if hovered_menu_idx != active_menu_idx {
+                    self.menu_state.open_menu(hovered_menu_idx);
+                    return true; // Force re-render since menu changed
+                }
+            }
+        }
+
         changed
     }
 
