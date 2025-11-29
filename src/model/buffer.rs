@@ -3028,6 +3028,30 @@ mod tests {
         assert_eq!(line, 1, "Position 21 should be on line 1");
         assert_eq!(char, 0, "Position 21 should be at char 0 (start of line)");
     }
+
+    #[test]
+    fn test_detect_crlf() {
+        assert_eq!(TextBuffer::detect_line_ending(b"hello\r\nworld\r\n"), LineEnding::CRLF);
+    }
+
+    #[test]
+    fn test_detect_lf() {
+        assert_eq!(TextBuffer::detect_line_ending(b"hello\nworld\n"), LineEnding::LF);
+    }
+
+    #[test]
+    fn test_normalize_crlf() {
+        let input = b"hello\r\nworld\r\n".to_vec();
+        let output = TextBuffer::normalize_line_endings(input);
+        assert_eq!(output, b"hello\nworld\n");
+    }
+
+    #[test]
+    fn test_normalize_empty() {
+        let input = Vec::new();
+        let output = TextBuffer::normalize_line_endings(input);
+        assert_eq!(output, Vec::<u8>::new());
+    }
 }
 
 #[cfg(test)]
