@@ -493,9 +493,9 @@ impl Theme {
             menu_hover_fg: Color::Rgb(255, 255, 255),
 
             status_bar_fg: Color::White,
-            status_bar_bg: Color::DarkGray,
+            status_bar_bg: Color::Rgb(30, 30, 30), // Darker than DarkGray
             prompt_fg: Color::White,
-            prompt_bg: Color::Black,
+            prompt_bg: Color::Rgb(20, 20, 20), // Very dark
             prompt_selection_fg: Color::White,
             prompt_selection_bg: Color::Rgb(58, 79, 120), // Blue selection
 
@@ -596,10 +596,10 @@ impl Theme {
             menu_hover_bg: Color::Rgb(230, 235, 240),
             menu_hover_fg: Color::Rgb(0, 0, 0),
 
-            status_bar_fg: Color::Rgb(60, 60, 60),
-            status_bar_bg: Color::Rgb(240, 240, 240),
-            prompt_fg: Color::Rgb(80, 80, 80),    // Light gray text
-            prompt_bg: Color::Rgb(255, 255, 255), // White background
+            status_bar_fg: Color::Black,
+            status_bar_bg: Color::Rgb(220, 220, 220), // Light grey
+            prompt_fg: Color::Black,
+            prompt_bg: Color::Rgb(230, 240, 250), // Very light blue
             prompt_selection_fg: Color::Black,
             prompt_selection_bg: Color::Rgb(173, 214, 255), // Light blue selection
 
@@ -701,9 +701,9 @@ impl Theme {
             menu_hover_fg: Color::Yellow,
 
             status_bar_fg: Color::White,
-            status_bar_bg: Color::DarkGray,
+            status_bar_bg: Color::Rgb(20, 20, 20), // Darker for high contrast
             prompt_fg: Color::White,
-            prompt_bg: Color::Black,
+            prompt_bg: Color::Rgb(10, 10, 10), // Very dark
             prompt_selection_fg: Color::White,
             prompt_selection_bg: Color::Rgb(0, 100, 200), // Blue selection
 
@@ -830,8 +830,8 @@ impl Theme {
 
             status_bar_fg: Color::Rgb(0, 0, 0),
             status_bar_bg: Color::Rgb(0, 170, 170), // Cyan status bar
-            prompt_fg: Color::Rgb(255, 255, 255),
-            prompt_bg: Color::Rgb(0, 0, 128),
+            prompt_fg: Color::Rgb(255, 255, 85), // Yellow text
+            prompt_bg: Color::Rgb(0, 0, 170),    // Blue background
             prompt_selection_fg: Color::Rgb(0, 0, 0),
             prompt_selection_bg: Color::Rgb(170, 170, 170),
 
