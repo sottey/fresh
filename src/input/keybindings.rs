@@ -1,6 +1,25 @@
 use crate::config::Config;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global flag to force Linux-style keybinding display (Ctrl instead of ⌘)
+/// This is primarily used in tests to ensure consistent output across platforms.
+static FORCE_LINUX_KEYBINDINGS: AtomicBool = AtomicBool::new(false);
+
+/// Force Linux-style keybinding display (Ctrl/Alt/Shift instead of ⌘/⌥/⇧)
+/// Call this in tests to ensure consistent output regardless of platform.
+pub fn set_force_linux_keybindings(force: bool) {
+    FORCE_LINUX_KEYBINDINGS.store(force, Ordering::SeqCst);
+}
+
+/// Check if we should use macOS-style symbols for keybindings
+fn use_macos_symbols() -> bool {
+    if FORCE_LINUX_KEYBINDINGS.load(Ordering::SeqCst) {
+        return false;
+    }
+    cfg!(target_os = "macos")
+}
 
 /// Format a keybinding as a user-friendly string
 /// On macOS, this will show ⌘ instead of Ctrl for better UX
@@ -9,28 +28,21 @@ pub fn format_keybinding(keycode: &KeyCode, modifiers: &KeyModifiers) -> String 
 
     // On macOS, show ⌘ (Cmd) symbol instead of Ctrl for the Control modifier
     // This provides a more native experience for Mac users
-    #[cfg(target_os = "macos")]
-    let ctrl_label = "⌘";
-    #[cfg(not(target_os = "macos"))]
-    let ctrl_label = "Ctrl";
+    let (ctrl_label, alt_label, shift_label) = if use_macos_symbols() {
+        ("⌘", "⌥", "⇧")
+    } else {
+        ("Ctrl", "Alt", "Shift")
+    };
 
     if modifiers.contains(KeyModifiers::CONTROL) {
         result.push_str(ctrl_label);
         result.push('+');
     }
     if modifiers.contains(KeyModifiers::ALT) {
-        #[cfg(target_os = "macos")]
-        let alt_label = "⌥";
-        #[cfg(not(target_os = "macos"))]
-        let alt_label = "Alt";
         result.push_str(alt_label);
         result.push('+');
     }
     if modifiers.contains(KeyModifiers::SHIFT) {
-        #[cfg(target_os = "macos")]
-        let shift_label = "⇧";
-        #[cfg(not(target_os = "macos"))]
-        let shift_label = "Shift";
         result.push_str(shift_label);
         result.push('+');
     }

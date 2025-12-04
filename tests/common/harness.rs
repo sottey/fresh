@@ -5,6 +5,9 @@
 #[ctor::ctor]
 fn init_v8_for_tests() {
     fresh::v8_init::init();
+    // Force Linux-style keybindings (Ctrl/Alt/Shift instead of ⌘/⌥/⇧)
+    // to ensure consistent visual test output across platforms
+    fresh::input::keybindings::set_force_linux_keybindings(true);
 }
 
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
