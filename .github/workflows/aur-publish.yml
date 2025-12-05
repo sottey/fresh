@@ -8,19 +8,29 @@ on:
       plan:
         required: true
         type: string
-  workflow_dispatch:  # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., 0.1.21)'
+        required: true
+        type: string
 
 jobs:
   publish-aur:
     runs-on: ubuntu-latest
-    if: ${{ !fromJson(inputs.plan).announcement_is_prerelease }}
+    if: ${{ inputs.version || !fromJson(inputs.plan).announcement_is_prerelease }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Extract version
         id: version
         run: |
-          VERSION=$(echo '${{ inputs.plan }}' | jq -r '.announcement_tag' | sed 's/^v//')
+          # Use manual input if provided, otherwise extract from plan
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(echo '${{ inputs.plan }}' | jq -r '.announcement_tag' | sed 's/^v//')
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Download tarball and compute checksum
