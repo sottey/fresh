@@ -169,12 +169,12 @@ def main() -> None:
 
     print("")
     release_notes_content = ""
-    release_notes_path = Path("RELEASE_NOTES.md")
+    release_notes_path = Path("CHANGELOG.md")
     if release_notes_path.exists():
         release_notes_content = release_notes_path.read_text().strip()
-        print(f"{BLUE}Found existing RELEASE_NOTES.md.{NC}")
+        print(f"{BLUE}Found existing CHANGELOG.md.{NC}")
     else:
-        print(f"{YELLOW}Warning: RELEASE_NOTES.md not found. Tag will not include release notes.{NC}")
+        print(f"{YELLOW}Warning: CHANGELOG.md not found. Tag will not include release notes.{NC}")
 
     reply = input(f"Commit, tag, and push v{new_version}? (y/N) ").lower()
     if reply != "y":
@@ -184,7 +184,7 @@ def main() -> None:
         print("To complete manually:")
         print(f"  1. Commit changes: {YELLOW}git add Cargo.toml Cargo.lock && git commit -m 'Bump version to {new_version}'{NC}")
         if release_notes_content:
-            print(f"  2. Create tag:     {YELLOW}git tag -a v{new_version} -F RELEASE_NOTES.md{NC}")
+            print(f"  2. Create tag:     {YELLOW}git tag -a v{new_version} -F CHANGELOG.md{NC}")
         else:
             print(f"  2. Create tag:     {YELLOW}git tag v{new_version}{NC}")
         print(f"  3. Push:           {YELLOW}git push && git push origin v{new_version}{NC}")
@@ -205,7 +205,7 @@ def main() -> None:
         print("")
         print(f"{BLUE}Step 5:{NC} Creating tag v{new_version}...")
         if release_notes_content:
-            run_command(["git", "tag", "-a", f"v{new_version}", "-F", "RELEASE_NOTES.md"])
+            run_command(["git", "tag", "-a", f"v{new_version}", "-F", "CHANGELOG.md"])
         else:
             run_command(["git", "tag", f"v{new_version}"])
         print(f"{GREEN}✓{NC} Tagged")

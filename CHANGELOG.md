@@ -2,6 +2,12 @@
 
 ## 0.1.25 - Unreleased
 
+### Features
+
+* **GPM Mouse Support**: Added mouse support in Linux virtual consoles (TTY) via the GPM daemon (#231). Uses dlopen to load libgpm.so at runtime, so the binary works on systems without GPM installed. Gracefully falls back to standard terminal mouse protocol when GPM is unavailable.
+
+* **Configurable Highlight Context**: Syntax highlighting lookback/lookforward is now configurable via `highlight_context_bytes` in config (default increased from 1KB to 10KB). Fixes inaccurate highlighting when viewing the middle of files with long multi-line constructs.
+
 ### Bug Fixes
 
 * **Mouse Wheel After Keyboard**: Fixed mouse wheel scroll not working in main editor after keyboard navigation (#248).
@@ -13,6 +19,8 @@
 * **Signal Handling**: Removed ctrlc dependency, use nix sigaction directly.
 
 * **Test Reliability**: Fixed flaky auto-revert tests on macOS (FSEvents latency) and filesystems with 1-second mtime granularity.
+
+* **Dependency Updates**: Reduced and updated dependencies.
 
 ---
 
