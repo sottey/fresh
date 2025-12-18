@@ -48,6 +48,19 @@
 
 ---
 
+## 0.1.52
+
+### Bug Fixes
+
+* **musl Build**: Enabled the `runtime` feature for musl builds.
+* **Flatpak**: Fixed CI and metainfo handling (official Flathub container + flatpak-builder action, appstream-compose deps, avoid corrupting XML declaration, remove invalid `launchable` tag).
+
+### Internal
+
+* **Version Bump Script**: Version bumps now skip `cargo check`.
+
+---
+
 ## 0.1.45
 
 ### Features
