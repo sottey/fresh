@@ -8,21 +8,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-/// Constants for menu context state keys
-/// These are used both in menu item `when` conditions and `checkbox` states
-pub mod context_keys {
-    pub const LINE_NUMBERS: &str = "line_numbers";
-    pub const LINE_WRAP: &str = "line_wrap";
-    pub const COMPOSE_MODE: &str = "compose_mode";
-    pub const FILE_EXPLORER: &str = "file_explorer";
-    pub const FILE_EXPLORER_FOCUSED: &str = "file_explorer_focused";
-    pub const MOUSE_CAPTURE: &str = "mouse_capture";
-    pub const MOUSE_HOVER: &str = "mouse_hover";
-    pub const LSP_AVAILABLE: &str = "lsp_available";
-    pub const FILE_EXPLORER_SHOW_HIDDEN: &str = "file_explorer_show_hidden";
-    pub const FILE_EXPLORER_SHOW_GITIGNORED: &str = "file_explorer_show_gitignored";
-    pub const HAS_SELECTION: &str = "has_selection";
-}
+// Re-export context_keys from the shared types module
+pub use crate::types::context_keys;
 
 /// Menu state context - provides named boolean states for menu item conditions
 /// Both `when` conditions and `checkbox` states look up values here
@@ -149,20 +136,34 @@ impl MenuState {
         };
 
         // Get the current menu items
-        let Some(items) = self.get_current_items(menus, active_idx) else {
+        let Some(menu) = menus.get(active_idx) else {
+            return false;
+        };
+        let Some(items) = self.get_current_items_cloned(menu) else {
             return false;
         };
 
-        // Check if highlighted item is a submenu
-        if let Some(MenuItem::Submenu {
-            items: submenu_items,
-            ..
-        }) = items.get(highlighted)
-        {
-            if !submenu_items.is_empty() {
-                self.submenu_path.push(highlighted);
-                self.highlighted_item = Some(0);
-                return true;
+        // Check if highlighted item is a submenu (including DynamicSubmenu which was expanded)
+        if let Some(item) = items.get(highlighted) {
+            match item {
+                MenuItem::Submenu {
+                    items: submenu_items,
+                    ..
+                } if !submenu_items.is_empty() => {
+                    self.submenu_path.push(highlighted);
+                    self.highlighted_item = Some(0);
+                    return true;
+                }
+                MenuItem::DynamicSubmenu { source, .. } => {
+                    // Generate items to check if non-empty
+                    let generated = MenuItem::generate_dynamic_items(source);
+                    if !generated.is_empty() {
+                        self.submenu_path.push(highlighted);
+                        self.highlighted_item = Some(0);
+                        return true;
+                    }
+                }
+                _ => {}
             }
         }
         false
@@ -204,16 +205,18 @@ impl MenuState {
     }
 
     /// Get owned vec of current items (for use when Menu is cloned)
+    /// DynamicSubmenus are expanded to regular Submenus
     pub fn get_current_items_cloned(&self, menu: &Menu) -> Option<Vec<MenuItem>> {
-        let mut items = menu.items.clone();
+        // Expand all items (handles DynamicSubmenu -> Submenu)
+        let mut items: Vec<MenuItem> = menu.items.iter().map(|i| i.expand_dynamic()).collect();
 
         for &idx in &self.submenu_path {
-            match items.get(idx)? {
+            match items.get(idx)?.expand_dynamic() {
                 MenuItem::Submenu {
                     items: submenu_items,
                     ..
                 } => {
-                    items = submenu_items.clone();
+                    items = submenu_items;
                 }
                 _ => return None,
             }
@@ -237,9 +240,9 @@ impl MenuState {
             return;
         }
 
-        // Skip separators
+        // Skip separators and disabled items
         let mut next = (idx + 1) % items.len();
-        while matches!(items[next], MenuItem::Separator { .. }) && next != idx {
+        while next != idx && self.should_skip_item(&items[next]) {
             next = (next + 1) % items.len();
         }
         self.highlighted_item = Some(next);
@@ -260,13 +263,28 @@ impl MenuState {
             return;
         }
 
-        // Skip separators
+        // Skip separators and disabled items
         let total = items.len();
         let mut prev = (idx + total - 1) % total;
-        while matches!(items[prev], MenuItem::Separator { .. }) && prev != idx {
+        while prev != idx && self.should_skip_item(&items[prev]) {
             prev = (prev + total - 1) % total;
         }
         self.highlighted_item = Some(prev);
+    }
+
+    /// Check if a menu item should be skipped during navigation
+    fn should_skip_item(&self, item: &MenuItem) -> bool {
+        match item {
+            MenuItem::Separator { .. } => true,
+            MenuItem::Action { when, .. } => {
+                // Skip disabled items (when condition evaluates to false)
+                match when.as_deref() {
+                    Some(condition) => !self.context.get(condition),
+                    None => false, // No condition means enabled, don't skip
+                }
+            }
+            _ => false,
+        }
     }
 
     /// Get the currently highlighted action (if any)
@@ -278,8 +296,9 @@ impl MenuState {
         let active_menu = self.active_menu?;
         let highlighted_item = self.highlighted_item?;
 
-        // Get the items at the current submenu level
-        let items = self.get_current_items(menus, active_menu)?;
+        // Get the items at the current submenu level, handling DynamicSubmenu
+        let menu = menus.get(active_menu)?;
+        let items = self.get_current_items_cloned(menu)?;
         let item = items.get(highlighted_item)?;
 
         match item {
@@ -303,11 +322,18 @@ impl MenuState {
             return false;
         };
 
-        let Some(items) = self.get_current_items(menus, active_menu) else {
+        // Use get_current_items_cloned to handle DynamicSubmenu
+        let Some(menu) = menus.get(active_menu) else {
+            return false;
+        };
+        let Some(items) = self.get_current_items_cloned(menu) else {
             return false;
         };
 
-        matches!(items.get(highlighted_item), Some(MenuItem::Submenu { .. }))
+        matches!(
+            items.get(highlighted_item),
+            Some(MenuItem::Submenu { .. } | MenuItem::DynamicSubmenu { .. })
+        )
     }
 
     /// Get the menu index at a given x position in the menu bar
@@ -374,11 +400,16 @@ impl MenuRenderer {
         theme: &Theme,
         hover_target: Option<&crate::app::HoverTarget>,
     ) {
-        // Combine config menus with plugin menus
-        let all_menus: Vec<&Menu> = menu_config
+        // Combine config menus with plugin menus, expanding any DynamicSubmenus
+        let all_menus: Vec<Menu> = menu_config
             .menus
             .iter()
             .chain(menu_state.plugin_menus.iter())
+            .cloned()
+            .map(|mut menu| {
+                menu.expand_dynamic_items();
+                menu
+            })
             .collect();
 
         // Build spans for each menu label
@@ -461,7 +492,7 @@ impl MenuRenderer {
         menu: &Menu,
         menu_state: &MenuState,
         menu_index: usize,
-        all_menus: &[&Menu],
+        all_menus: &[Menu],
         keybindings: &crate::input::keybindings::KeybindingResolver,
         theme: &Theme,
         hover_target: Option<&crate::app::HoverTarget>,
@@ -514,7 +545,17 @@ impl MenuRenderer {
             // If not at the deepest level, navigate into the submenu for next iteration
             if !is_deepest {
                 let submenu_idx = menu_state.submenu_path[depth];
-                if let Some(MenuItem::Submenu { items, .. }) = current_items.get(submenu_idx) {
+                // Handle both Submenu and DynamicSubmenu
+                let submenu_items = match current_items.get(submenu_idx) {
+                    Some(MenuItem::Submenu { items, .. }) => Some(items.as_slice()),
+                    Some(MenuItem::DynamicSubmenu { .. }) => {
+                        // DynamicSubmenu items will be generated and stored temporarily
+                        // This case shouldn't happen in normal flow since we expand before entering
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(items) = submenu_items {
                     current_items = items;
                     // Position submenu to the right of parent, aligned with the highlighted item
                     current_x = dropdown_rect
@@ -544,7 +585,9 @@ impl MenuRenderer {
             .filter_map(|item| match item {
                 MenuItem::Action { label, .. } => Some(label.len() + 20),
                 MenuItem::Submenu { label, .. } => Some(label.len() + 20),
+                MenuItem::DynamicSubmenu { label, .. } => Some(label.len() + 20),
                 MenuItem::Separator { .. } => Some(20),
+                MenuItem::Label { info } => Some(info.len() + 4),
             })
             .max()
             .unwrap_or(20)
@@ -693,7 +736,7 @@ impl MenuRenderer {
                             .bg(theme.menu_dropdown_bg),
                     )])
                 }
-                MenuItem::Submenu { label, .. } => {
+                MenuItem::Submenu { label, .. } | MenuItem::DynamicSubmenu { label, .. } => {
                     // Highlight submenu items that have an open child
                     let style = if is_highlighted || has_open_submenu {
                         Style::default()
@@ -709,11 +752,22 @@ impl MenuRenderer {
                             .bg(theme.menu_dropdown_bg)
                     };
 
-                    // Format: " Label        ▶ " - label left-aligned, arrow near the end with padding
+                    // Format: " Label        > " - label left-aligned, arrow near the end with padding
                     // content_width minus: leading space (1) + space before arrow (1) + arrow (1) + trailing space (2)
                     let label_width = content_width.saturating_sub(5);
                     Line::from(vec![Span::styled(
-                        format!(" {:<label_width$} ▶  ", label),
+                        format!(" {:<label_width$} >  ", label),
+                        style,
+                    )])
+                }
+                MenuItem::Label { info } => {
+                    // Disabled info label - always shown in disabled style
+                    let style = Style::default()
+                        .fg(theme.menu_disabled_fg)
+                        .bg(theme.menu_dropdown_bg);
+                    let padding = content_width;
+                    Line::from(vec![Span::styled(
+                        format!(" {:<width$}", info, width = padding),
                         style,
                     )])
                 }

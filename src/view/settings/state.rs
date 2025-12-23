@@ -3,14 +3,33 @@
 //! Tracks the current state of the settings UI, pending changes,
 //! and provides methods for reading/writing config values.
 
+use super::entry_dialog::EntryDialogState;
 use super::items::{control_to_value, SettingControl, SettingItem, SettingsPage};
 use super::layout::SettingsHit;
-use super::schema::{parse_schema, SettingCategory};
+use super::schema::{parse_schema, SettingCategory, SettingSchema};
 use super::search::{search_settings, SearchResult};
 use crate::config::Config;
 use crate::view::controls::FocusState;
 use crate::view::ui::ScrollablePanel;
 use std::collections::HashMap;
+
+/// Info needed to open a nested dialog (extracted before mutable borrow)
+enum NestedDialogInfo {
+    MapEntry {
+        key: String,
+        value: serde_json::Value,
+        schema: SettingSchema,
+        path: String,
+        is_new: bool,
+    },
+    ArrayItem {
+        index: Option<usize>,
+        value: serde_json::Value,
+        schema: SettingSchema,
+        path: String,
+        is_new: bool,
+    },
+}
 
 /// Which panel currently has keyboard focus
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -69,6 +88,9 @@ pub struct SettingsState {
     pub hover_position: Option<(u16, u16)>,
     /// Current hover hit result (computed from hover_position and cached layout)
     pub hover_hit: Option<SettingsHit>,
+    /// Stack of entry dialogs (for nested editing of Maps/ObjectArrays)
+    /// The top of the stack (last element) is the currently active dialog.
+    pub entry_dialog_stack: Vec<EntryDialogState>,
 }
 
 impl SettingsState {
@@ -100,6 +122,7 @@ impl SettingsState {
             editing_text: false,
             hover_position: None,
             hover_hit: None,
+            entry_dialog_stack: Vec::new(),
         })
     }
 
@@ -119,6 +142,21 @@ impl SettingsState {
         self.visible = false;
         self.search_active = false;
         self.search_query.clear();
+    }
+
+    /// Get the current entry dialog (top of stack), if any
+    pub fn entry_dialog(&self) -> Option<&EntryDialogState> {
+        self.entry_dialog_stack.last()
+    }
+
+    /// Get the current entry dialog mutably (top of stack), if any
+    pub fn entry_dialog_mut(&mut self) -> Option<&mut EntryDialogState> {
+        self.entry_dialog_stack.last_mut()
+    }
+
+    /// Check if any entry dialog is open
+    pub fn has_entry_dialog(&self) -> bool {
+        !self.entry_dialog_stack.is_empty()
     }
 
     /// Get the currently selected page
@@ -144,6 +182,43 @@ impl SettingsState {
             .and_then(|page| page.items.get_mut(self.selected_item))
     }
 
+    /// Check if the current text field can be exited (valid JSON if required)
+    pub fn can_exit_text_editing(&self) -> bool {
+        self.current_item()
+            .map(|item| {
+                if let SettingControl::Text(state) = &item.control {
+                    state.is_valid()
+                } else {
+                    true
+                }
+            })
+            .unwrap_or(true)
+    }
+
+    /// Check if entry dialog's current text field can be exited (valid JSON if required)
+    pub fn entry_dialog_can_exit_text_editing(&self) -> bool {
+        self.entry_dialog()
+            .and_then(|dialog| dialog.current_item())
+            .map(|item| {
+                if let SettingControl::Text(state) = &item.control {
+                    state.is_valid()
+                } else {
+                    true
+                }
+            })
+            .unwrap_or(true)
+    }
+
+    /// Initialize map focus when entering a Map control.
+    /// `from_above`: true = start at first entry, false = start at add-new field
+    fn init_map_focus(&mut self, from_above: bool) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Map(ref mut map_state) = item.control {
+                map_state.init_focus(from_above);
+            }
+        }
+    }
+
     /// Move selection up
     pub fn select_prev(&mut self) {
         match self.focus_panel {
@@ -156,11 +231,21 @@ impl SettingsState {
                 }
             }
             FocusPanel::Settings => {
-                if self.selected_item > 0 {
+                // Try to navigate within current Map control first
+                let handled = self
+                    .current_item_mut()
+                    .and_then(|item| match &mut item.control {
+                        SettingControl::Map(map_state) => Some(map_state.focus_prev()),
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+
+                if !handled && self.selected_item > 0 {
                     self.selected_item -= 1;
                     self.sub_focus = None;
-                    self.ensure_visible();
+                    self.init_map_focus(false); // entering from below
                 }
+                self.ensure_visible();
             }
             FocusPanel::Footer => {
                 // Navigate between footer buttons (left)
@@ -183,13 +268,26 @@ impl SettingsState {
                 }
             }
             FocusPanel::Settings => {
-                if let Some(page) = self.current_page() {
-                    if self.selected_item + 1 < page.items.len() {
+                // Try to navigate within current Map control first
+                let handled = self
+                    .current_item_mut()
+                    .and_then(|item| match &mut item.control {
+                        SettingControl::Map(map_state) => Some(map_state.focus_next()),
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+
+                if !handled {
+                    let can_move = self
+                        .current_page()
+                        .map_or(false, |page| self.selected_item + 1 < page.items.len());
+                    if can_move {
                         self.selected_item += 1;
                         self.sub_focus = None;
-                        self.ensure_visible();
+                        self.init_map_focus(true); // entering from above
                     }
                 }
+                self.ensure_visible();
             }
             FocusPanel::Footer => {
                 // Navigate between footer buttons (right)
@@ -215,6 +313,11 @@ impl SettingsState {
             self.selected_item = 0;
         }
         self.sub_focus = None;
+
+        if self.focus_panel == FocusPanel::Settings {
+            self.init_map_focus(true); // entering from above
+        }
+
         self.ensure_visible();
     }
 
@@ -331,6 +434,8 @@ impl SettingsState {
                     SettingControl::Text(state) => state.focus = focus,
                     SettingControl::TextList(state) => state.focus = focus,
                     SettingControl::Map(state) => state.focus = focus,
+                    SettingControl::ObjectArray(state) => state.focus = focus,
+                    SettingControl::Json(state) => state.focus = focus,
                     SettingControl::Complex { .. } => {}
                 }
             }
@@ -403,6 +508,7 @@ impl SettingsState {
                 self.scroll_panel.update_content_height(&page.items);
             }
             self.sub_focus = None;
+            self.init_map_focus(true);
             self.ensure_visible();
             self.cancel_search();
         }
@@ -447,6 +553,329 @@ impl SettingsState {
     /// Hide the help overlay
     pub fn hide_help(&mut self) {
         self.showing_help = false;
+    }
+
+    /// Check if the entry dialog is showing
+    pub fn showing_entry_dialog(&self) -> bool {
+        self.has_entry_dialog()
+    }
+
+    /// Open the entry dialog for the currently focused map entry
+    pub fn open_entry_dialog(&mut self) {
+        let Some(item) = self.current_item() else {
+            return;
+        };
+
+        // Determine what type of entry we're editing based on the path
+        let path = item.path.as_str();
+        let SettingControl::Map(map_state) = &item.control else {
+            return;
+        };
+
+        // Get the focused entry
+        let Some(entry_idx) = map_state.focused_entry else {
+            return;
+        };
+        let Some((key, value)) = map_state.entries.get(entry_idx) else {
+            return;
+        };
+
+        // Get the value schema for this map
+        let Some(schema) = map_state.value_schema.as_ref() else {
+            return; // No schema available, can't create dialog
+        };
+
+        // Create dialog from schema
+        let dialog = EntryDialogState::from_schema(key.clone(), value, schema, &path, false);
+        self.entry_dialog_stack.push(dialog);
+    }
+
+    /// Open entry dialog for adding a new entry (with empty key)
+    pub fn open_add_entry_dialog(&mut self) {
+        let Some(item) = self.current_item() else {
+            return;
+        };
+        let SettingControl::Map(map_state) = &item.control else {
+            return;
+        };
+        let Some(schema) = map_state.value_schema.as_ref() else {
+            return;
+        };
+        let path = item.path.clone();
+
+        // Create dialog with empty key - user will fill it in
+        let dialog = EntryDialogState::from_schema(
+            String::new(),
+            &serde_json::json!({}),
+            schema,
+            &path,
+            true,
+        );
+        self.entry_dialog_stack.push(dialog);
+    }
+
+    /// Open dialog for adding a new array item
+    pub fn open_add_array_item_dialog(&mut self) {
+        let Some(item) = self.current_item() else {
+            return;
+        };
+        let SettingControl::ObjectArray(array_state) = &item.control else {
+            return;
+        };
+        let Some(schema) = array_state.item_schema.as_ref() else {
+            return;
+        };
+        let path = item.path.clone();
+
+        // Create dialog with empty value - user will fill it in
+        let dialog =
+            EntryDialogState::for_array_item(None, &serde_json::json!({}), schema, &path, true);
+        self.entry_dialog_stack.push(dialog);
+    }
+
+    /// Open dialog for editing an existing array item
+    pub fn open_edit_array_item_dialog(&mut self) {
+        let Some(item) = self.current_item() else {
+            return;
+        };
+        let SettingControl::ObjectArray(array_state) = &item.control else {
+            return;
+        };
+        let Some(schema) = array_state.item_schema.as_ref() else {
+            return;
+        };
+        let Some(index) = array_state.focused_index else {
+            return;
+        };
+        let Some(value) = array_state.bindings.get(index) else {
+            return;
+        };
+        let path = item.path.clone();
+
+        let dialog = EntryDialogState::for_array_item(Some(index), value, schema, &path, false);
+        self.entry_dialog_stack.push(dialog);
+    }
+
+    /// Close the entry dialog without saving (pops from stack)
+    pub fn close_entry_dialog(&mut self) {
+        self.entry_dialog_stack.pop();
+    }
+
+    /// Open a nested entry dialog for a Map or ObjectArray field within the current dialog
+    ///
+    /// This enables recursive editing: if a dialog field is itself a Map or ObjectArray,
+    /// pressing Enter will open a new dialog on top of the stack for that nested structure.
+    pub fn open_nested_entry_dialog(&mut self) {
+        // Get info from the current dialog's focused field
+        let nested_info = self.entry_dialog().and_then(|dialog| {
+            let item = dialog.current_item()?;
+            let path = format!("{}/{}", dialog.map_path, item.path.trim_start_matches('/'));
+
+            match &item.control {
+                SettingControl::Map(map_state) => {
+                    let schema = map_state.value_schema.as_ref()?;
+                    if let Some(entry_idx) = map_state.focused_entry {
+                        // Edit existing entry
+                        let (key, value) = map_state.entries.get(entry_idx)?;
+                        Some(NestedDialogInfo::MapEntry {
+                            key: key.clone(),
+                            value: value.clone(),
+                            schema: schema.as_ref().clone(),
+                            path,
+                            is_new: false,
+                        })
+                    } else {
+                        // Add new entry
+                        Some(NestedDialogInfo::MapEntry {
+                            key: String::new(),
+                            value: serde_json::json!({}),
+                            schema: schema.as_ref().clone(),
+                            path,
+                            is_new: true,
+                        })
+                    }
+                }
+                SettingControl::ObjectArray(array_state) => {
+                    let schema = array_state.item_schema.as_ref()?;
+                    if let Some(index) = array_state.focused_index {
+                        // Edit existing item
+                        let value = array_state.bindings.get(index)?;
+                        Some(NestedDialogInfo::ArrayItem {
+                            index: Some(index),
+                            value: value.clone(),
+                            schema: schema.as_ref().clone(),
+                            path,
+                            is_new: false,
+                        })
+                    } else {
+                        // Add new item
+                        Some(NestedDialogInfo::ArrayItem {
+                            index: None,
+                            value: serde_json::json!({}),
+                            schema: schema.as_ref().clone(),
+                            path,
+                            is_new: true,
+                        })
+                    }
+                }
+                _ => None,
+            }
+        });
+
+        // Now create and push the dialog (outside the borrow)
+        if let Some(info) = nested_info {
+            let dialog = match info {
+                NestedDialogInfo::MapEntry {
+                    key,
+                    value,
+                    schema,
+                    path,
+                    is_new,
+                } => EntryDialogState::from_schema(key, &value, &schema, &path, is_new),
+                NestedDialogInfo::ArrayItem {
+                    index,
+                    value,
+                    schema,
+                    path,
+                    is_new,
+                } => EntryDialogState::for_array_item(index, &value, &schema, &path, is_new),
+            };
+            self.entry_dialog_stack.push(dialog);
+        }
+    }
+
+    /// Save the entry dialog and apply changes
+    ///
+    /// Automatically detects whether this is a Map or ObjectArray dialog
+    /// and handles saving appropriately.
+    pub fn save_entry_dialog(&mut self) {
+        // Check what type of control we're dealing with
+        let is_array = self
+            .current_item()
+            .map(|item| matches!(item.control, SettingControl::ObjectArray(_)))
+            .unwrap_or(false);
+
+        if is_array {
+            self.save_array_item_dialog_inner();
+        } else {
+            self.save_map_entry_dialog_inner();
+        }
+    }
+
+    /// Save a Map entry dialog
+    fn save_map_entry_dialog_inner(&mut self) {
+        let Some(dialog) = self.entry_dialog_stack.pop() else {
+            return;
+        };
+
+        // Get key from the dialog's key field (may have been edited)
+        let key = dialog.get_key();
+        if key.is_empty() {
+            return; // Can't save with empty key
+        }
+
+        let value = dialog.to_value();
+        let map_path = dialog.map_path.clone();
+        let original_key = dialog.entry_key.clone();
+        let is_new = dialog.is_new;
+        let key_changed = !is_new && key != original_key;
+
+        // Update the map control with the new value
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Map(map_state) = &mut item.control {
+                // If key was changed, remove old entry first
+                if key_changed {
+                    if let Some(idx) = map_state
+                        .entries
+                        .iter()
+                        .position(|(k, _)| k == &original_key)
+                    {
+                        map_state.entries.remove(idx);
+                    }
+                }
+
+                // Find or add the entry with the (possibly new) key
+                if let Some(entry) = map_state.entries.iter_mut().find(|(k, _)| k == &key) {
+                    entry.1 = value.clone();
+                } else {
+                    map_state.entries.push((key.clone(), value.clone()));
+                    map_state.entries.sort_by(|a, b| a.0.cmp(&b.0));
+                }
+            }
+        }
+
+        // Record deletion of old key if key was changed
+        if key_changed {
+            let old_path = format!("{}/{}", map_path, original_key);
+            self.pending_changes
+                .insert(old_path, serde_json::Value::Null);
+        }
+
+        // Record the pending change
+        let path = format!("{}/{}", map_path, key);
+        self.set_pending_change(&path, value);
+    }
+
+    /// Save an ObjectArray item dialog
+    fn save_array_item_dialog_inner(&mut self) {
+        let Some(dialog) = self.entry_dialog_stack.pop() else {
+            return;
+        };
+
+        let value = dialog.to_value();
+        let array_path = dialog.map_path.clone();
+        let is_new = dialog.is_new;
+
+        // Update the array control with the new value
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::ObjectArray(array_state) = &mut item.control {
+                if is_new {
+                    // Add new item to the array
+                    array_state.bindings.push(value.clone());
+                } else {
+                    // Update existing item by index
+                    if let Ok(index) = dialog.entry_key.parse::<usize>() {
+                        if index < array_state.bindings.len() {
+                            array_state.bindings[index] = value.clone();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Record the pending change for the entire array
+        // Build the new array value from all bindings
+        if let Some(item) = self.current_item() {
+            if let SettingControl::ObjectArray(array_state) = &item.control {
+                let array_value = serde_json::Value::Array(array_state.bindings.clone());
+                self.set_pending_change(&array_path, array_value);
+            }
+        }
+    }
+
+    /// Delete the entry from the map and close the dialog
+    pub fn delete_entry_dialog(&mut self) {
+        let Some(dialog) = self.entry_dialog_stack.pop() else {
+            return;
+        };
+
+        let path = format!("{}/{}", dialog.map_path, dialog.entry_key);
+
+        // Remove from the map control
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Map(map_state) = &mut item.control {
+                if let Some(idx) = map_state
+                    .entries
+                    .iter()
+                    .position(|(k, _)| k == &dialog.entry_key)
+                {
+                    map_state.remove_entry(idx);
+                }
+            }
+        }
+
+        // Record the pending change (null value signals deletion)
+        self.set_pending_change(&path, serde_json::Value::Null);
     }
 
     /// Get the maximum scroll offset for the current page (in rows)
@@ -612,51 +1041,26 @@ impl SettingsState {
         }
     }
 
-    /// Move focus to previous item in TextList/Map
+    /// Move focus to previous item in TextList/Map (wraps within control)
     pub fn text_focus_prev(&mut self) {
         if let Some(item) = self.current_item_mut() {
             match &mut item.control {
                 SettingControl::TextList(state) => state.focus_prev(),
                 SettingControl::Map(state) => {
-                    // Move focus to previous entry (None = add-new field)
-                    match state.focused_entry {
-                        None if !state.entries.is_empty() => {
-                            state.focused_entry = Some(state.entries.len() - 1);
-                        }
-                        Some(0) => {
-                            state.focused_entry = None;
-                        }
-                        Some(idx) => {
-                            state.focused_entry = Some(idx - 1);
-                        }
-                        _ => {}
-                    }
+                    state.focus_prev();
                 }
                 _ => {}
             }
         }
     }
 
-    /// Move focus to next item in TextList/Map
+    /// Move focus to next item in TextList/Map (wraps within control)
     pub fn text_focus_next(&mut self) {
         if let Some(item) = self.current_item_mut() {
             match &mut item.control {
                 SettingControl::TextList(state) => state.focus_next(),
                 SettingControl::Map(state) => {
-                    // Move focus to next entry (None = add-new field)
-                    match state.focused_entry {
-                        None => {
-                            if !state.entries.is_empty() {
-                                state.focused_entry = Some(0);
-                            }
-                        }
-                        Some(idx) if idx + 1 < state.entries.len() => {
-                            state.focused_entry = Some(idx + 1);
-                        }
-                        Some(_) => {
-                            state.focused_entry = None;
-                        }
-                    }
+                    state.focus_next();
                 }
                 _ => {}
             }
@@ -776,7 +1180,7 @@ impl SettingsState {
     pub fn is_number_editing(&self) -> bool {
         self.current_item().map_or(false, |item| {
             if let SettingControl::Number(ref n) = item.control {
-                n.editing
+                n.editing()
             } else {
                 false
             }
@@ -825,6 +1229,150 @@ impl SettingsState {
         if let Some(item) = self.current_item_mut() {
             if let SettingControl::Number(ref mut n) = item.control {
                 n.cancel_editing();
+            }
+        }
+    }
+
+    /// Delete character forward in number input
+    pub fn number_delete(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.delete();
+            }
+        }
+    }
+
+    /// Move cursor left in number input
+    pub fn number_move_left(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.move_left();
+            }
+        }
+    }
+
+    /// Move cursor right in number input
+    pub fn number_move_right(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.move_right();
+            }
+        }
+    }
+
+    /// Move cursor to start of number input
+    pub fn number_move_home(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.move_home();
+            }
+        }
+    }
+
+    /// Move cursor to end of number input
+    pub fn number_move_end(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.move_end();
+            }
+        }
+    }
+
+    /// Move cursor left selecting in number input
+    pub fn number_move_left_selecting(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.move_left_selecting();
+            }
+        }
+    }
+
+    /// Move cursor right selecting in number input
+    pub fn number_move_right_selecting(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.move_right_selecting();
+            }
+        }
+    }
+
+    /// Move cursor to start selecting in number input
+    pub fn number_move_home_selecting(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.move_home_selecting();
+            }
+        }
+    }
+
+    /// Move cursor to end selecting in number input
+    pub fn number_move_end_selecting(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.move_end_selecting();
+            }
+        }
+    }
+
+    /// Move word left in number input
+    pub fn number_move_word_left(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.move_word_left();
+            }
+        }
+    }
+
+    /// Move word right in number input
+    pub fn number_move_word_right(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.move_word_right();
+            }
+        }
+    }
+
+    /// Move word left selecting in number input
+    pub fn number_move_word_left_selecting(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.move_word_left_selecting();
+            }
+        }
+    }
+
+    /// Move word right selecting in number input
+    pub fn number_move_word_right_selecting(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.move_word_right_selecting();
+            }
+        }
+    }
+
+    /// Select all text in number input
+    pub fn number_select_all(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.select_all();
+            }
+        }
+    }
+
+    /// Delete word backward in number input
+    pub fn number_delete_word_backward(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.delete_word_backward();
+            }
+        }
+    }
+
+    /// Delete word forward in number input
+    pub fn number_delete_word_forward(&mut self) {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::Number(ref mut n) = item.control {
+                n.delete_word_forward();
             }
         }
     }
@@ -885,6 +1433,24 @@ fn update_control_from_value(control: &mut SettingControl, value: &serde_json::V
                 state.entries = obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                 state.entries.sort_by(|a, b| a.0.cmp(&b.0));
             }
+        }
+        SettingControl::ObjectArray(state) => {
+            if let Some(arr) = value.as_array() {
+                state.bindings = arr.clone();
+            }
+        }
+        SettingControl::Json(state) => {
+            // Re-create from value with pretty printing
+            let json_str =
+                serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".to_string());
+            let json_str = if json_str.is_empty() {
+                "null".to_string()
+            } else {
+                json_str
+            };
+            state.original_text = json_str.clone();
+            state.editor.set_value(&json_str);
+            state.scroll_offset = 0;
         }
         SettingControl::Complex { .. } => {}
     }
@@ -1180,15 +1746,15 @@ mod tests {
         state.number_backspace();
 
         // Check edit text was modified
-        let edit_text = state.current_item().and_then(|item| {
+        let display_text = state.current_item().and_then(|item| {
             if let SettingControl::Number(ref n) = item.control {
-                Some(n.edit_text.clone())
+                Some(n.display_text())
             } else {
                 None
             }
         });
         // Original "4" should have last char removed, leaving ""
-        assert_eq!(edit_text, Some(String::new()));
+        assert_eq!(display_text, Some(String::new()));
 
         state.number_cancel();
     }

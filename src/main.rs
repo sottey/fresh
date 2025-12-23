@@ -2,9 +2,9 @@ use clap::Parser;
 use crossterm::{
     cursor::SetCursorStyle,
     event::{
-        poll as event_poll, read as event_read, Event as CrosstermEvent, KeyEvent, KeyEventKind,
-        KeyboardEnhancementFlags, MouseEvent, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        poll as event_poll, read as event_read, DisableBracketedPaste, EnableBracketedPaste,
+        Event as CrosstermEvent, KeyEvent, KeyEventKind, KeyboardEnhancementFlags, MouseEvent,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
@@ -13,7 +13,7 @@ use crossterm::{
 use fresh::services::gpm::{gpm_to_crossterm, GpmClient};
 use fresh::services::tracing_setup;
 use fresh::{
-    app::Editor, config, config::DirectoryContext, services::release_checker,
+    app::Editor, config, config_io::DirectoryContext, services::release_checker,
     services::signal_handler, services::warning_log::WarningLogHandle,
 };
 use ratatui::Terminal;
@@ -52,6 +52,10 @@ struct Args {
     /// Don't restore previous session (start fresh)
     #[arg(long)]
     no_session: bool,
+
+    /// Print the effective configuration as JSON and exit
+    #[arg(long)]
+    dump_config: bool,
 }
 
 /// Parsed file location from CLI argument in file:line:col format
@@ -258,12 +262,35 @@ fn initialize_app(args: &Args) -> io::Result<SetupState> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
         let _ = crossterm::execute!(stdout(), crossterm::event::DisableMouseCapture);
+        let _ = stdout().execute(DisableBracketedPaste);
         let _ = stdout().execute(SetCursorStyle::DefaultUserShape);
         let _ = stdout().execute(PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
         let _ = stdout().execute(LeaveAlternateScreen);
         original_hook(panic);
     }));
+
+    // Determine working directory early for config loading
+    let file_location = args
+        .file
+        .as_ref()
+        .map(|p| parse_file_location(p.to_string_lossy().as_ref()));
+
+    let (working_dir, file_to_open, show_file_explorer) = if let Some(ref loc) = file_location {
+        if loc.path.is_dir() {
+            (Some(loc.path.clone()), None, true)
+        } else {
+            (None, Some(loc.path.clone()), false)
+        }
+    } else {
+        (None, None, false)
+    };
+
+    // Load config - checking working directory first, then system paths
+    let effective_working_dir = working_dir
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
     let config = if let Some(config_path) = &args.config {
         match config::Config::load_from_file(config_path) {
@@ -278,7 +305,7 @@ fn initialize_app(args: &Args) -> io::Result<SetupState> {
             }
         }
     } else {
-        config::Config::load_or_default()
+        config::Config::load_for_working_dir(&effective_working_dir)
     };
 
     enable_raw_mode()?;
@@ -307,6 +334,10 @@ fn initialize_app(args: &Args) -> io::Result<SetupState> {
         tracing::info!("Using GPM for mouse capture, skipping crossterm mouse protocol");
     }
 
+    // Enable bracketed paste mode so external pastes arrive as Event::Paste
+    let _ = stdout().execute(EnableBracketedPaste);
+    tracing::info!("Enabled bracketed paste mode");
+
     let _ = stdout().execute(SetCursorStyle::BlinkingBlock);
     tracing::info!("Enabled blinking block cursor");
 
@@ -316,21 +347,6 @@ fn initialize_app(args: &Args) -> io::Result<SetupState> {
 
     let size = terminal.size()?;
     tracing::info!("Terminal size: {}x{}", size.width, size.height);
-
-    let file_location = args
-        .file
-        .as_ref()
-        .map(|p| parse_file_location(p.to_string_lossy().as_ref()));
-
-    let (working_dir, file_to_open, show_file_explorer) = if let Some(ref loc) = file_location {
-        if loc.path.is_dir() {
-            (Some(loc.path.clone()), None, true)
-        } else {
-            (None, Some(loc.path.clone()), false)
-        }
-    } else {
-        (None, None, false)
-    };
 
     let dir_context = DirectoryContext::from_system()?;
     let current_working_dir = working_dir;
@@ -379,6 +395,37 @@ fn main() -> io::Result<()> {
     // Parse command-line arguments
     let args = Args::parse();
 
+    // Handle --dump-config early (no terminal setup needed)
+    if args.dump_config {
+        let config = if let Some(config_path) = &args.config {
+            match config::Config::load_from_file(config_path) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!(
+                        "Error: Failed to load config from {}: {}",
+                        config_path.display(),
+                        e
+                    );
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+                }
+            }
+        } else {
+            config::Config::load_for_working_dir(&std::env::current_dir().unwrap_or_default())
+        };
+
+        // Pretty-print the config as JSON
+        match serde_json::to_string_pretty(&config) {
+            Ok(json) => {
+                println!("{}", json);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Error: Failed to serialize config: {}", e);
+                return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+            }
+        }
+    }
+
     let SetupState {
         config,
         mut warning_log_handle,
@@ -410,6 +457,9 @@ fn main() -> io::Result<()> {
         let first_run = is_first_run;
         let session_enabled = !args.no_session && file_to_open.is_none();
 
+        // Detect terminal color capability
+        let color_capability = fresh::view::color_support::ColorCapability::detect();
+
         let mut editor = Editor::with_working_dir(
             config.clone(),
             terminal_width,
@@ -417,6 +467,7 @@ fn main() -> io::Result<()> {
             current_working_dir.clone(),
             dir_context.clone(),
             !args.no_plugins,
+            color_capability,
         )?;
 
         #[cfg(target_os = "linux")]
@@ -494,6 +545,7 @@ fn main() -> io::Result<()> {
 
     // Clean up terminal
     let _ = crossterm::execute!(stdout(), crossterm::event::DisableMouseCapture);
+    let _ = stdout().execute(DisableBracketedPaste);
     let _ = stdout().execute(SetCursorStyle::DefaultUserShape);
     let _ = stdout().execute(PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
@@ -569,6 +621,7 @@ where
     let mut pending_event: Option<CrosstermEvent> = None;
 
     loop {
+        // Process async messages and poll for file changes (auto-revert, file tree)
         if editor.process_async_messages() {
             needs_render = true;
         }
@@ -637,6 +690,11 @@ where
                 editor.resize(w, h);
                 needs_render = true;
             }
+            CrosstermEvent::Paste(text) => {
+                // External paste from terminal (bracketed paste mode)
+                editor.paste_text(text);
+                needs_render = true;
+            }
             _ => {}
         }
     }
@@ -695,7 +753,7 @@ fn poll_with_gpm(
     );
 
     // Check GPM first (mouse events are typically less frequent)
-    if gpm_revents.map_or(false, |r| r.contains(PollFlags::POLLIN)) {
+    if gpm_revents.is_some_and(|r| r.contains(PollFlags::POLLIN)) {
         tracing::trace!("GPM poll: GPM fd has data, reading event...");
         match gpm.read_event() {
             Ok(Some(gpm_event)) => {
@@ -723,7 +781,7 @@ fn poll_with_gpm(
     }
 
     // Check stdin (crossterm events)
-    if stdin_revents.map_or(false, |r| r.contains(PollFlags::POLLIN)) {
+    if stdin_revents.is_some_and(|r| r.contains(PollFlags::POLLIN)) {
         // Use crossterm's read since it handles escape sequence parsing
         if event_poll(Duration::ZERO)? {
             return Ok(Some(event_read()?));

@@ -62,9 +62,10 @@ pub mod layout {
         terminal_height.saturating_sub(TOTAL_RESERVED_ROWS)
     }
 }
-use fresh::config::DirectoryContext;
+use fresh::config_io::DirectoryContext;
 use fresh::primitives::highlight_engine::HighlightEngine;
 use fresh::services::fs::{BackendMetrics, FsBackend, LocalFsBackend, SlowFsBackend, SlowFsConfig};
+use fresh::services::time_source::{SharedTimeSource, TestTimeSource};
 use fresh::{app::Editor, config::Config};
 use ratatui::{backend::TestBackend, Terminal};
 use std::io::{self, Write};
@@ -116,6 +117,10 @@ pub struct EditorTestHarness {
     /// Tokio runtime for async operations (needed for TypeScript plugins)
     _tokio_runtime: Option<tokio::runtime::Runtime>,
 
+    /// Test time source for controllable time in tests
+    /// All harness constructors use TestTimeSource for fast, deterministic testing
+    time_source: Arc<TestTimeSource>,
+
     /// Shadow string that mirrors editor operations for validation
     /// This helps catch discrepancies between piece tree and simple string operations
     shadow_string: String,
@@ -140,11 +145,16 @@ impl EditorTestHarness {
     /// Create new test harness with virtual terminal
     /// Uses a temporary directory to avoid loading plugins from the project directory
     /// Auto-indent is disabled by default to match shadow string behavior
+    /// Uses TestTimeSource for fast, deterministic time control
     pub fn new(width: u16, height: u16) -> io::Result<Self> {
         let temp_dir = TempDir::new()?;
         let temp_path = temp_dir.path().to_path_buf();
         // Create DirectoryContext pointing to temp dirs for test isolation
         let dir_context = DirectoryContext::for_testing(temp_dir.path());
+
+        // Create TestTimeSource for controllable time in tests
+        let test_time_source = Arc::new(TestTimeSource::new());
+        let time_source: SharedTimeSource = test_time_source.clone();
 
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend)?;
@@ -153,8 +163,16 @@ impl EditorTestHarness {
         config.check_for_updates = false; // Disable update checking in tests
         config.editor.double_click_time_ms = 10; // Fast double-click for faster tests
                                                  // Use temp directory to avoid loading project plugins in tests
-        let editor =
-            Editor::with_working_dir(config, width, height, Some(temp_path), dir_context, true)?;
+        let editor = Editor::for_test(
+            config,
+            width,
+            height,
+            Some(temp_path),
+            dir_context,
+            fresh::view::color_support::ColorCapability::TrueColor,
+            None,
+            Some(time_source),
+        )?;
 
         Ok(EditorTestHarness {
             editor,
@@ -162,6 +180,7 @@ impl EditorTestHarness {
             _temp_dir: Some(temp_dir),
             fs_metrics: None,
             _tokio_runtime: None,
+            time_source: test_time_source,
             shadow_string: String::new(),
             shadow_cursor: 0,
             enable_shadow_validation: false,
@@ -173,19 +192,32 @@ impl EditorTestHarness {
 
     /// Create with custom config
     /// Uses a temporary directory to avoid loading plugins from the project directory
+    /// Uses TestTimeSource for fast, deterministic time control
     pub fn with_config(width: u16, height: u16, mut config: Config) -> io::Result<Self> {
         let temp_dir = TempDir::new()?;
         let temp_path = temp_dir.path().to_path_buf();
         // Create DirectoryContext pointing to temp dirs for test isolation
         let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
+        // Create TestTimeSource for controllable time in tests
+        let test_time_source = Arc::new(TestTimeSource::new());
+        let time_source: SharedTimeSource = test_time_source.clone();
+
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend)?;
         // Disable update checking in tests to avoid flaky status bar changes
         config.check_for_updates = false;
         // Use temp directory to avoid loading project plugins in tests
-        let editor =
-            Editor::with_working_dir(config, width, height, Some(temp_path), dir_context, true)?;
+        let editor = Editor::for_test(
+            config,
+            width,
+            height,
+            Some(temp_path),
+            dir_context,
+            fresh::view::color_support::ColorCapability::TrueColor,
+            None,
+            Some(time_source),
+        )?;
 
         Ok(EditorTestHarness {
             editor,
@@ -193,6 +225,7 @@ impl EditorTestHarness {
             _temp_dir: Some(temp_dir),
             fs_metrics: None,
             _tokio_runtime: None,
+            time_source: test_time_source,
             shadow_string: String::new(),
             shadow_cursor: 0,
             enable_shadow_validation: false,
@@ -214,6 +247,7 @@ impl EditorTestHarness {
     }
 
     /// Create a test harness with a temporary project directory and custom config
+    /// Uses TestTimeSource for fast, deterministic time control
     pub fn with_temp_project_and_config(
         width: u16,
         height: u16,
@@ -222,6 +256,10 @@ impl EditorTestHarness {
         let temp_dir = TempDir::new()?;
         // Create DirectoryContext pointing to temp dirs for test isolation
         let dir_context = DirectoryContext::for_testing(temp_dir.path());
+
+        // Create TestTimeSource for controllable time in tests
+        let test_time_source = Arc::new(TestTimeSource::new());
+        let time_source: SharedTimeSource = test_time_source.clone();
 
         // Create a subdirectory with a constant name for deterministic paths
         let project_root = temp_dir.path().join("project_root");
@@ -232,8 +270,16 @@ impl EditorTestHarness {
         let terminal = Terminal::new(backend)?;
         // Disable update checking in tests to avoid flaky status bar changes
         config.check_for_updates = false;
-        let editor =
-            Editor::with_working_dir(config, width, height, Some(project_root), dir_context, true)?;
+        let editor = Editor::for_test(
+            config,
+            width,
+            height,
+            Some(project_root),
+            dir_context,
+            fresh::view::color_support::ColorCapability::TrueColor,
+            None,
+            Some(time_source),
+        )?;
 
         Ok(EditorTestHarness {
             editor,
@@ -241,6 +287,7 @@ impl EditorTestHarness {
             _temp_dir: Some(temp_dir),
             fs_metrics: None,
             _tokio_runtime: None,
+            time_source: test_time_source,
             shadow_string: String::new(),
             shadow_cursor: 0,
             enable_shadow_validation: false,
@@ -250,9 +297,23 @@ impl EditorTestHarness {
         })
     }
 
+    /// Create with explicit working directory, loading config from that directory.
+    /// This mirrors production behavior where config is loaded from the working directory.
+    /// Note: Creates a temp dir for DirectoryContext to ensure test isolation
+    /// Uses TestTimeSource for fast, deterministic time control
+    pub fn with_working_dir(
+        width: u16,
+        height: u16,
+        working_dir: std::path::PathBuf,
+    ) -> io::Result<Self> {
+        let config = Config::load_for_working_dir(&working_dir);
+        Self::with_config_and_working_dir(width, height, config, working_dir)
+    }
+
     /// Create with custom config and explicit working directory
     /// The working directory is used for LSP initialization and file operations
     /// Note: Creates a temp dir for DirectoryContext to ensure test isolation
+    /// Uses TestTimeSource for fast, deterministic time control
     pub fn with_config_and_working_dir(
         width: u16,
         height: u16,
@@ -263,14 +324,26 @@ impl EditorTestHarness {
         // Create DirectoryContext pointing to temp dirs for test isolation
         let dir_context = DirectoryContext::for_testing(temp_dir.path());
 
+        // Create TestTimeSource for controllable time in tests
+        let test_time_source = Arc::new(TestTimeSource::new());
+        let time_source: SharedTimeSource = test_time_source.clone();
+
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend)?;
 
         // Disable update checking in tests to avoid flaky status bar changes
         config.check_for_updates = false;
         // Create editor - it will create its own tokio runtime for async operations
-        let mut editor =
-            Editor::with_working_dir(config, width, height, Some(working_dir), dir_context, true)?;
+        let mut editor = Editor::for_test(
+            config,
+            width,
+            height,
+            Some(working_dir),
+            dir_context,
+            fresh::view::color_support::ColorCapability::TrueColor,
+            None,
+            Some(time_source),
+        )?;
 
         // Process any pending plugin commands (e.g., command registrations from TypeScript plugins)
         editor.process_async_messages();
@@ -281,6 +354,7 @@ impl EditorTestHarness {
             _temp_dir: Some(temp_dir),
             fs_metrics: None,
             _tokio_runtime: None,
+            time_source: test_time_source,
             shadow_string: String::new(),
             shadow_cursor: 0,
             enable_shadow_validation: false,
@@ -301,6 +375,7 @@ impl EditorTestHarness {
     /// Create with custom config, working directory, and shared DirectoryContext.
     /// This is useful for session restore tests that need to share state directories
     /// across multiple Editor instances.
+    /// Uses TestTimeSource for fast, deterministic time control
     pub fn with_shared_dir_context(
         width: u16,
         height: u16,
@@ -308,14 +383,26 @@ impl EditorTestHarness {
         working_dir: std::path::PathBuf,
         dir_context: DirectoryContext,
     ) -> io::Result<Self> {
+        // Create TestTimeSource for controllable time in tests
+        let test_time_source = Arc::new(TestTimeSource::new());
+        let time_source: SharedTimeSource = test_time_source.clone();
+
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend)?;
 
         // Disable update checking in tests to avoid flaky status bar changes
         config.check_for_updates = false;
         // Create editor - it will create its own tokio runtime for async operations
-        let mut editor =
-            Editor::with_working_dir(config, width, height, Some(working_dir), dir_context, true)?;
+        let mut editor = Editor::for_test(
+            config,
+            width,
+            height,
+            Some(working_dir),
+            dir_context,
+            fresh::view::color_support::ColorCapability::TrueColor,
+            None,
+            Some(time_source),
+        )?;
 
         // Process any pending plugin commands (e.g., command registrations from TypeScript plugins)
         editor.process_async_messages();
@@ -326,6 +413,7 @@ impl EditorTestHarness {
             _temp_dir: None, // No owned temp dir - caller manages the shared context
             fs_metrics: None,
             _tokio_runtime: None,
+            time_source: test_time_source,
             shadow_string: String::new(),
             shadow_cursor: 0,
             enable_shadow_validation: false,
@@ -337,11 +425,16 @@ impl EditorTestHarness {
 
     /// Create a test harness with a slow filesystem backend for performance testing
     /// Returns the harness and provides access to filesystem metrics
+    /// Uses TestTimeSource for fast, deterministic time control
     pub fn with_slow_fs(width: u16, height: u16, slow_config: SlowFsConfig) -> io::Result<Self> {
         let temp_dir = TempDir::new()?;
         let temp_path = temp_dir.path().to_path_buf();
         // Create DirectoryContext pointing to temp dirs for test isolation
         let dir_context = DirectoryContext::for_testing(temp_dir.path());
+
+        // Create TestTimeSource for controllable time in tests
+        let test_time_source = Arc::new(TestTimeSource::new());
+        let time_source: SharedTimeSource = test_time_source.clone();
 
         // Create slow filesystem backend wrapping the local backend
         let local_backend = Arc::new(LocalFsBackend::new());
@@ -355,14 +448,16 @@ impl EditorTestHarness {
         // Disable update checking in tests to avoid flaky status bar changes
         config.check_for_updates = false;
 
-        // Create editor with custom filesystem backend
-        let editor = Editor::with_fs_backend_for_test(
+        // Create editor with custom filesystem backend and time source
+        let editor = Editor::for_test(
             config,
             width,
             height,
             Some(temp_path),
-            fs_backend,
             dir_context,
+            fresh::view::color_support::ColorCapability::TrueColor,
+            Some(fs_backend),
+            Some(time_source),
         )?;
 
         Ok(EditorTestHarness {
@@ -371,6 +466,7 @@ impl EditorTestHarness {
             _temp_dir: Some(temp_dir),
             fs_metrics: Some(metrics_arc),
             _tokio_runtime: None,
+            time_source: test_time_source,
             shadow_string: String::new(),
             shadow_cursor: 0,
             enable_shadow_validation: false,
@@ -378,6 +474,37 @@ impl EditorTestHarness {
             term_width: width,
             term_height: height,
         })
+    }
+
+    /// Advance the test time source by the given duration (instant, no real wait).
+    ///
+    /// Use this for time-based editor logic like:
+    /// - Auto-save intervals
+    /// - Debounce timers that check elapsed time
+    /// - Rate limiting based on time
+    ///
+    /// Do NOT use this for waiting on async I/O operations (file changes, LSP responses).
+    /// For those, use `wait_for_async` or real `std::thread::sleep`.
+    pub fn advance_time(&self, duration: std::time::Duration) {
+        self.time_source.advance(duration);
+    }
+
+    /// Sleep using the test time source (instant logical time advancement).
+    ///
+    /// This is equivalent to `advance_time` - it advances logical time without
+    /// actually waiting. Use this to replace `thread::sleep` in tests that are
+    /// waiting for time-based editor logic.
+    ///
+    /// # When to use this vs `std::thread::sleep`:
+    /// - Use `sleep()` for time-based editor logic (debounce, rate limiting, auto-save)
+    /// - Use `std::thread::sleep()` for waiting on real async I/O (file changes, LSP, plugins)
+    pub fn sleep(&self, duration: std::time::Duration) {
+        self.advance_time(duration);
+    }
+
+    /// Get the test time source.
+    pub fn time_source(&self) -> &Arc<TestTimeSource> {
+        &self.time_source
     }
 
     /// Get filesystem metrics (if using slow filesystem backend)
@@ -1239,8 +1366,8 @@ impl EditorTestHarness {
         Ok(())
     }
 
-    /// Process pending async messages and render
-    /// Useful for testing async features like git grep, file explorer, etc.
+    /// Process pending async messages (including file polling) and render
+    /// Useful for testing async features like git grep, file explorer, auto-revert, etc.
     pub fn process_async_and_render(&mut self) -> io::Result<()> {
         let _ = self.editor.process_async_messages();
         self.render()?;
@@ -1270,17 +1397,68 @@ impl EditorTestHarness {
     /// Wait indefinitely for async operations until condition is met
     /// Repeatedly processes async messages until condition is met (no timeout)
     /// Use this for semantic events that must eventually occur
+    ///
+    /// Note: Uses a short real wall-clock sleep between iterations to allow
+    /// async I/O operations (running on tokio runtime) time to complete.
     pub fn wait_until<F>(&mut self, mut condition: F) -> io::Result<()>
     where
         F: FnMut(&Self) -> bool,
     {
+        const WAIT_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
         loop {
             self.process_async_and_render()?;
             if condition(self) {
                 return Ok(());
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            // Sleep for real wall-clock time to allow async I/O operations to complete
+            // These run on the tokio runtime and need actual time, not logical time
+            std::thread::sleep(WAIT_SLEEP);
+            // Also advance test time so time-based features (polling, debounce) continue working
+            self.advance_time(WAIT_SLEEP);
         }
+    }
+
+    // ===== File Explorer Wait Helpers =====
+
+    /// Wait for file explorer to be initialized (has a view)
+    pub fn wait_for_file_explorer(&mut self) -> io::Result<()> {
+        self.wait_until(|h| h.editor().file_explorer().is_some())
+    }
+
+    /// Wait for file explorer to show a specific item by name (in the tree, not tabs)
+    /// The file explorer tree uses │ characters, so we check for lines containing both
+    /// Also ensures the file_explorer object exists (not taken for async operation)
+    pub fn wait_for_file_explorer_item(&mut self, name: &str) -> io::Result<()> {
+        let name = name.to_string();
+        self.wait_until(move |h| {
+            // Ensure file_explorer exists (not None during async operation)
+            if h.editor().file_explorer().is_none() {
+                return false;
+            }
+            let screen = h.screen_to_string();
+            // Look for the item in a file explorer tree line (contains │ tree connector)
+            // or in a line with tree markers like > or ▼
+            screen.lines().any(|line| {
+                line.contains(&name)
+                    && (line.contains("│") || line.contains(">") || line.contains("▼"))
+            })
+        })
+    }
+
+    /// Wait for a prompt to become active
+    pub fn wait_for_prompt(&mut self) -> io::Result<()> {
+        self.wait_until(|h| h.editor().is_prompting())
+    }
+
+    /// Wait for prompt to close (no longer prompting)
+    pub fn wait_for_prompt_closed(&mut self) -> io::Result<()> {
+        self.wait_until(|h| !h.editor().is_prompting())
+    }
+
+    /// Wait for screen to contain specific text
+    pub fn wait_for_screen_contains(&mut self, text: &str) -> io::Result<()> {
+        let text = text.to_string();
+        self.wait_until(move |h| h.screen_to_string().contains(&text))
     }
 
     /// Capture a visual step for regression testing

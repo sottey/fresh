@@ -169,6 +169,9 @@ impl TextBuffer {
     pub fn from_bytes(content: Vec<u8>) -> Self {
         let bytes = content.len();
 
+        // Auto-detect line ending format from content
+        let line_ending = Self::detect_line_ending(&content);
+
         // Create initial StringBuffer with ID 0
         let buffer = StringBuffer::new(0, content);
         let line_feed_cnt = buffer.line_feed_count();
@@ -182,6 +185,7 @@ impl TextBuffer {
         let saved_root = piece_tree.root();
 
         TextBuffer {
+            line_ending,
             piece_tree,
             saved_root,
             buffers: vec![buffer],
@@ -191,7 +195,6 @@ impl TextBuffer {
             recovery_pending: false,
             large_file: false,
             is_binary: false,
-            line_ending: LineEnding::default(),
             saved_file_size: Some(bytes), // Treat initial content as "saved" state
         }
     }
@@ -256,13 +259,11 @@ impl TextBuffer {
         // Detect if this is a binary file
         let is_binary = Self::detect_binary(&contents);
 
-        // Detect line ending format before normalizing
+        // Detect line ending format (CRLF/LF/CR) - used for Enter key insertion
         let line_ending = Self::detect_line_ending(&contents);
 
-        // Normalize line endings to LF for internal representation
-        let normalized_contents = Self::normalize_line_endings(contents);
-
-        let mut buffer = Self::from_bytes(normalized_contents);
+        // Keep original line endings - the view layer handles CRLF display
+        let mut buffer = Self::from_bytes(contents);
         buffer.file_path = Some(path.to_path_buf());
         buffer.modified = false;
         buffer.large_file = false;
@@ -385,12 +386,11 @@ impl TextBuffer {
 
             match &buffer.data {
                 BufferData::Loaded { data, .. } => {
-                    // Write from memory, converting line endings if necessary
+                    // Write from memory (line endings are already correct in buffer)
                     let start = piece_view.buffer_offset;
                     let end = start + piece_view.bytes;
                     let chunk = &data[start..end];
-                    let converted = Self::convert_line_endings(chunk, self.line_ending);
-                    out_file.write_all(&converted)?;
+                    out_file.write_all(chunk)?;
                 }
                 BufferData::Unloaded {
                     file_path,
@@ -1404,6 +1404,7 @@ impl TextBuffer {
     /// Converts CRLF (\r\n) and CR (\r) to LF (\n) for internal representation.
     /// This makes editing and cursor movement simpler while preserving the
     /// original format for saving.
+    #[allow(dead_code)] // Kept for tests and potential future use
     pub fn normalize_line_endings(bytes: Vec<u8>) -> Vec<u8> {
         let mut normalized = Vec::with_capacity(bytes.len());
         let mut i = 0;
@@ -1433,6 +1434,7 @@ impl TextBuffer {
     /// Convert LF line endings back to the specified format
     ///
     /// Used when saving files to restore the original line ending format.
+    #[allow(dead_code)] // No longer used - line endings are preserved as-is
     fn convert_line_endings(bytes: &[u8], target_ending: LineEnding) -> Vec<u8> {
         if target_ending == LineEnding::LF {
             // No conversion needed

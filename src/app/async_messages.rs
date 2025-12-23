@@ -474,14 +474,12 @@ impl Editor {
 
         // Track rapid file change events - only disable after many reverts in short window
         if let Some((window_start, count)) = self.file_rapid_change_counts.get_mut(&path_buf) {
-            if window_start.elapsed() < DEBOUNCE_WINDOW {
+            if self.time_source.elapsed_since(*window_start) < DEBOUNCE_WINDOW {
                 *count += 1;
 
                 if *count >= RAPID_REVERT_THRESHOLD {
-                    // Disable auto-revert and stop the file watcher
+                    // Disable auto-revert
                     self.auto_revert_enabled = false;
-                    self.file_watcher = None;
-                    self.watched_dirs.clear();
                     self.status_message = Some(format!(
                         "Auto-revert disabled: {} is updating too frequently (use Ctrl+Shift+R to re-enable)",
                         path_buf.file_name().unwrap_or_default().to_string_lossy()
@@ -497,12 +495,12 @@ impl Editor {
             } else {
                 // Reset counter - start a new window
                 *count = 1;
-                *window_start = Instant::now();
+                *window_start = self.time_source.now();
             }
         } else {
             // First event for this file
             self.file_rapid_change_counts
-                .insert(path_buf.clone(), (Instant::now(), 1));
+                .insert(path_buf.clone(), (self.time_source.now(), 1));
         }
 
         tracing::info!("File changed externally: {}", path);

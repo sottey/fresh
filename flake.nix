@@ -48,6 +48,8 @@
             (craneLib.fileset.commonCargoSources unfilteredRoot)
             # Also keep any javascript files
             (lib.fileset.fileFilter (file: file.hasExt "js") unfilteredRoot)
+            # Keep sublime-syntax grammar files (used by include_str! in grammar_registry.rs)
+            (lib.fileset.fileFilter (file: file.hasExt "sublime-syntax") unfilteredRoot)
             ./docs
             ./keymaps
             ./plugins
@@ -162,13 +164,11 @@
           default = fresh;
         };
 
-        apps.default =
-          flake-utils.lib.mkApp {
-            drv = fresh;
-          }
-          // {
-            meta.description = "Text editor for your terminal: easy, powerful and fast";
-          };
+        apps.default = {
+          type = "app";
+          program = "${fresh}/bin/fresh";
+          meta.description = "Text editor for your terminal: easy, powerful and fast";
+        };
 
         devShells.default = craneLib.devShell (
           commonVars

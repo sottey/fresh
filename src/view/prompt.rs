@@ -55,12 +55,18 @@ pub enum PromptType {
     JumpToBookmark,
     /// Set compose width (empty clears to viewport)
     SetComposeWidth,
+    /// Set tab size for current buffer
+    SetTabSize,
+    /// Set line ending format for current buffer
+    SetLineEnding,
     /// Stop a running LSP server (select from list)
     StopLspServer,
     /// Select a theme (select from list)
     SelectTheme,
     /// Select a keybinding map (select from list)
     SelectKeybindingMap,
+    /// Select a theme for copy with formatting
+    CopyWithFormattingTheme,
     /// Confirm reverting a modified file
     ConfirmRevert,
     /// Confirm saving over a file that changed on disk

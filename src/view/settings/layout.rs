@@ -172,6 +172,18 @@ impl SettingsLayout {
                             }
                         }
                     }
+                    ControlLayoutInfo::ObjectArray { entry_rows } => {
+                        for (row_idx, row_area) in entry_rows.iter().enumerate() {
+                            if self.contains(*row_area, x, y) {
+                                return Some(SettingsHit::ControlMapRow(item.index, row_idx));
+                            }
+                        }
+                    }
+                    ControlLayoutInfo::Json { edit_area } => {
+                        if self.contains(*edit_area, x, y) {
+                            return Some(SettingsHit::ControlText(item.index));
+                        }
+                    }
                     ControlLayoutInfo::Complex => {}
                 }
 

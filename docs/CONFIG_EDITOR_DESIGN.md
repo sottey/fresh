@@ -313,9 +313,9 @@ At the bottom of the settings panel, contextual actions:
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **Reset to Default**: Reset current setting only
-- **Revert All Changes**: Discard all pending changes
-- **Save**: Write config.json (Ctrl+S shortcut)
+- **Reset**: Reset current setting to default
+- **Save**: Save changes and close dialog
+- **Cancel**: Discard changes and close dialog (shows confirmation if unsaved changes exist)
 
 ---
 
@@ -324,15 +324,13 @@ At the bottom of the settings panel, contextual actions:
 | Key | Action |
 |-----|--------|
 | `↑` `↓` | Navigate settings list |
-| `←` `→` | Switch between category tree and settings panel |
-| `Enter` | Toggle bool, open dropdown, edit value |
+| `←` `→` | Switch between category tree and settings panel (or increment/decrement values) |
+| `Enter` | Toggle bool, open dropdown, edit value, or activate footer button |
 | `Space` | Toggle boolean (alternative) |
-| `Tab` | Move to next setting / next control |
-| `Shift+Tab` | Move to previous setting |
+| `Tab` | Cycle between panels: categories → settings → footer buttons |
+| `Shift+Tab` | Cycle panels in reverse |
 | `/` | Focus search field |
 | `Esc` | Clear search / close dropdown / exit settings |
-| `Ctrl+S` | Save changes |
-| `Ctrl+Z` | Undo last change |
 | `?` | Show help overlay |
 
 ### Category Tree Navigation
@@ -724,12 +722,12 @@ Add to the `Action` enum:
 #### Keybinding Defaults
 
 Register these in the `default` keymap for `KeyContext::Settings`:
-- `Escape` → `SettingsClose`
-- `Ctrl+S` → `SettingsSave`
+- `Escape` → `CloseSettings`
 - `/` → `SettingsSearch`
-- `Up/Down` → `SettingsNavigate`
-- `Enter/Space` → `SettingsToggle`
-- `Tab` → Focus next control
+- `Up/Down` → Navigate settings
+- `Left/Right` → Increment/decrement values, or navigate footer buttons
+- `Enter` → Toggle/activate current control
+- `Tab` → Cycle focus between panels (categories → settings → footer)
 - `?` → Show help overlay
 
 ### Rendering Integration
@@ -778,22 +776,29 @@ Following the `FileBrowserLayout` pattern:
 
 ---
 
-## Migration from Plugin
+## Migration from Plugin ✅ COMPLETE
 
-The current `plugins/config_editor.ts` provides similar functionality via the plugin API. Migration steps:
+The `plugins/config_editor.ts` plugin has been fully removed. The built-in Settings UI is now the only way to edit configuration (besides directly editing config.json).
 
-1. Implement native settings view in Rust
-2. Add `open_settings` action to command palette
-3. Deprecate `config_editor.ts` plugin
-4. Remove after one release cycle
+### What was done:
+
+1. ✅ Implemented native settings view in Rust
+2. ✅ Added `OpenSettings` action to command palette
+3. ✅ Added `Ctrl+,` keybinding to open Settings
+4. ✅ Added "Settings..." to Edit menu
+5. ✅ Removed `config_editor.ts` plugin and its e2e tests
+6. ✅ Removed `s` and `Ctrl+S` keybindings (previously used by plugin)
+7. ✅ Settings dialog now consumes all keyboard input (global shortcuts don't leak through)
+8. ✅ Theme and keybinding changes are applied immediately after saving
 
 ### Advantages of Native Implementation
 
 - Faster startup (no JavaScript evaluation)
 - Direct access to Config struct and schema
-- Better keyboard handling
+- Better keyboard handling (consumes all input when modal is open)
 - Consistent with other native UI components
 - No TextEncoder/TextDecoder polyfill issues
+- Runtime state updates (theme, keybindings) applied immediately
 
 ---
 
@@ -807,9 +812,37 @@ The current `plugins/config_editor.ts` provides similar functionality via the pl
 | Phase 2: Schema Generation | ✅ DONE | 5-line binary replaces 620-line build.rs |
 | Phase 3: Settings UI | ✅ DONE | Basic modal with navigation working |
 | Phase 4: Search & Polish | ✅ DONE | Help overlay, confirmation dialog, search UI all working |
-| Phase 5: Migration | ✅ DONE | Command palette, menu integration, keybinding added |
+| Phase 5: Migration | ✅ DONE | Plugin removed, Settings UI is now the only config editor |
+
+### Current Implementation Details
+
+The settings panel now includes:
+
+1. **Description display**: Each setting shows its description below the control in a subdued color. Descriptions are truncated with "..." if they exceed the available width.
+
+2. **Smart highlighting**: Selection and hover highlights only cover content rows (control + description), not the empty spacing row between items. This provides cleaner visual feedback.
+
+3. **Horizontal padding**: Settings panel content has 2-character padding from the vertical separator for better visual separation.
+
+4. **Column alignment**: All single-row controls (Toggle, Number, Dropdown, Text) align their labels in columns using a calculated maximum label width.
 
 ### Known Bugs (found during testing)
+
+#### Critical UX Gaps (blocking intuitive use)
+
+The following issues make the Settings UI difficult or impossible to use for common tasks:
+
+1. **Complex settings not editable** - Keybindings and LSP settings cannot be added/edited through the UI. Users must edit `config.toml` directly for these.
+
+2. ~~**[+] Add new buttons non-functional**~~ - ✅ Fixed: Map controls now show text input when pressing Enter on "[+] Add new".
+
+3. ~~**Search is broken**~~ - ✅ Fixed: Search field now displays typed text correctly.
+
+4. ~~**No selection indicators**~~ - ✅ Fixed: Selection highlighting now shows for both categories and settings.
+
+5. ~~**Empty Unsaved Changes dialog**~~ - ✅ Verified working: Dialog correctly displays pending changes.
+
+#### Bug Table
 
 | Bug | Severity | Status | Description |
 |-----|----------|--------|-------------|
@@ -818,22 +851,28 @@ The current `plugins/config_editor.ts` provides similar functionality via the pl
 | Map entry values not editable | High | Open | Map entries show `{N fields}` but expanding/editing individual fields not implemented. |
 | Dropdown editing doesn't work | High | ✅ Fixed | Enter/arrows on dropdown now work correctly. |
 | Number input editing not implemented | High | ✅ Fixed | Enter to edit, type value, Enter to confirm. Left/Right also increment/decrement. |
-| No settings item selection indicator | Medium | Open | Can't see which setting is selected in the settings panel. This makes navigation nearly unusable. |
+| No settings item selection indicator | Medium | ✅ Fixed | Selection highlighting now shows for focused settings items. |
 | View doesn't scroll to selection | Medium | Open | After search jump, view doesn't scroll to show the selected item. |
-| Search text input broken | High | ✅ Fixed | Settings actions weren't routed to handle_action. |
+| Search text input broken | High | ✅ Fixed | Search field now displays typed text correctly. |
 | Confirmation dialog empty | Medium | ✅ Fixed | Dialog height calculation was off by 1, causing changes to overlap with separator. |
-| No button selection indicator | Medium | ✅ Fixed | Added ▶ indicator and bold styling for selected button. |
-| No panel focus indicator | Low | Open | Can't visually tell if categories or settings panel has focus. |
+| No button selection indicator | Medium | ✅ Fixed | Added > indicator and bold styling for selected button. |
+| No panel focus indicator | Low | Open | Can't visually tell if categories or settings panel has focus. Footer panel shows focus (>) but categories/settings don't. |
 | Terminal captures input when Settings opens | High | ✅ Fixed | Added Settings to popup/prompt check in input routing. Also added OpenSettings to terminal UI actions. |
-| Footer buttons inaccessible via keyboard | High | ✅ Fixed | Added FocusPanel enum with Categories/Settings/Footer states. Tab now cycles through all three panels. |
+| Footer buttons inaccessible via keyboard | High | ✅ Fixed | Added FocusPanel enum with Categories/Settings/Footer states. Tab now cycles through all three panels. Footer buttons now navigable with Left/Right arrows. |
+| Global shortcuts leak through Settings | High | ✅ Fixed | Ctrl+P (palette), Ctrl+Q (quit), etc. were not consumed when Settings was open. Fixed by consuming all unhandled keys in Settings context. |
 | Search results unrelated to query | Medium | Open | Searching "font" returns 14 results with no "font" matches. Fuzzy matching too aggressive or broken. |
 | "●" indicator unexplained | Low | Open | Some categories show ● with no explanation. Users don't know if it means unsaved changes, errors, etc. |
 | Left/Right for +/- undiscoverable | Low | Open | Arrow keys increment/decrement number fields but help text only shows "↑↓:Navigate". |
 | Cancel in Unsaved Changes dialog closes everything | Medium | Open | "Cancel" should return to Settings, but instead closes the entire dialog like Discard. |
-| [+] Add new buttons don't respond | Medium | Open | Pressing Enter on "[+] Add new" for Keybinding Maps/Languages produces no response. |
-| Empty Unsaved Changes dialog persists | Medium | Open | "You have unsaved changes" dialog appears with no changes listed, persists across Settings reopens. |
+| [+] Add new buttons don't respond | High | ✅ Fixed | Map controls now show text input field when pressing Enter on "[+] Add new". Type key name, press Enter to add entry. |
+| Empty Unsaved Changes dialog persists | Medium | ✅ Fixed | Dialog now correctly displays pending changes (e.g., "• /check_for_updates: true"). |
 | Dropdown options have no selection indicator | Low | Open | When dropdown is open, no visible highlight shows which option is selected (only preview updates). |
 | Escape doesn't close Settings directly | Low | Open | Help text says "Esc:Close" but Escape only triggers unsaved changes flow, doesn't close directly. |
+| Theme not applied after save | High | ✅ Fixed | save_settings() now updates runtime state (theme, keybindings) after saving config. |
+| Number input appends instead of replaces | Medium | Open | When pressing Enter to edit a number field, typing appends to existing value instead of replacing. User must manually clear with Backspace first. |
+| Category selection indicator missing | Medium | ✅ Fixed | Selection highlighting now shows for focused category in the left panel. |
+| Language entries not expandable | High | Open | Individual language configurations (extensions, grammar, comment prefix, etc.) cannot be viewed or edited. Only the enabled checkbox is accessible. |
+| No LSP settings section visible | Medium | Open | LSP/Language Server settings mentioned in design doc are not visible. No way to configure LSP servers from Settings UI. |
 
 ### Phase 1: Core Controls Module ✅
 
@@ -888,13 +927,13 @@ fn main() {
 
 **Usage:**
 ```bash
-cargo run --bin generate_schema > plugins/config-schema.json
+cargo run --features dev-bins --bin generate_schema > plugins/config-schema.json
 ```
 
 **CI verification** (in `.github/workflows/ci.yml`):
 ```yaml
 - name: Generate schema
-  run: cargo run --bin generate_schema > /tmp/config-schema.json
+  run: cargo run --features dev-bins --bin generate_schema > /tmp/config-schema.json
 - name: Check schema is up-to-date
   run: diff -u plugins/config-schema.json /tmp/config-schema.json
 ```
@@ -966,17 +1005,18 @@ Add search functionality and UX polish.
 - Help overlay (?)
 - Unsaved changes confirmation dialog
 
-### Phase 5: Migration & Cleanup
+### Phase 5: Migration & Cleanup ✅
 
 Replace the plugin-based config editor.
 
-**Steps:**
-1. Add command palette entry "Edit Settings" → `OpenSettings` action
-2. Add to Edit menu
-3. Add keyboard shortcut (e.g., `Ctrl+,`)
-4. Deprecation notice in config_editor.ts plugin
-5. Remove plugin after one release cycle
-6. Remove ~600 lines of custom parsing from build.rs (replaced by fresh-config crate)
+**Completed steps:**
+1. ✅ Added command palette entry "Settings" → `OpenSettings` action
+2. ✅ Added "Settings..." to Edit menu
+3. ✅ Added keyboard shortcut `Ctrl+,`
+4. ✅ Removed `config_editor.ts` plugin entirely
+5. ✅ Removed `s` and `Ctrl+S` keybindings from default keymap
+6. ✅ Settings dialog consumes all keyboard input (no global shortcut leakage)
+7. ✅ Runtime state (theme, keybindings) updated immediately on save
 
 ---
 

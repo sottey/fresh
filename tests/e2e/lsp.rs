@@ -17,6 +17,7 @@ fn test_lsp_completion_popup_text_not_mangled() -> std::io::Result<()> {
     state.apply(&Event::ShowPopup {
         popup: PopupData {
             title: Some("Completion".to_string()),
+            transient: false,
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
@@ -100,6 +101,7 @@ fn test_lsp_completion_replaces_word() -> std::io::Result<()> {
     state.apply(&Event::ShowPopup {
         popup: PopupData {
             title: Some("Completion".to_string()),
+            transient: false,
             content: PopupContentData::List {
                 items: vec![PopupListItemData {
                     text: "test_function".to_string(),
@@ -187,6 +189,7 @@ fn test_lsp_completion_popup() -> std::io::Result<()> {
     state.apply(&Event::ShowPopup {
         popup: PopupData {
             title: Some("Completion".to_string()),
+            transient: false,
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
@@ -349,6 +352,7 @@ fn test_lsp_completion_navigation() -> std::io::Result<()> {
     state.apply(&Event::ShowPopup {
         popup: PopupData {
             title: Some("Completion".to_string()),
+            transient: false,
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
@@ -418,6 +422,7 @@ fn test_lsp_completion_cancel() -> std::io::Result<()> {
     state.apply(&Event::ShowPopup {
         popup: PopupData {
             title: Some("Completion".to_string()),
+            transient: false,
             content: PopupContentData::List {
                 items: vec![PopupListItemData {
                     text: "completion_item".to_string(),
@@ -472,6 +477,7 @@ fn test_lsp_completion_after_dot() -> std::io::Result<()> {
     state.apply(&Event::ShowPopup {
         popup: PopupData {
             title: Some("Completion".to_string()),
+            transient: false,
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
@@ -534,6 +540,7 @@ fn test_lsp_completion_after_dot_with_partial() -> std::io::Result<()> {
     state.apply(&Event::ShowPopup {
         popup: PopupData {
             title: Some("Completion".to_string()),
+            transient: false,
             content: PopupContentData::List {
                 items: vec![PopupListItemData {
                     text: "length".to_string(),
@@ -586,6 +593,7 @@ fn test_lsp_completion_filtering() -> std::io::Result<()> {
     state.apply(&Event::ShowPopup {
         popup: PopupData {
             title: Some("Completion".to_string()),
+            transient: false,
             content: PopupContentData::List {
                 items: vec![
                     // Only items matching "test_" prefix should appear
@@ -677,6 +685,7 @@ fn test_lsp_completion_popup_size() -> std::io::Result<()> {
     state.apply(&Event::ShowPopup {
         popup: PopupData {
             title: Some("Completion".to_string()),
+            transient: false,
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
@@ -769,7 +778,7 @@ fn test_lsp_waiting_indicator() -> std::io::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::client::LspServerConfig {
+        fresh::services::lsp::LspServerConfig {
             command: FakeLspServer::script_path().to_string_lossy().to_string(),
             args: vec![],
             enabled: true,
@@ -802,7 +811,7 @@ fn test_lsp_waiting_indicator() -> std::io::Result<()> {
     // Process async messages to get LSP response
     for _ in 0..10 {
         harness.process_async_and_render()?;
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        harness.sleep(std::time::Duration::from_millis(50));
     }
 
     // Get the screen content
@@ -841,6 +850,7 @@ fn test_lsp_completion_popup_hides_background() -> std::io::Result<()> {
     state.apply(&Event::ShowPopup {
         popup: PopupData {
             title: Some("Completion".to_string()),
+            transient: false,
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
@@ -942,7 +952,7 @@ fn test_lsp_completion_canceled_on_cursor_move() -> std::io::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::client::LspServerConfig {
+        fresh::services::lsp::LspServerConfig {
             command: FakeLspServer::script_path().to_string_lossy().to_string(),
             args: vec![],
             enabled: true,
@@ -1007,7 +1017,7 @@ fn test_lsp_cursor_animation() -> std::io::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::client::LspServerConfig {
+        fresh::services::lsp::LspServerConfig {
             command: FakeLspServer::script_path().to_string_lossy().to_string(),
             args: vec![],
             enabled: true,
@@ -1043,7 +1053,7 @@ fn test_lsp_cursor_animation() -> std::io::Result<()> {
     // Process async messages to get LSP response
     for _ in 0..10 {
         harness.process_async_and_render()?;
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        harness.sleep(std::time::Duration::from_millis(50));
     }
 
     // Get screen after LSP request
@@ -1073,7 +1083,7 @@ fn test_lsp_completion_canceled_on_text_edit() -> std::io::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::client::LspServerConfig {
+        fresh::services::lsp::LspServerConfig {
             command: FakeLspServer::script_path().to_string_lossy().to_string(),
             args: vec![],
             enabled: true,
@@ -1184,7 +1194,7 @@ edition = "2021"
     let mut lsp_ready = false;
     for _ in 0..40 {
         // Wait 100ms
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        harness.sleep(std::time::Duration::from_millis(100));
 
         // Process async messages
         let _ = harness.editor_mut().process_async_messages();
@@ -1208,7 +1218,7 @@ edition = "2021"
     let mut had_progress = false;
     for i in 0..120 {
         // Wait up to 12 seconds for indexing
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        harness.sleep(std::time::Duration::from_millis(100));
         let processed = harness.editor_mut().process_async_messages();
         if i < 10 && processed {
             println!("  Processed async messages at {}ms", i * 100);
@@ -1239,9 +1249,9 @@ edition = "2021"
     // Extra safety: wait a bit after progress ends to ensure all state is updated
     // rust-analyzer needs extra time after indexing to build its full semantic model
     println!("Waiting for rust-analyzer semantic analysis...");
-    std::thread::sleep(std::time::Duration::from_millis(2000));
+    harness.sleep(std::time::Duration::from_millis(2000));
     for _ in 0..20 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        harness.sleep(std::time::Duration::from_millis(100));
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
     }
@@ -1313,7 +1323,7 @@ edition = "2021"
     // Wait for LSP response (rust-analyzer can take several seconds)
     let mut rename_succeeded = false;
     for i in 0..20 {
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        harness.sleep(std::time::Duration::from_millis(500));
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
 
@@ -1655,7 +1665,7 @@ fn test_lsp_diagnostics_non_blocking() -> std::io::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::client::LspServerConfig {
+        fresh::services::lsp::LspServerConfig {
             command: FakeLspServer::blocking_script_path()
                 .to_string_lossy()
                 .to_string(),
@@ -1811,7 +1821,7 @@ fn test_rust_analyzer_rename_real_scenario() -> std::io::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::client::LspServerConfig {
+        fresh::services::lsp::LspServerConfig {
             command: "rust-analyzer".to_string(),
             args: vec![
                 "--log-file".to_string(),
@@ -1841,7 +1851,7 @@ fn test_rust_analyzer_rename_real_scenario() -> std::io::Result<()> {
     // Wait INDEFINITELY for LSP to initialize (no timeout as user requested)
     let mut wait_count = 0;
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        harness.sleep(std::time::Duration::from_millis(500));
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
         wait_count += 1;
@@ -1908,7 +1918,7 @@ fn test_rust_analyzer_rename_real_scenario() -> std::io::Result<()> {
     // Wait INDEFINITELY for LSP response (no timeout)
     eprintln!("Waiting for rust-analyzer response (no timeout)...");
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        harness.sleep(std::time::Duration::from_millis(200));
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
 
@@ -2185,7 +2195,7 @@ edition = "2021"
     let mut lsp_ready = false;
     for i in 0..240 {
         // Up to 24 seconds
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        harness.sleep(std::time::Duration::from_millis(100));
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
 
@@ -2216,7 +2226,7 @@ edition = "2021"
     eprintln!("Waiting for indexing...");
     let mut had_progress = false;
     for i in 0..120 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        harness.sleep(std::time::Duration::from_millis(100));
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
 
@@ -2242,9 +2252,9 @@ edition = "2021"
 
     // Extra wait for semantic analysis (rust-analyzer needs this)
     eprintln!("Waiting for semantic analysis...");
-    std::thread::sleep(std::time::Duration::from_millis(2000));
+    harness.sleep(std::time::Duration::from_millis(2000));
     for _ in 0..20 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        harness.sleep(std::time::Duration::from_millis(100));
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
     }
@@ -2293,7 +2303,7 @@ edition = "2021"
     // Wait for LSP response
     eprintln!("Waiting for first rename response...");
     for _ in 0..40 {
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        harness.sleep(std::time::Duration::from_millis(250));
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
 
@@ -2359,7 +2369,7 @@ edition = "2021"
     // Wait for LSP response
     eprintln!("Waiting for second rename response...");
     for _ in 0..40 {
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        harness.sleep(std::time::Duration::from_millis(250));
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
 
@@ -2420,7 +2430,7 @@ fn test_lsp_progress_status_display() -> std::io::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::client::LspServerConfig {
+        fresh::services::lsp::LspServerConfig {
             command: FakeLspServer::progress_script_path()
                 .to_string_lossy()
                 .to_string(),
@@ -2455,7 +2465,7 @@ fn test_lsp_progress_status_display() -> std::io::Result<()> {
     // Poll for progress notifications
     for i in 0..30 {
         // Wait up to 3 seconds
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        harness.sleep(std::time::Duration::from_millis(100));
 
         // Process async messages from LSP
         let _ = harness.editor_mut().process_async_messages();
@@ -2580,7 +2590,7 @@ fn test_lsp_crash_detection_and_restart() -> std::io::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::client::LspServerConfig {
+        fresh::services::lsp::LspServerConfig {
             command: FakeLspServer::crashing_script_path()
                 .to_string_lossy()
                 .to_string(),
@@ -2610,7 +2620,7 @@ fn test_lsp_crash_detection_and_restart() -> std::io::Result<()> {
 
     // Give the LSP server a moment to initialize and process didOpen
     // The server will crash when it receives didOpen
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    harness.sleep(std::time::Duration::from_millis(200));
 
     // Render to process async messages
     harness.render()?;
@@ -2619,7 +2629,7 @@ fn test_lsp_crash_detection_and_restart() -> std::io::Result<()> {
     let mut crash_detected = false;
     let mut status_msg = String::new();
     for i in 0..30 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        harness.sleep(std::time::Duration::from_millis(100));
 
         // Send a no-op key to trigger async message processing
         // (render() alone doesn't process async messages)
@@ -2690,7 +2700,7 @@ fn test_lsp_crash_detection_and_restart() -> std::io::Result<()> {
 
     // Wait for restart backoff (first attempt is 1 second)
     // The restart should happen automatically
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    harness.sleep(std::time::Duration::from_millis(1500));
 
     // Process messages to trigger the restart
     harness.send_key(KeyCode::Null, KeyModifiers::NONE)?;
@@ -2876,7 +2886,7 @@ fn test_pull_diagnostics_auto_trigger_after_open() -> std::io::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::client::LspServerConfig {
+        fresh::services::lsp::LspServerConfig {
             command: FakeLspServer::pull_diagnostics_script_path()
                 .to_string_lossy()
                 .to_string(),
@@ -2928,7 +2938,7 @@ fn test_pull_diagnostics_auto_trigger_after_open() -> std::io::Result<()> {
         }
 
         // Small delay between checks
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        harness.sleep(std::time::Duration::from_millis(100));
     }
 
     assert!(
@@ -2954,7 +2964,7 @@ fn test_pull_diagnostics_result_id_tracking() -> std::io::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::client::LspServerConfig {
+        fresh::services::lsp::LspServerConfig {
             command: FakeLspServer::pull_diagnostics_script_path()
                 .to_string_lossy()
                 .to_string(),
@@ -3002,7 +3012,7 @@ fn test_pull_diagnostics_result_id_tracking() -> std::io::Result<()> {
             break;
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        harness.sleep(std::time::Duration::from_millis(100));
     }
 
     assert!(
@@ -3019,7 +3029,7 @@ fn test_pull_diagnostics_result_id_tracking() -> std::io::Result<()> {
     for _ in 0..30 {
         harness.send_key(KeyCode::Null, KeyModifiers::NONE)?;
         harness.render()?;
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        harness.sleep(std::time::Duration::from_millis(100));
     }
 
     // The diagnostics should still be there (server returned unchanged or new full response)
@@ -3213,7 +3223,7 @@ fn test_stopped_lsp_does_not_auto_restart_on_edit() -> std::io::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::client::LspServerConfig {
+        fresh::services::lsp::LspServerConfig {
             command: FakeLspServer::script_path().to_string_lossy().to_string(),
             args: vec![],
             enabled: true,
@@ -3236,7 +3246,7 @@ fn test_stopped_lsp_does_not_auto_restart_on_edit() -> std::io::Result<()> {
     harness.render()?;
 
     // Wait for the LSP server to initialize
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    harness.sleep(std::time::Duration::from_millis(200));
     harness.send_key(KeyCode::Null, KeyModifiers::NONE)?;
     harness.render()?;
 
@@ -3254,7 +3264,7 @@ fn test_stopped_lsp_does_not_auto_restart_on_edit() -> std::io::Result<()> {
     assert!(stopped, "shutdown_lsp_server should return true");
 
     // Give the shutdown a moment to complete
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    harness.sleep(std::time::Duration::from_millis(50));
     harness.send_key(KeyCode::Null, KeyModifiers::NONE)?;
     harness.render()?;
 
@@ -3273,7 +3283,7 @@ fn test_stopped_lsp_does_not_auto_restart_on_edit() -> std::io::Result<()> {
     harness.render()?;
 
     // Give some time for any potential LSP spawn
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    harness.sleep(std::time::Duration::from_millis(100));
     harness.send_key(KeyCode::Null, KeyModifiers::NONE)?;
     harness.render()?;
 
@@ -3289,7 +3299,7 @@ fn test_stopped_lsp_does_not_auto_restart_on_edit() -> std::io::Result<()> {
     // Type more text to double-check
     harness.type_text("// Another edit\n")?;
     harness.render()?;
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    harness.sleep(std::time::Duration::from_millis(50));
     harness.send_key(KeyCode::Null, KeyModifiers::NONE)?;
     harness.render()?;
 
@@ -3343,6 +3353,7 @@ fn test_hover_popup_at_right_edge_does_not_panic() -> std::io::Result<()> {
     state.apply(&Event::ShowPopup {
         popup: PopupData {
             title: Some("Hover".to_string()),
+            transient: true,
             content: PopupContentData::Text(vec![
                 "fn example() -> i32".to_string(),
                 "Returns an example value".to_string(),
@@ -3364,6 +3375,241 @@ fn test_hover_popup_at_right_edge_does_not_panic() -> std::io::Result<()> {
     assert!(
         screen.contains("Hover") || screen.contains("example"),
         "Hover popup should be rendered on screen"
+    );
+
+    Ok(())
+}
+
+/// Test that hover popup is dismissed when focus changes
+///
+/// The hover popup should be dismissed when:
+/// 1. Opening command palette (Ctrl+Shift+P)
+/// 2. Switching buffers
+/// 3. Focusing file explorer
+/// 4. Opening any prompt
+#[test]
+fn test_hover_popup_dismissed_on_focus_change() -> std::io::Result<()> {
+    use fresh::model::event::{Event, PopupContentData, PopupData, PopupPositionData};
+
+    let mut harness = EditorTestHarness::new(80, 24)?;
+
+    // Helper to show a hover popup
+    fn show_hover_popup(harness: &mut EditorTestHarness) {
+        let state = harness.editor_mut().active_state_mut();
+        state.apply(&Event::ShowPopup {
+            popup: PopupData {
+                title: Some("Hover".to_string()),
+                transient: true,
+                content: PopupContentData::Text(vec![
+                    "fn example() -> i32".to_string(),
+                    "Returns an example value".to_string(),
+                ]),
+                position: PopupPositionData::BelowCursor,
+                width: 40,
+                max_height: 10,
+                bordered: true,
+            },
+        });
+    }
+
+    // Test 1: Hover popup dismissed when opening command palette
+    show_hover_popup(&mut harness);
+    harness.render()?;
+    assert!(
+        harness.editor().active_state().popups.is_visible(),
+        "Hover popup should be visible initially"
+    );
+
+    // Open command palette (Ctrl+Shift+P)
+    harness.send_key(
+        KeyCode::Char('P'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    )?;
+
+    assert!(
+        !harness.editor().active_state().popups.is_visible(),
+        "Hover popup should be dismissed after opening command palette"
+    );
+
+    // Close command palette
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE)?;
+
+    // Test 2: Hover popup dismissed when opening Go to Line prompt
+    show_hover_popup(&mut harness);
+    harness.render()?;
+    assert!(
+        harness.editor().active_state().popups.is_visible(),
+        "Hover popup should be visible again"
+    );
+
+    // Open Go to Line (Ctrl+G)
+    harness.send_key(KeyCode::Char('g'), KeyModifiers::CONTROL)?;
+
+    assert!(
+        !harness.editor().active_state().popups.is_visible(),
+        "Hover popup should be dismissed after opening Go to Line prompt"
+    );
+
+    // Close prompt
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE)?;
+
+    // Test 3: Hover popup dismissed when switching buffers
+    // First open a second buffer
+    harness.type_text("test content")?;
+    harness.send_key(KeyCode::Char('n'), KeyModifiers::CONTROL)?; // New buffer
+
+    // Go back to first buffer
+    harness.send_key(KeyCode::Tab, KeyModifiers::CONTROL)?;
+
+    // Show hover popup
+    show_hover_popup(&mut harness);
+    harness.render()?;
+    assert!(
+        harness.editor().active_state().popups.is_visible(),
+        "Hover popup should be visible before buffer switch"
+    );
+
+    // Switch to other buffer
+    harness.send_key(KeyCode::Tab, KeyModifiers::CONTROL)?;
+
+    // Note: After switching buffers, the popup belongs to the previous buffer's state.
+    // The new buffer should not have the popup.
+    assert!(
+        !harness.editor().active_state().popups.is_visible(),
+        "New buffer should not have hover popup after switching"
+    );
+
+    // Test 4: Hover popup dismissed when opening search prompt
+    // Switch back and show hover
+    harness.send_key(KeyCode::Tab, KeyModifiers::CONTROL)?;
+    show_hover_popup(&mut harness);
+    harness.render()?;
+    assert!(
+        harness.editor().active_state().popups.is_visible(),
+        "Hover popup should be visible before search"
+    );
+
+    // Open search (Ctrl+F)
+    harness.send_key(KeyCode::Char('f'), KeyModifiers::CONTROL)?;
+
+    assert!(
+        !harness.editor().active_state().popups.is_visible(),
+        "Hover popup should be dismissed after opening search"
+    );
+
+    // Close search prompt
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE)?;
+
+    // Test 5: Hover popup dismissed when opening menu (Alt/F10)
+    show_hover_popup(&mut harness);
+    harness.render()?;
+    assert!(
+        harness.editor().active_state().popups.is_visible(),
+        "Hover popup should be visible before opening menu"
+    );
+
+    // Open menu (F10)
+    harness.send_key(KeyCode::F(10), KeyModifiers::NONE)?;
+
+    assert!(
+        !harness.editor().active_state().popups.is_visible(),
+        "Hover popup should be dismissed after opening menu"
+    );
+
+    Ok(())
+}
+
+/// Test that hover popup persists when mouse moves within hovered symbol or popup
+///
+/// The hover popup should stay visible when:
+/// 1. Mouse moves within the hovered symbol range
+/// 2. Mouse moves over the hover popup itself
+/// The hover should only be dismissed when mouse leaves the editor area.
+///
+/// Uses a fake LSP server to properly trigger hover flow via user-style events.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "FakeLspServer uses a Bash script which is not available on Windows"
+)]
+fn test_hover_popup_persists_within_symbol_and_popup() -> std::io::Result<()> {
+    use crate::common::fake_lsp::FakeLspServer;
+
+    // Spawn fake LSP server (has hover support)
+    let _fake_server = FakeLspServer::spawn()?;
+
+    // Create temp dir and test file
+    let temp_dir = tempfile::tempdir()?;
+    let test_file = temp_dir.path().join("test.rs");
+    std::fs::write(&test_file, "fn example_function() {}\n")?;
+
+    // Configure editor to use the fake LSP server
+    let mut config = fresh::config::Config::default();
+    config.lsp.insert(
+        "rust".to_string(),
+        fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path().to_string_lossy().to_string(),
+            args: vec![],
+            enabled: true,
+            auto_start: false,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+        },
+    );
+
+    // Create harness with config
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        config,
+        temp_dir.path().to_path_buf(),
+    )?;
+
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // Move mouse over the symbol "example_function" to trigger hover state
+    // The gutter takes some columns, so move to column ~10 which should be over the symbol
+    harness.mouse_move(10, 2)?;
+    harness.render()?;
+
+    // Force check mouse hover to bypass the 500ms timer and send the request
+    harness.editor_mut().force_check_mouse_hover();
+
+    // Wait for hover popup to appear (LSP response received)
+    harness.wait_until(|h| h.editor().active_state().popups.is_visible())?;
+
+    // Test 1: Mouse move within the symbol range should keep popup
+    // Move mouse slightly to the right (still within 10 char range)
+    harness.mouse_move(12, 2)?;
+
+    assert!(
+        harness.editor().active_state().popups.is_visible(),
+        "Hover popup should persist when mouse moves within symbol range"
+    );
+
+    // Test 2: Mouse move over the popup area should keep popup
+    // The popup renders below cursor, so move to where it would be
+    // Get popup areas from cached layout
+    let popup_visible_after_popup_hover = {
+        harness.render()?;
+        // Move mouse to where the popup should be (below the hover point)
+        harness.mouse_move(12, 5)?;
+        harness.editor().active_state().popups.is_visible()
+    };
+
+    assert!(
+        popup_visible_after_popup_hover,
+        "Hover popup should persist when mouse is over the popup area"
+    );
+
+    // Test 3: Mouse leaving editor area should dismiss popup
+    // Move mouse to row 0 (menu bar area, outside editor content)
+    harness.mouse_move(40, 0)?;
+
+    assert!(
+        !harness.editor().active_state().popups.is_visible(),
+        "Hover popup should be dismissed when mouse leaves editor area"
     );
 
     Ok(())

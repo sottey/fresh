@@ -7,15 +7,98 @@ use super::layout::{SettingsHit, SettingsLayout};
 use super::search::SearchResult;
 use super::state::SettingsState;
 use crate::view::controls::{
-    render_dropdown, render_number_input, render_text_input, render_toggle, DropdownColors,
-    MapColors, NumberInputColors, TextInputColors, TextListColors, ToggleColors,
+    render_dropdown_aligned, render_number_input_aligned, render_text_input_aligned,
+    render_toggle_aligned, DropdownColors, MapColors, NumberInputColors, TextInputColors,
+    TextListColors, ToggleColors,
 };
 use crate::view::theme::Theme;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+
+/// Build spans for a text line with selection highlighting
+///
+/// Returns a vector of spans where selected portions are highlighted.
+fn build_selection_spans(
+    display_text: &str,
+    display_len: usize,
+    line_idx: usize,
+    start_row: usize,
+    start_col: usize,
+    end_row: usize,
+    end_col: usize,
+    text_color: Color,
+    selection_bg: Color,
+) -> Vec<Span<'static>> {
+    let chars: Vec<char> = display_text.chars().collect();
+    let char_count = chars.len();
+
+    // Determine selection range for this line
+    let (sel_start, sel_end) = if line_idx < start_row || line_idx > end_row {
+        // Line not in selection
+        (char_count, char_count)
+    } else if line_idx == start_row && line_idx == end_row {
+        // Selection within single line
+        let start = byte_to_char_idx(display_text, start_col).min(char_count);
+        let end = byte_to_char_idx(display_text, end_col).min(char_count);
+        (start, end)
+    } else if line_idx == start_row {
+        // Selection starts on this line
+        let start = byte_to_char_idx(display_text, start_col).min(char_count);
+        (start, char_count)
+    } else if line_idx == end_row {
+        // Selection ends on this line
+        let end = byte_to_char_idx(display_text, end_col).min(char_count);
+        (0, end)
+    } else {
+        // Entire line is selected
+        (0, char_count)
+    };
+
+    let mut spans = Vec::new();
+    let normal_style = Style::default().fg(text_color);
+    let selected_style = Style::default().fg(text_color).bg(selection_bg);
+
+    if sel_start >= sel_end || sel_start >= char_count {
+        // No selection on this line
+        let padded = format!("{:width$}", display_text, width = display_len);
+        spans.push(Span::styled(padded, normal_style));
+    } else {
+        // Before selection
+        if sel_start > 0 {
+            let before: String = chars[..sel_start].iter().collect();
+            spans.push(Span::styled(before, normal_style));
+        }
+
+        // Selection
+        let selected: String = chars[sel_start..sel_end].iter().collect();
+        spans.push(Span::styled(selected, selected_style));
+
+        // After selection
+        if sel_end < char_count {
+            let after: String = chars[sel_end..].iter().collect();
+            spans.push(Span::styled(after, normal_style));
+        }
+
+        // Pad to display_len
+        let current_len = char_count;
+        if current_len < display_len {
+            let padding = " ".repeat(display_len - current_len);
+            spans.push(Span::styled(padding, normal_style));
+        }
+    }
+
+    spans
+}
+
+/// Convert byte offset to char index in a string
+fn byte_to_char_idx(s: &str, byte_offset: usize) -> usize {
+    s.char_indices()
+        .take_while(|(i, _)| *i < byte_offset)
+        .count()
+}
 
 /// Render the settings modal
 pub fn render_settings(
@@ -24,9 +107,9 @@ pub fn render_settings(
     state: &mut SettingsState,
     theme: &Theme,
 ) -> SettingsLayout {
-    // Calculate modal size (80% of screen, max 100 wide, 40 tall)
+    // Calculate modal size (80% of screen width, 90% height to fill most of available space)
     let modal_width = (area.width * 80 / 100).min(100);
-    let modal_height = (area.height * 80 / 100).min(40);
+    let modal_height = area.height * 90 / 100;
     let modal_x = (area.width.saturating_sub(modal_width)) / 2;
     let modal_y = (area.height.saturating_sub(modal_height)) / 2;
 
@@ -97,10 +180,12 @@ pub fn render_settings(
     render_separator(frame, separator_area, theme);
 
     // Render settings (right panel) or search results
+    // Add horizontal padding from separator
+    let horizontal_padding = 2;
     let settings_inner = Rect::new(
-        settings_area.x + 1,
+        settings_area.x + horizontal_padding,
         settings_area.y,
-        settings_area.width.saturating_sub(1),
+        settings_area.width.saturating_sub(horizontal_padding),
         settings_area.height,
     );
 
@@ -113,13 +198,34 @@ pub fn render_settings(
     // Render footer with buttons
     render_footer(frame, modal_area, state, theme, &mut layout);
 
+    // Determine the topmost dialog layer and apply dimming to layers below
+    let has_confirm = state.showing_confirm_dialog;
+    let has_entry = state.showing_entry_dialog();
+    let has_help = state.showing_help;
+
     // Render confirmation dialog if showing
-    if state.showing_confirm_dialog {
+    if has_confirm {
+        // Dim the main settings modal if confirm is showing
+        // (but only if confirm is the topmost, otherwise entry/help dialog will dim it)
+        if !has_entry && !has_help {
+            crate::view::dimming::apply_dimming(frame, modal_area);
+        }
         render_confirm_dialog(frame, modal_area, state, theme);
     }
 
+    // Render entry detail dialog if showing
+    if has_entry {
+        // Dim everything below (including confirm dialog if visible)
+        if !has_help {
+            crate::view::dimming::apply_dimming(frame, modal_area);
+        }
+        render_entry_dialog(frame, modal_area, state, theme);
+    }
+
     // Render help overlay if showing
-    if state.showing_help {
+    if has_help {
+        // Help is topmost, dim everything below
+        crate::view::dimming::apply_dimming(frame, modal_area);
         render_help_overlay(frame, modal_area, theme);
     }
 
@@ -167,9 +273,19 @@ fn render_categories(
 
         // Indicator for categories with modified settings
         let has_changes = page.items.iter().any(|i| i.modified);
-        let prefix = if has_changes { "● " } else { "  " };
+        let modified_indicator = if has_changes { "●" } else { " " };
 
-        let text = format!("{}{}", prefix, page.name);
+        // Show ">" when selected and focused for clearer selection indicator
+        let selection_indicator = if is_selected && state.focus_panel == FocusPanel::Categories {
+            ">"
+        } else {
+            " "
+        };
+
+        let text = format!(
+            "{}{} {}",
+            selection_indicator, modified_indicator, page.name
+        );
         let line = Line::from(Span::styled(text, style));
         frame.render_widget(Paragraph::new(line), row_area);
     }
@@ -254,6 +370,23 @@ fn render_settings_panel(
     // Get items reference for rendering
     let page = state.pages.get(state.selected_category).unwrap();
 
+    // Calculate max label width for column alignment (only for single-row controls)
+    let max_label_width = page
+        .items
+        .iter()
+        .filter_map(|item| {
+            // Only consider single-row controls for alignment
+            match &item.control {
+                SettingControl::Toggle(s) => Some(s.label.len() as u16),
+                SettingControl::Number(s) => Some(s.label.len() as u16),
+                SettingControl::Dropdown(s) => Some(s.label.len() as u16),
+                SettingControl::Text(s) => Some(s.label.len() as u16),
+                // Multi-row controls have their labels on separate lines
+                _ => None,
+            }
+        })
+        .max();
+
     // Use ScrollablePanel to render items with automatic scroll handling
     let panel_layout = state.scroll_panel.render(
         frame,
@@ -268,6 +401,7 @@ fn render_settings_panel(
                 info.skip_top,
                 &render_ctx,
                 theme,
+                max_label_width,
             )
         },
         theme,
@@ -293,10 +427,52 @@ fn render_settings_panel(
     }
 }
 
+/// Wrap text to fit within a given width
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 || text.is_empty() {
+        return vec![text.to_string()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
+    let mut current_len = 0;
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+
+        if current_len == 0 {
+            // First word on line
+            current_line = word.to_string();
+            current_len = word_len;
+        } else if current_len + 1 + word_len <= width {
+            // Word fits on current line
+            current_line.push(' ');
+            current_line.push_str(word);
+            current_len += 1 + word_len;
+        } else {
+            // Start new line
+            lines.push(current_line);
+            current_line = word.to_string();
+            current_len = word_len;
+        }
+    }
+
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    lines
+}
+
 /// Pure render function for a setting item (returns layout, doesn't modify external state)
 ///
 /// # Arguments
 /// * `skip_top` - Number of rows to skip at top of item (for partial visibility when scrolling)
+/// * `label_width` - Optional label width for column alignment
 fn render_setting_item_pure(
     frame: &mut Frame,
     area: Rect,
@@ -305,6 +481,7 @@ fn render_setting_item_pure(
     skip_top: u16,
     ctx: &RenderContext,
     theme: &Theme,
+    label_width: Option<u16>,
 ) -> ControlLayoutInfo {
     let is_selected = ctx.settings_focused && idx == ctx.selected_item;
 
@@ -321,29 +498,105 @@ fn render_setting_item_pure(
         _ => false,
     };
 
-    // Draw selection or hover highlight background (for visible portion)
-    if is_selected || is_item_hovered {
+    let is_focused_or_hovered = is_selected || is_item_hovered;
+
+    // Focus indicator takes 2 chars ("> ")
+    let focus_indicator_width: u16 = 2;
+
+    // Calculate content height - expanded when focused/hovered
+    let content_height = if is_focused_or_hovered {
+        item.content_height_expanded(area.width.saturating_sub(focus_indicator_width))
+    } else {
+        item.content_height()
+    };
+    // Adjust for skipped rows
+    let visible_content_height = content_height.saturating_sub(skip_top);
+
+    // Draw selection or hover highlight background (only for content rows, not spacing)
+    if is_focused_or_hovered {
         let bg_style = if is_selected {
             Style::default().bg(theme.current_line_bg)
         } else {
             Style::default().bg(theme.menu_hover_bg)
         };
-        for row in 0..area.height {
+        for row in 0..visible_content_height.min(area.height) {
             let row_area = Rect::new(area.x, area.y + row, area.width, 1);
             frame.render_widget(Paragraph::new("").style(bg_style), row_area);
         }
     }
 
-    // All controls render their own label, so just render the control
-    render_control(
+    // Render focus indicator ">" for selected items (when settings panel is focused)
+    if is_selected && skip_top == 0 {
+        let indicator_style = Style::default()
+            .fg(theme.menu_highlight_fg)
+            .add_modifier(Modifier::BOLD);
+        frame.render_widget(
+            Paragraph::new(">").style(indicator_style),
+            Rect::new(area.x, area.y, 1, 1),
+        );
+    }
+
+    // Calculate control height and area (offset by focus indicator)
+    let control_height = item.control.control_height();
+    let visible_control_height = control_height.saturating_sub(skip_top);
+    let control_area = Rect::new(
+        area.x + focus_indicator_width,
+        area.y,
+        area.width.saturating_sub(focus_indicator_width),
+        visible_control_height.min(area.height),
+    );
+
+    // Render the control
+    let layout = render_control(
         frame,
-        area,
+        control_area,
         &item.control,
         &item.name,
         item.modified,
         skip_top,
         theme,
-    )
+        label_width.map(|w| w.saturating_sub(focus_indicator_width)),
+    );
+
+    // Render description below the control (if visible and exists)
+    // Description is also offset by focus_indicator_width to align with control
+    if let Some(ref description) = item.description {
+        // Description starts after the control
+        let desc_start_row = control_height.saturating_sub(skip_top);
+        if desc_start_row < area.height {
+            let desc_x = area.x + focus_indicator_width;
+            let desc_y = area.y + desc_start_row;
+            let desc_width = area.width.saturating_sub(focus_indicator_width);
+            let desc_style = Style::default().fg(theme.line_number_fg);
+            let max_width = desc_width.saturating_sub(2) as usize;
+
+            if is_focused_or_hovered && description.len() > max_width {
+                // Wrap description to multiple lines when focused/hovered
+                let wrapped_lines = wrap_text(description, max_width);
+                let available_rows = area.height.saturating_sub(desc_start_row) as usize;
+
+                for (i, line) in wrapped_lines.iter().take(available_rows).enumerate() {
+                    frame.render_widget(
+                        Paragraph::new(line.as_str()).style(desc_style),
+                        Rect::new(desc_x, desc_y + i as u16, desc_width, 1),
+                    );
+                }
+            } else {
+                // Single line - truncate if too long
+                let display_desc = if description.len() > max_width {
+                    format!("{}...", &description[..max_width.saturating_sub(3)])
+                } else {
+                    description.clone()
+                };
+                frame.render_widget(
+                    Paragraph::new(display_desc).style(desc_style),
+                    Rect::new(desc_x, desc_y, desc_width, 1),
+                );
+            }
+        }
+    }
+
+    layout
 }
 
 /// Render the appropriate control for a setting
@@ -352,6 +605,7 @@ fn render_setting_item_pure(
 /// * `name` - Setting name (for controls that render their own label)
 /// * `modified` - Whether the setting has been modified from default
 /// * `skip_rows` - Number of rows to skip at top of control (for partial visibility)
+/// * `label_width` - Optional label width for column alignment
 fn render_control(
     frame: &mut Frame,
     area: Rect,
@@ -360,6 +614,7 @@ fn render_control(
     modified: bool,
     skip_rows: u16,
     theme: &Theme,
+    label_width: Option<u16>,
 ) -> ControlLayoutInfo {
     match control {
         // Single-row controls: only render if not skipped
@@ -368,7 +623,7 @@ fn render_control(
                 return ControlLayoutInfo::Toggle(Rect::default());
             }
             let colors = ToggleColors::from_theme(theme);
-            let toggle_layout = render_toggle(frame, area, state, &colors);
+            let toggle_layout = render_toggle_aligned(frame, area, state, &colors, label_width);
             ControlLayoutInfo::Toggle(toggle_layout.full_area)
         }
 
@@ -381,7 +636,7 @@ fn render_control(
                 };
             }
             let colors = NumberInputColors::from_theme(theme);
-            let num_layout = render_number_input(frame, area, state, &colors);
+            let num_layout = render_number_input_aligned(frame, area, state, &colors, label_width);
             ControlLayoutInfo::Number {
                 decrement: num_layout.decrement_area,
                 increment: num_layout.increment_area,
@@ -394,7 +649,7 @@ fn render_control(
                 return ControlLayoutInfo::Dropdown(Rect::default());
             }
             let colors = DropdownColors::from_theme(theme);
-            let drop_layout = render_dropdown(frame, area, state, &colors);
+            let drop_layout = render_dropdown_aligned(frame, area, state, &colors, label_width);
             ControlLayoutInfo::Dropdown(drop_layout.button_area)
         }
 
@@ -403,7 +658,8 @@ fn render_control(
                 return ControlLayoutInfo::Text(Rect::default());
             }
             let colors = TextInputColors::from_theme(theme);
-            let text_layout = render_text_input(frame, area, state, &colors, 30);
+            let text_layout =
+                render_text_input_aligned(frame, area, state, &colors, 30, label_width);
             ControlLayoutInfo::Text(text_layout.input_area)
         }
 
@@ -424,6 +680,26 @@ fn render_control(
             }
         }
 
+        SettingControl::ObjectArray(state) => {
+            let colors = crate::view::controls::KeybindingListColors {
+                label_fg: theme.editor_fg,
+                key_fg: theme.help_key_fg,
+                action_fg: theme.syntax_function,
+                focused_bg: theme.selection_bg,
+                delete_fg: theme.diagnostic_error_fg,
+                add_fg: theme.syntax_string,
+            };
+            let kb_layout =
+                render_keybinding_list_partial(frame, area, state, &colors, skip_rows, modified);
+            ControlLayoutInfo::ObjectArray {
+                entry_rows: kb_layout.entry_rects,
+            }
+        }
+
+        SettingControl::Json(state) => {
+            render_json_control(frame, area, state, name, modified, skip_rows, theme)
+        }
+
         SettingControl::Complex { type_name } => {
             if skip_rows > 0 {
                 return ControlLayoutInfo::Complex;
@@ -442,6 +718,170 @@ fn render_control(
             frame.render_widget(Paragraph::new(Line::from(vec![label, value])), area);
             ControlLayoutInfo::Complex
         }
+    }
+}
+
+/// Render a multiline JSON editor control
+fn render_json_control(
+    frame: &mut Frame,
+    area: Rect,
+    state: &super::items::JsonEditState,
+    name: &str,
+    modified: bool,
+    skip_rows: u16,
+    theme: &Theme,
+) -> ControlLayoutInfo {
+    use crate::view::controls::FocusState;
+
+    let empty_layout = ControlLayoutInfo::Json {
+        edit_area: Rect::default(),
+    };
+
+    if area.height == 0 || area.width < 10 {
+        return empty_layout;
+    }
+
+    let is_focused = state.focus == FocusState::Focused;
+    let is_valid = state.is_valid();
+
+    let label_color = if is_focused {
+        theme.menu_highlight_fg
+    } else {
+        theme.editor_fg
+    };
+
+    let text_color = theme.editor_fg;
+    let border_color = if !is_valid {
+        theme.diagnostic_error_fg
+    } else if is_focused {
+        theme.menu_highlight_fg
+    } else {
+        theme.split_separator_fg
+    };
+
+    let mut y = area.y;
+    let mut content_row = 0u16;
+
+    // Row 0: label
+    if content_row >= skip_rows {
+        let modified_indicator = if modified { "• " } else { "" };
+        let label_line = Line::from(vec![Span::styled(
+            format!("{}{}:", modified_indicator, name),
+            Style::default().fg(label_color),
+        )]);
+        frame.render_widget(
+            Paragraph::new(label_line),
+            Rect::new(area.x, y, area.width, 1),
+        );
+        y += 1;
+    }
+    content_row += 1;
+
+    let indent = 2u16;
+    let edit_width = area.width.saturating_sub(indent + 1);
+    let edit_x = area.x + indent;
+    let edit_start_y = y;
+
+    // Render all lines (scrolling handled by entry dialog/scroll panel)
+    let lines = state.lines();
+    let total_lines = lines.len();
+    for line_idx in 0..total_lines {
+        let actual_line_idx = line_idx;
+
+        if content_row < skip_rows {
+            content_row += 1;
+            continue;
+        }
+
+        if y >= area.y + area.height {
+            break;
+        }
+
+        let line_content = lines.get(actual_line_idx).map(|s| s.as_str()).unwrap_or("");
+
+        // Truncate line if too long
+        let display_len = edit_width.saturating_sub(2) as usize;
+        let display_text: String = line_content.chars().take(display_len).collect();
+
+        // Get selection range and cursor position
+        let selection = state.selection_range();
+        let (cursor_row, cursor_col) = state.cursor_pos();
+
+        // Build content spans with selection highlighting
+        let content_spans = if is_focused {
+            if let Some(((start_row, start_col), (end_row, end_col))) = selection {
+                build_selection_spans(
+                    &display_text,
+                    display_len,
+                    actual_line_idx,
+                    start_row,
+                    start_col,
+                    end_row,
+                    end_col,
+                    text_color,
+                    theme.selection_bg,
+                )
+            } else {
+                vec![Span::styled(
+                    format!("{:width$}", display_text, width = display_len),
+                    Style::default().fg(text_color),
+                )]
+            }
+        } else {
+            vec![Span::styled(
+                format!("{:width$}", display_text, width = display_len),
+                Style::default().fg(text_color),
+            )]
+        };
+
+        // Build line with border
+        let mut spans = vec![
+            Span::raw(" ".repeat(indent as usize)),
+            Span::styled("│", Style::default().fg(border_color)),
+        ];
+        spans.extend(content_spans);
+        spans.push(Span::styled("│", Style::default().fg(border_color)));
+        let line = Line::from(spans);
+
+        frame.render_widget(Paragraph::new(line), Rect::new(area.x, y, area.width, 1));
+
+        // Draw cursor if focused and on this line (overlays selection)
+        if is_focused && actual_line_idx == cursor_row {
+            let cursor_x = edit_x + 1 + cursor_col.min(display_len) as u16;
+            if cursor_x < area.x + area.width - 1 {
+                let cursor_char = line_content.chars().nth(cursor_col).unwrap_or(' ');
+                let cursor_span = Span::styled(
+                    cursor_char.to_string(),
+                    Style::default()
+                        .fg(theme.cursor)
+                        .add_modifier(Modifier::REVERSED),
+                );
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![cursor_span])),
+                    Rect::new(cursor_x, y, 1, 1),
+                );
+            }
+        }
+
+        y += 1;
+        content_row += 1;
+    }
+
+    // Show invalid JSON indicator
+    if !is_valid && y < area.y + area.height {
+        let warning = Span::styled(
+            "  ⚠ Invalid JSON",
+            Style::default().fg(theme.diagnostic_warning_fg),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![warning])),
+            Rect::new(area.x, y, area.width, 1),
+        );
+    }
+
+    let edit_height = y.saturating_sub(edit_start_y);
+    ControlLayoutInfo::Json {
+        edit_area: Rect::new(edit_x, edit_start_y, edit_width, edit_height),
     }
 }
 
@@ -615,7 +1055,7 @@ fn render_map_partial(
     let indent = 2u16;
 
     // Render entries
-    for (idx, (key, _value)) in state.entries.iter().enumerate() {
+    for (idx, (key, value)) in state.entries.iter().enumerate() {
         if y >= area.y + area.height {
             break;
         }
@@ -626,27 +1066,64 @@ fn render_map_partial(
         }
 
         let is_focused = state.focused_entry == Some(idx) && state.focus == FocusState::Focused;
-        let key_color = if is_focused {
-            colors.focused
+
+        let row_area = Rect::new(area.x, y, area.width, 1);
+
+        // Full row background highlight for focused entry
+        if is_focused {
+            let highlight_style = Style::default().bg(colors.focused);
+            let bg_line = Line::from(Span::styled(
+                " ".repeat(area.width as usize),
+                highlight_style,
+            ));
+            frame.render_widget(Paragraph::new(bg_line), row_area);
+        }
+
+        let (key_color, value_color) = if is_focused {
+            (colors.label, colors.value_preview)
         } else if state.focus == FocusState::Disabled {
-            colors.disabled
+            (colors.disabled, colors.disabled)
         } else {
-            colors.key
+            (colors.key, colors.value_preview)
+        };
+
+        let base_style = if is_focused {
+            Style::default().bg(colors.focused)
+        } else {
+            Style::default()
+        };
+
+        // Get display value
+        let value_preview = state.get_display_value(value);
+        let max_preview_len = 20;
+        let value_preview = if value_preview.len() > max_preview_len {
+            format!("{}...", &value_preview[..max_preview_len - 3])
+        } else {
+            value_preview
         };
 
         let display_key: String = key.chars().take(key_width as usize).collect();
-        let line = Line::from(vec![
-            Span::raw(" ".repeat(indent as usize)),
+        let mut spans = vec![
+            Span::styled(" ".repeat(indent as usize), base_style),
             Span::styled(
                 format!("{:width$}", display_key, width = key_width as usize),
-                Style::default().fg(key_color),
+                base_style.fg(key_color),
             ),
             Span::raw(" "),
-            Span::styled("[x]", Style::default().fg(colors.remove_button)),
-        ]);
+            Span::styled(value_preview, base_style.fg(value_color)),
+        ];
 
-        let row_area = Rect::new(area.x, y, area.width, 1);
-        frame.render_widget(Paragraph::new(line), row_area);
+        // Add [Edit] hint for focused entry
+        if is_focused {
+            spans.push(Span::styled(
+                "  [Enter to edit]",
+                base_style
+                    .fg(colors.value_preview)
+                    .add_modifier(Modifier::DIM),
+            ));
+        }
+
+        frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
 
         entry_areas.push(MapEntryLayout {
             index: idx,
@@ -660,14 +1137,42 @@ fn render_map_partial(
         content_row += 1;
     }
 
-    // Add-new row
+    // Add-new row (always show as button - dialog handles input)
     let add_row_area = if y < area.y + area.height && content_row >= skip_rows {
-        let add_line = Line::from(vec![
-            Span::raw(" ".repeat(indent as usize)),
-            Span::styled("[+] Add new", Style::default().fg(colors.add_button)),
-        ]);
         let row_area = Rect::new(area.x, y, area.width, 1);
-        frame.render_widget(Paragraph::new(add_line), row_area);
+        let is_focused = state.focused_entry.is_none() && state.focus == FocusState::Focused;
+
+        // Highlight row when focused
+        if is_focused {
+            let highlight_style = Style::default().bg(colors.focused);
+            let bg_line = Line::from(Span::styled(
+                " ".repeat(area.width as usize),
+                highlight_style,
+            ));
+            frame.render_widget(Paragraph::new(bg_line), row_area);
+        }
+
+        let base_style = if is_focused {
+            Style::default().bg(colors.focused)
+        } else {
+            Style::default()
+        };
+
+        let mut spans = vec![
+            Span::styled(" ".repeat(indent as usize), base_style),
+            Span::styled("[+] Add new", base_style.fg(colors.add_button)),
+        ];
+
+        if is_focused {
+            spans.push(Span::styled(
+                "  [Enter to add]",
+                base_style
+                    .fg(colors.value_preview)
+                    .add_modifier(Modifier::DIM),
+            ));
+        }
+
+        frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
         Some(row_area)
     } else {
         None
@@ -677,6 +1182,125 @@ fn render_map_partial(
         entry_areas,
         add_row_area,
         full_area: area,
+    }
+}
+
+/// Render KeybindingList with partial visibility
+fn render_keybinding_list_partial(
+    frame: &mut Frame,
+    area: Rect,
+    state: &crate::view::controls::KeybindingListState,
+    colors: &crate::view::controls::KeybindingListColors,
+    skip_rows: u16,
+    modified: bool,
+) -> crate::view::controls::KeybindingListLayout {
+    use crate::view::controls::keybinding_list::format_key_combo;
+    use crate::view::controls::FocusState;
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+
+    let empty_layout = crate::view::controls::KeybindingListLayout {
+        entry_rects: Vec::new(),
+        delete_rects: Vec::new(),
+        add_rect: None,
+    };
+
+    if area.height == 0 {
+        return empty_layout;
+    }
+
+    let indent = 2u16;
+    let is_focused = state.focus == FocusState::Focused;
+    let mut entry_rects = Vec::new();
+    let mut delete_rects = Vec::new();
+    let mut content_row = 0u16;
+    let mut y = area.y;
+
+    // Render label (row 0)
+    if content_row >= skip_rows {
+        let modified_indicator = if modified { "• " } else { "" };
+        let label_line = Line::from(vec![Span::styled(
+            format!("{}{}:", modified_indicator, state.label),
+            Style::default().fg(colors.label_fg),
+        )]);
+        frame.render_widget(
+            Paragraph::new(label_line),
+            Rect::new(area.x, y, area.width, 1),
+        );
+        y += 1;
+    }
+    content_row += 1;
+
+    // Render each keybinding entry
+    for (idx, binding) in state.bindings.iter().enumerate() {
+        if y >= area.y + area.height {
+            break;
+        }
+
+        if content_row >= skip_rows {
+            let entry_area = Rect::new(area.x + indent, y, area.width.saturating_sub(indent), 1);
+            entry_rects.push(entry_area);
+
+            let is_entry_focused = is_focused && state.focused_index == Some(idx);
+            let bg = if is_entry_focused {
+                colors.focused_bg
+            } else {
+                Color::Reset
+            };
+
+            let key_combo = format_key_combo(binding);
+            let action = binding
+                .get("action")
+                .and_then(|a| a.as_str())
+                .unwrap_or("(no action)");
+
+            let indicator = if is_entry_focused { "> " } else { "  " };
+            let line = Line::from(vec![
+                Span::styled(indicator, Style::default().fg(colors.label_fg).bg(bg)),
+                Span::styled(
+                    format!("{:<20}", key_combo),
+                    Style::default().fg(colors.key_fg).bg(bg),
+                ),
+                Span::styled(" → ", Style::default().fg(colors.label_fg).bg(bg)),
+                Span::styled(action, Style::default().fg(colors.action_fg).bg(bg)),
+                Span::styled(" [x]", Style::default().fg(colors.delete_fg).bg(bg)),
+            ]);
+            frame.render_widget(Paragraph::new(line), entry_area);
+
+            // Track delete button area
+            let delete_x = entry_area.x + entry_area.width.saturating_sub(4);
+            delete_rects.push(Rect::new(delete_x, y, 3, 1));
+
+            y += 1;
+        }
+        content_row += 1;
+    }
+
+    // Render add-new row
+    let add_rect = if y < area.y + area.height && content_row >= skip_rows {
+        let is_add_focused = is_focused && state.focused_index.is_none();
+        let bg = if is_add_focused {
+            colors.focused_bg
+        } else {
+            Color::Reset
+        };
+
+        let indicator = if is_add_focused { "> " } else { "  " };
+        let line = Line::from(vec![
+            Span::styled(indicator, Style::default().fg(colors.label_fg).bg(bg)),
+            Span::styled("[+] Add new", Style::default().fg(colors.add_fg).bg(bg)),
+        ]);
+        let add_area = Rect::new(area.x + indent, y, area.width.saturating_sub(indent), 1);
+        frame.render_widget(Paragraph::new(line), add_area);
+        Some(add_area)
+    } else {
+        None
+    };
+
+    crate::view::controls::KeybindingListLayout {
+        entry_rects,
+        delete_rects,
+        add_rect,
     }
 }
 
@@ -696,6 +1320,12 @@ pub enum ControlLayoutInfo {
     },
     Map {
         entry_rows: Vec<Rect>,
+    },
+    ObjectArray {
+        entry_rows: Vec<Rect>,
+    },
+    Json {
+        edit_area: Rect,
     },
     Complex,
 }
@@ -746,10 +1376,10 @@ fn render_footer(
     let cancel_focused = footer_focused && state.footer_button_index == 2;
 
     // Calculate button positions from right
-    // When focused, buttons get a "▶" prefix adding 1 char
-    let cancel_width = if cancel_focused { 11 } else { 10 }; // "▶[ Cancel ]" or "[ Cancel ]"
-    let save_width = if save_focused { 9 } else { 8 }; // "▶[ Save ]" or "[ Save ]"
-    let reset_width = if reset_focused { 10 } else { 9 }; // "▶[ Reset ]" or "[ Reset ]"
+    // When focused, buttons get a ">" prefix adding 1 char
+    let cancel_width = if cancel_focused { 11 } else { 10 }; // ">[ Cancel ]" or "[ Cancel ]"
+    let save_width = if save_focused { 9 } else { 8 }; // ">[ Save ]" or "[ Save ]"
+    let reset_width = if reset_focused { 10 } else { 9 }; // ">[ Reset ]" or "[ Reset ]"
     let gap = 2;
 
     let cancel_x = footer_area.x + footer_area.width - cancel_width;
@@ -764,7 +1394,7 @@ fn render_footer(
             .fg(theme.menu_highlight_fg)
             .bg(theme.menu_highlight_bg)
             .add_modifier(Modifier::BOLD);
-        frame.render_widget(Paragraph::new("▶[ Reset ]").style(style), reset_area);
+        frame.render_widget(Paragraph::new(">[ Reset ]").style(style), reset_area);
     } else if reset_hovered {
         let style = Style::default()
             .fg(theme.menu_hover_fg)
@@ -785,7 +1415,7 @@ fn render_footer(
             .fg(theme.menu_highlight_fg)
             .bg(theme.menu_highlight_bg)
             .add_modifier(Modifier::BOLD);
-        frame.render_widget(Paragraph::new("▶[ Save ]").style(style), save_area);
+        frame.render_widget(Paragraph::new(">[ Save ]").style(style), save_area);
     } else if save_hovered {
         let style = Style::default()
             .fg(theme.menu_hover_fg)
@@ -806,7 +1436,7 @@ fn render_footer(
             .fg(theme.menu_highlight_fg)
             .bg(theme.menu_highlight_bg)
             .add_modifier(Modifier::BOLD);
-        frame.render_widget(Paragraph::new("▶[ Cancel ]").style(style), cancel_area);
+        frame.render_widget(Paragraph::new(">[ Cancel ]").style(style), cancel_area);
     } else if cancel_hovered {
         let style = Style::default()
             .fg(theme.menu_hover_fg)
@@ -1111,7 +1741,7 @@ fn render_confirm_dialog(
         };
 
         let text = if is_selected {
-            format!("▶[ {} ]", label)
+            format!(">[ {} ]", label)
         } else {
             format!(" [ {} ]", label)
         };
@@ -1130,6 +1760,249 @@ fn render_confirm_dialog(
         Paragraph::new(help).style(help_style),
         Rect::new(inner.x, button_y + 1, inner.width, 1),
     );
+}
+
+/// Render the entry detail dialog for editing Language/LSP/Keybinding entries
+///
+/// Now uses the same SettingItem/SettingControl infrastructure as the main settings UI,
+/// eliminating duplication and ensuring consistent rendering.
+fn render_entry_dialog(
+    frame: &mut Frame,
+    parent_area: Rect,
+    state: &mut SettingsState,
+    theme: &Theme,
+) {
+    let Some(dialog) = state.entry_dialog_mut() else {
+        return;
+    };
+
+    // Calculate dialog size - use most of available space for editing
+    let dialog_width = (parent_area.width * 85 / 100).min(90).max(50);
+    let dialog_height = (parent_area.height * 90 / 100).max(15);
+    let dialog_x = parent_area.x + (parent_area.width.saturating_sub(dialog_width)) / 2;
+    let dialog_y = parent_area.y + (parent_area.height.saturating_sub(dialog_height)) / 2;
+
+    let dialog_area = Rect::new(dialog_x, dialog_y, dialog_width, dialog_height);
+
+    // Clear and draw border
+    frame.render_widget(Clear, dialog_area);
+
+    let title = format!(" {} ", dialog.title);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.popup_border_fg))
+        .style(Style::default().bg(theme.popup_bg));
+    frame.render_widget(block, dialog_area);
+
+    // Inner area (reserve 2 lines for buttons and help at bottom)
+    let inner = Rect::new(
+        dialog_area.x + 2,
+        dialog_area.y + 1,
+        dialog_area.width.saturating_sub(4),
+        dialog_area.height.saturating_sub(5), // 1 border + 2 button/help rows + 2 padding
+    );
+
+    // Calculate optimal label column width based on actual item names
+    let max_label_width = (inner.width / 2).max(20);
+    let label_col_width = dialog
+        .items
+        .iter()
+        .map(|item| item.name.len() as u16 + 2) // +2 for ": "
+        .filter(|&w| w <= max_label_width)
+        .max()
+        .unwrap_or(20)
+        .min(max_label_width);
+
+    // Calculate total content height and viewport
+    let total_content_height = dialog.total_content_height();
+    let viewport_height = inner.height as usize;
+
+    // Store viewport height for use in focus navigation
+    dialog.viewport_height = viewport_height;
+
+    let scroll_offset = dialog.scroll_offset;
+    let needs_scroll = total_content_height > viewport_height;
+
+    // Track current position in content (for scrolling)
+    let mut content_y: usize = 0;
+    let mut screen_y = inner.y;
+
+    for (idx, item) in dialog.items.iter().enumerate() {
+        let control_height = item.control.control_height() as usize;
+
+        // Check if this item is visible in the viewport
+        let item_start = content_y;
+        let item_end = content_y + control_height;
+
+        // Skip items completely above the viewport
+        if item_end <= scroll_offset {
+            content_y = item_end;
+            continue;
+        }
+
+        // Stop if we're past the viewport
+        if screen_y >= inner.y + inner.height {
+            break;
+        }
+
+        // Calculate how many rows to skip at top of this item
+        let skip_rows = if item_start < scroll_offset {
+            (scroll_offset - item_start) as u16
+        } else {
+            0
+        };
+
+        // Calculate visible height for this item
+        let visible_height = control_height.saturating_sub(skip_rows as usize);
+        let available_height = (inner.y + inner.height).saturating_sub(screen_y) as usize;
+        let render_height = visible_height.min(available_height);
+
+        if render_height == 0 {
+            content_y = item_end;
+            continue;
+        }
+
+        let is_focused = !dialog.focus_on_buttons && dialog.selected_item == idx;
+        let is_hovered = dialog.hover_item == Some(idx);
+
+        // Draw selection or hover highlight background
+        if is_focused || is_hovered {
+            let bg_style = if is_focused {
+                Style::default().bg(theme.current_line_bg)
+            } else {
+                Style::default().bg(theme.menu_hover_bg)
+            };
+            for row in 0..render_height as u16 {
+                let row_area = Rect::new(inner.x, screen_y + row, inner.width, 1);
+                frame.render_widget(Paragraph::new("").style(bg_style), row_area);
+            }
+        }
+
+        // Render focus indicator ">" for the focused item
+        let focus_indicator_width: u16 = 2; // "> "
+        if is_focused && skip_rows == 0 {
+            let indicator_style = Style::default()
+                .fg(theme.menu_highlight_fg)
+                .add_modifier(Modifier::BOLD);
+            frame.render_widget(
+                Paragraph::new(">").style(indicator_style),
+                Rect::new(inner.x, screen_y, 1, 1),
+            );
+        }
+
+        // Calculate control area (offset by focus indicator width)
+        let control_area = Rect::new(
+            inner.x + focus_indicator_width,
+            screen_y,
+            inner.width.saturating_sub(focus_indicator_width),
+            render_height as u16,
+        );
+
+        // Render using the same render_control function as main settings
+        let _layout = render_control(
+            frame,
+            control_area,
+            &item.control,
+            &item.name,
+            item.modified,
+            skip_rows,
+            theme,
+            Some(label_col_width.saturating_sub(focus_indicator_width)),
+        );
+
+        screen_y += render_height as u16;
+        content_y = item_end;
+    }
+
+    // Render scrollbar if needed
+    if needs_scroll {
+        use crate::view::ui::scrollbar::{render_scrollbar, ScrollbarColors, ScrollbarState};
+
+        let scrollbar_x = dialog_area.x + dialog_area.width - 3;
+        let scrollbar_area = Rect::new(scrollbar_x, inner.y, 1, inner.height);
+        let scrollbar_state =
+            ScrollbarState::new(total_content_height, viewport_height, scroll_offset);
+        let scrollbar_colors = ScrollbarColors::from_theme(theme);
+        render_scrollbar(frame, scrollbar_area, &scrollbar_state, &scrollbar_colors);
+    }
+
+    // Render buttons at bottom
+    let button_y = dialog_area.y + dialog_area.height - 2;
+    let buttons: Vec<&str> = if dialog.is_new {
+        vec!["[ Save ]", "[ Cancel ]"]
+    } else {
+        vec!["[ Save ]", "[ Delete ]", "[ Cancel ]"]
+    };
+    let button_width: u16 = buttons.iter().map(|b: &&str| b.len() as u16 + 2).sum();
+    let button_x = dialog_area.x + (dialog_area.width.saturating_sub(button_width)) / 2;
+
+    let mut x = button_x;
+    for (idx, label) in buttons.iter().enumerate() {
+        let is_selected = dialog.focus_on_buttons && dialog.focused_button == idx;
+        let is_hovered = dialog.hover_button == Some(idx);
+        let is_delete = !dialog.is_new && idx == 1;
+        let style = if is_selected {
+            Style::default()
+                .fg(theme.menu_highlight_fg)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else if is_hovered {
+            Style::default()
+                .fg(theme.menu_hover_fg)
+                .bg(theme.menu_hover_bg)
+        } else if is_delete {
+            Style::default().fg(theme.diagnostic_error_fg)
+        } else {
+            Style::default().fg(theme.editor_fg)
+        };
+        frame.render_widget(
+            Paragraph::new(*label).style(style),
+            Rect::new(x, button_y, label.len() as u16, 1),
+        );
+        x += label.len() as u16 + 2;
+    }
+
+    // Check if current item has invalid JSON (for Text controls with validation)
+    // and if we're actively editing a JSON control
+    let is_editing_json = dialog.editing_text && dialog.is_editing_json();
+    let (has_invalid_json, is_json_control) = dialog
+        .current_item()
+        .map(|item| match &item.control {
+            SettingControl::Text(state) => (!state.is_valid(), false),
+            SettingControl::Json(state) => (!state.is_valid(), is_editing_json),
+            _ => (false, false),
+        })
+        .unwrap_or((false, false));
+
+    // Render help text or warning
+    let help_area = Rect::new(
+        dialog_area.x + 2,
+        button_y + 1,
+        dialog_area.width.saturating_sub(4),
+        1,
+    );
+
+    if has_invalid_json && !is_json_control {
+        // Text control with JSON validation - must fix before leaving
+        let warning = "⚠ Invalid JSON - fix before leaving field";
+        let warning_style = Style::default().fg(theme.diagnostic_warning_fg);
+        frame.render_widget(Paragraph::new(warning).style(warning_style), help_area);
+    } else if has_invalid_json && is_json_control {
+        // JSON control with invalid JSON
+        let warning = "⚠ Invalid JSON";
+        let warning_style = Style::default().fg(theme.diagnostic_warning_fg);
+        frame.render_widget(Paragraph::new(warning).style(warning_style), help_area);
+    } else if is_json_control {
+        // Editing JSON control
+        let help = "↑↓←→:Move  Enter:Newline  Tab/Esc:Exit";
+        let help_style = Style::default().fg(theme.line_number_fg);
+        frame.render_widget(Paragraph::new(help).style(help_style), help_area);
+    } else {
+        let help = "↑↓:Navigate  Tab:Fields/Buttons  Enter:Edit/Confirm  Esc:Cancel";
+        let help_style = Style::default().fg(theme.line_number_fg);
+        frame.render_widget(Paragraph::new(help).style(help_style), help_area);
+    }
 }
 
 /// Render the help overlay showing keyboard shortcuts
@@ -1157,7 +2030,6 @@ fn render_help_overlay(frame: &mut Frame, parent_area: Rect, theme: &Theme) {
             "Actions",
             vec![
                 ("Ctrl+S", "Save settings"),
-                ("Ctrl+R", "Reset to default"),
                 ("Esc", "Close settings"),
                 ("?", "Toggle this help"),
             ],

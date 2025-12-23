@@ -1,4 +1,5 @@
-use crate::services::lsp::client::LspServerConfig;
+use crate::types::{context_keys, LspServerConfig, ProcessLimits};
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -268,6 +269,20 @@ pub struct EditorConfig {
     /// Default: 500ms
     #[serde(default = "default_double_click_time")]
     pub double_click_time_ms: u64,
+
+    /// Poll interval in milliseconds for auto-reverting open buffers.
+    /// When auto-revert is enabled, file modification times are checked at this interval.
+    /// Lower values detect external changes faster but use more CPU.
+    /// Default: 2000ms (2 seconds)
+    #[serde(default = "default_auto_revert_poll_interval")]
+    pub auto_revert_poll_interval_ms: u64,
+
+    /// Poll interval in milliseconds for refreshing expanded directories in the file explorer.
+    /// Directory modification times are checked at this interval to detect new/deleted files.
+    /// Lower values detect changes faster but use more CPU.
+    /// Default: 3000ms (3 seconds)
+    #[serde(default = "default_file_tree_poll_interval")]
+    pub file_tree_poll_interval_ms: u64,
 }
 
 fn default_tab_size() -> usize {
@@ -323,6 +338,14 @@ fn default_double_click_time() -> u64 {
     500 // 500ms window for detecting double-clicks
 }
 
+fn default_auto_revert_poll_interval() -> u64 {
+    2000 // 2 seconds between file mtime checks
+}
+
+fn default_file_tree_poll_interval() -> u64 {
+    3000 // 3 seconds between directory mtime checks
+}
+
 impl Default for EditorConfig {
     fn default() -> Self {
         Self {
@@ -344,6 +367,8 @@ impl Default for EditorConfig {
             mouse_hover_enabled: true,
             mouse_hover_delay_ms: default_mouse_hover_delay(),
             double_click_time_ms: default_double_click_time(),
+            auto_revert_poll_interval_ms: default_auto_revert_poll_interval(),
+            file_tree_poll_interval_ms: default_file_tree_poll_interval(),
         }
     }
 }
@@ -458,9 +483,13 @@ pub struct KeymapConfig {
 /// Language-specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LanguageConfig {
-    /// File extensions for this language
+    /// File extensions for this language (e.g., ["rs"] for Rust)
     #[serde(default)]
     pub extensions: Vec<String>,
+
+    /// Exact filenames for this language (e.g., ["Makefile", "GNUmakefile"])
+    #[serde(default)]
+    pub filenames: Vec<String>,
 
     /// Tree-sitter grammar name
     #[serde(default)]
@@ -482,6 +511,22 @@ pub struct LanguageConfig {
     /// If specified, this grammar will be used when highlighter is "textmate"
     #[serde(default)]
     pub textmate_grammar: Option<std::path::PathBuf>,
+
+    /// Whether to show whitespace tab indicators (→) for this language
+    /// Defaults to true. Set to false for languages like Go that use tabs for indentation.
+    #[serde(default = "default_true")]
+    pub show_whitespace_tabs: bool,
+
+    /// Whether pressing Tab should insert a tab character instead of spaces.
+    /// Defaults to false (insert spaces based on tab_size).
+    /// Set to true for languages like Go and Makefile that require tabs.
+    #[serde(default = "default_false")]
+    pub use_tabs: bool,
+
+    /// Tab size (number of spaces per tab) for this language.
+    /// If not specified, falls back to the global editor.tab_size setting.
+    #[serde(default)]
+    pub tab_size: Option<usize>,
 }
 
 /// Preference for which syntax highlighting backend to use
@@ -516,6 +561,18 @@ pub struct Menu {
     pub items: Vec<MenuItem>,
 }
 
+impl Menu {
+    /// Expand all DynamicSubmenu items in this menu to regular Submenu items
+    /// This should be called before the menu is used for rendering/navigation
+    pub fn expand_dynamic_items(&mut self) {
+        self.items = self
+            .items
+            .iter()
+            .map(|item| item.expand_dynamic())
+            .collect();
+    }
+}
+
 /// A menu item (action, separator, or submenu)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
@@ -536,6 +593,54 @@ pub enum MenuItem {
     },
     /// A submenu (for future extensibility)
     Submenu { label: String, items: Vec<MenuItem> },
+    /// A dynamic submenu whose items are generated at runtime
+    /// The `source` field specifies what to generate (e.g., "themes")
+    DynamicSubmenu { label: String, source: String },
+    /// A disabled info label (no action)
+    Label { info: String },
+}
+
+impl MenuItem {
+    /// Expand a DynamicSubmenu into a regular Submenu with generated items.
+    /// Returns the original item if not a DynamicSubmenu.
+    pub fn expand_dynamic(&self) -> MenuItem {
+        match self {
+            MenuItem::DynamicSubmenu { label, source } => {
+                let items = Self::generate_dynamic_items(source);
+                MenuItem::Submenu {
+                    label: label.clone(),
+                    items,
+                }
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Generate menu items for a dynamic source
+    pub fn generate_dynamic_items(source: &str) -> Vec<MenuItem> {
+        match source {
+            "copy_with_theme" => {
+                // Generate theme options from available themes
+                crate::view::theme::Theme::available_themes()
+                    .into_iter()
+                    .map(|theme_name| {
+                        let mut args = HashMap::new();
+                        args.insert("theme".to_string(), serde_json::json!(theme_name));
+                        MenuItem::Action {
+                            label: theme_name.to_string(),
+                            action: "copy_with_theme".to_string(),
+                            args,
+                            when: Some(context_keys::HAS_SELECTION.to_string()),
+                            checkbox: None,
+                        }
+                    })
+                    .collect()
+            }
+            _ => vec![MenuItem::Label {
+                info: format!("Unknown source: {}", source),
+            }],
+        }
+    }
 }
 
 impl Default for Config {
@@ -565,45 +670,12 @@ impl Default for MenuConfig {
 }
 
 impl Config {
-    /// Get the default config file path
-    pub fn default_config_paths() -> Vec<std::path::PathBuf> {
-        let mut paths = Vec::with_capacity(2);
+    /// The config filename used throughout the application
+    pub(crate) const FILENAME: &'static str = "config.json";
 
-        // macOS: Prioritize ~/.config/fresh/config.json
-        #[cfg(target_os = "macos")]
-        if let Some(home) = dirs::home_dir() {
-            let path = home.join(".config").join("fresh").join("config.json");
-            if path.exists() {
-                paths.push(path);
-            }
-        }
-
-        // Standard system paths (XDG on Linux, AppSupport on macOS, Roaming on Windows)
-        if let Some(config_dir) = dirs::config_dir() {
-            let path = config_dir.join("fresh").join("config.json");
-            if !paths.contains(&path) && path.exists() {
-                paths.push(path);
-            }
-        }
-
-        paths
-    }
-
-    /// Load configuration from the default location, falling back to defaults if not found
-    pub fn load_or_default() -> Self {
-        for path in Self::default_config_paths() {
-            match Self::load_from_file(&path) {
-                Ok(config) => return config,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to load config from {}: {}, trying next option",
-                        path.display(),
-                        e
-                    );
-                }
-            }
-        }
-        Self::default()
+    /// Get the local config path (in the working directory)
+    pub(crate) fn local_config_path(working_dir: &Path) -> std::path::PathBuf {
+        working_dir.join(Self::FILENAME)
     }
 
     /// Load configuration from a JSON file
@@ -632,7 +704,7 @@ impl Config {
     /// - Default language configs are present even if user only customizes one
     ///
     /// User entries override defaults when keys collide.
-    fn merge_defaults_for_maps(&mut self) {
+    pub(crate) fn merge_defaults_for_maps(&mut self) {
         let defaults = Self::default();
 
         // Merge LSP configs: start with defaults, overlay user entries
@@ -652,16 +724,6 @@ impl Config {
         // Note: keybinding_maps is NOT merged - user defines their own complete maps
         // Note: keybindings Vec is NOT merged - it's user customizations only
         // Note: menu is NOT merged - user can completely override the menu structure
-    }
-
-    /// Save configuration to a JSON file
-    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), ConfigError> {
-        let contents = serde_json::to_string_pretty(self)
-            .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
-
-        std::fs::write(path.as_ref(), contents).map_err(|e| ConfigError::IoError(e.to_string()))?;
-
-        Ok(())
     }
 
     /// Load a built-in keymap from embedded JSON
@@ -730,47 +792,63 @@ impl Config {
             "rust".to_string(),
             LanguageConfig {
                 extensions: vec!["rs".to_string()],
+                filenames: vec![],
                 grammar: "rust".to_string(),
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: false,
+                tab_size: None,
             },
         );
 
         languages.insert(
             "javascript".to_string(),
             LanguageConfig {
-                extensions: vec!["js".to_string(), "jsx".to_string()],
+                extensions: vec!["js".to_string(), "jsx".to_string(), "mjs".to_string()],
+                filenames: vec![],
                 grammar: "javascript".to_string(),
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: false,
+                tab_size: None,
             },
         );
 
         languages.insert(
             "typescript".to_string(),
             LanguageConfig {
-                extensions: vec!["ts".to_string(), "tsx".to_string()],
+                extensions: vec!["ts".to_string(), "tsx".to_string(), "mts".to_string()],
+                filenames: vec![],
                 grammar: "typescript".to_string(),
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: false,
+                tab_size: None,
             },
         );
 
         languages.insert(
             "python".to_string(),
             LanguageConfig {
-                extensions: vec!["py".to_string()],
+                extensions: vec!["py".to_string(), "pyi".to_string()],
+                filenames: vec![],
                 grammar: "python".to_string(),
                 comment_prefix: Some("#".to_string()),
                 auto_indent: true,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: false,
+                tab_size: None,
             },
         );
 
@@ -778,11 +856,15 @@ impl Config {
             "c".to_string(),
             LanguageConfig {
                 extensions: vec!["c".to_string(), "h".to_string()],
+                filenames: vec![],
                 grammar: "c".to_string(),
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: false,
+                tab_size: None,
             },
         );
 
@@ -797,11 +879,15 @@ impl Config {
                     "hh".to_string(),
                     "hxx".to_string(),
                 ],
+                filenames: vec![],
                 grammar: "cpp".to_string(),
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: false,
+                tab_size: None,
             },
         );
 
@@ -809,11 +895,159 @@ impl Config {
             "csharp".to_string(),
             LanguageConfig {
                 extensions: vec!["cs".to_string()],
+                filenames: vec![],
                 grammar: "c_sharp".to_string(),
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: false,
+                tab_size: None,
+            },
+        );
+
+        languages.insert(
+            "bash".to_string(),
+            LanguageConfig {
+                extensions: vec!["sh".to_string(), "bash".to_string()],
+                filenames: vec![
+                    ".bashrc".to_string(),
+                    ".bash_profile".to_string(),
+                    ".bash_aliases".to_string(),
+                    ".bash_logout".to_string(),
+                    ".profile".to_string(),
+                    ".zshrc".to_string(),
+                    ".zprofile".to_string(),
+                    ".zshenv".to_string(),
+                    ".zlogin".to_string(),
+                    ".zlogout".to_string(),
+                ],
+                grammar: "bash".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: false,
+                tab_size: None,
+            },
+        );
+
+        languages.insert(
+            "makefile".to_string(),
+            LanguageConfig {
+                extensions: vec!["mk".to_string()],
+                filenames: vec![
+                    "Makefile".to_string(),
+                    "makefile".to_string(),
+                    "GNUmakefile".to_string(),
+                ],
+                grammar: "make".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: false,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: true,    // Makefiles require tabs for recipes
+                tab_size: Some(8), // Makefiles traditionally use 8-space tabs
+            },
+        );
+
+        languages.insert(
+            "dockerfile".to_string(),
+            LanguageConfig {
+                extensions: vec!["dockerfile".to_string()],
+                filenames: vec!["Dockerfile".to_string(), "Containerfile".to_string()],
+                grammar: "dockerfile".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: false,
+                tab_size: None,
+            },
+        );
+
+        languages.insert(
+            "json".to_string(),
+            LanguageConfig {
+                extensions: vec!["json".to_string(), "jsonc".to_string()],
+                filenames: vec![],
+                grammar: "json".to_string(),
+                comment_prefix: None,
+                auto_indent: true,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: false,
+                tab_size: None,
+            },
+        );
+
+        languages.insert(
+            "toml".to_string(),
+            LanguageConfig {
+                extensions: vec!["toml".to_string()],
+                filenames: vec!["Cargo.lock".to_string()],
+                grammar: "toml".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: false,
+                tab_size: None,
+            },
+        );
+
+        languages.insert(
+            "yaml".to_string(),
+            LanguageConfig {
+                extensions: vec!["yml".to_string(), "yaml".to_string()],
+                filenames: vec![],
+                grammar: "yaml".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: false,
+                tab_size: None,
+            },
+        );
+
+        languages.insert(
+            "markdown".to_string(),
+            LanguageConfig {
+                extensions: vec!["md".to_string(), "markdown".to_string()],
+                filenames: vec!["README".to_string()],
+                grammar: "markdown".to_string(),
+                comment_prefix: None,
+                auto_indent: false,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: false,
+                tab_size: None,
+            },
+        );
+
+        // Go uses tabs for indentation by convention, so hide tab indicators and use tabs
+        languages.insert(
+            "go".to_string(),
+            LanguageConfig {
+                extensions: vec!["go".to_string()],
+                filenames: vec![],
+                grammar: "go".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: false,
+                use_tabs: true,    // Go convention is to use tabs
+                tab_size: Some(8), // Go convention is 8-space tab width
             },
         );
 
@@ -830,7 +1064,26 @@ impl Config {
             .join(format!("rust-analyzer-{}.log", std::process::id()))
             .to_string_lossy()
             .to_string();
-        tracing::info!("rust-analyzer will log to: {}", ra_log_path);
+
+        // Minimal performance config for rust-analyzer:
+        // - checkOnSave: false - disables cargo check on every save (the #1 cause of slowdowns)
+        // - cachePriming.enable: false - disables background indexing of entire crate graph
+        // - procMacro.enable: false - disables proc-macro expansion (saves CPU/RAM)
+        // - cargo.buildScripts.enable: false - prevents running build.rs automatically
+        // - cargo.autoreload: false - only reload manually
+        // - diagnostics.enable: true - keeps basic syntax error reporting
+        // - files.watcher: "server" - more efficient than editor-side watchers
+        let ra_init_options = serde_json::json!({
+            "checkOnSave": false,
+            "cachePriming": { "enable": false },
+            "procMacro": { "enable": false },
+            "cargo": {
+                "buildScripts": { "enable": false },
+                "autoreload": false
+            },
+            "diagnostics": { "enable": true },
+            "files": { "watcher": "server" }
+        });
 
         lsp.insert(
             "rust".to_string(),
@@ -839,8 +1092,8 @@ impl Config {
                 args: vec!["--log-file".to_string(), ra_log_path],
                 enabled: true,
                 auto_start: false,
-                process_limits: crate::services::process_limits::ProcessLimits::default(),
-                initialization_options: None,
+                process_limits: ProcessLimits::default(),
+                initialization_options: Some(ra_init_options),
             },
         );
 
@@ -852,7 +1105,7 @@ impl Config {
                 args: vec![],
                 enabled: true,
                 auto_start: false,
-                process_limits: crate::services::process_limits::ProcessLimits::default(),
+                process_limits: ProcessLimits::default(),
                 initialization_options: None,
             },
         );
@@ -864,7 +1117,7 @@ impl Config {
             args: vec!["--stdio".to_string()],
             enabled: true,
             auto_start: false,
-            process_limits: crate::services::process_limits::ProcessLimits::default(),
+            process_limits: ProcessLimits::default(),
             initialization_options: None,
         };
         lsp.insert("javascript".to_string(), ts_lsp.clone());
@@ -878,7 +1131,7 @@ impl Config {
                 args: vec!["--stdio".to_string()],
                 enabled: true,
                 auto_start: false,
-                process_limits: crate::services::process_limits::ProcessLimits::default(),
+                process_limits: ProcessLimits::default(),
                 initialization_options: None,
             },
         );
@@ -891,7 +1144,7 @@ impl Config {
                 args: vec!["--stdio".to_string()],
                 enabled: true,
                 auto_start: false,
-                process_limits: crate::services::process_limits::ProcessLimits::default(),
+                process_limits: ProcessLimits::default(),
                 initialization_options: None,
             },
         );
@@ -904,7 +1157,7 @@ impl Config {
                 args: vec![],
                 enabled: true,
                 auto_start: false,
-                process_limits: crate::services::process_limits::ProcessLimits::default(),
+                process_limits: ProcessLimits::default(),
                 initialization_options: None,
             },
         );
@@ -915,7 +1168,7 @@ impl Config {
                 args: vec![],
                 enabled: true,
                 auto_start: false,
-                process_limits: crate::services::process_limits::ProcessLimits::default(),
+                process_limits: ProcessLimits::default(),
                 initialization_options: None,
             },
         );
@@ -928,7 +1181,7 @@ impl Config {
                 args: vec![],
                 enabled: true,
                 auto_start: false,
-                process_limits: crate::services::process_limits::ProcessLimits::default(),
+                process_limits: ProcessLimits::default(),
                 initialization_options: None,
             },
         );
@@ -941,7 +1194,7 @@ impl Config {
                 args: vec!["--stdio".to_string()],
                 enabled: true,
                 auto_start: false,
-                process_limits: crate::services::process_limits::ProcessLimits::default(),
+                process_limits: ProcessLimits::default(),
                 initialization_options: None,
             },
         );
@@ -954,7 +1207,7 @@ impl Config {
                 args: vec![],
                 enabled: true,
                 auto_start: false,
-                process_limits: crate::services::process_limits::ProcessLimits::default(),
+                process_limits: ProcessLimits::default(),
                 initialization_options: None,
             },
         );
@@ -1053,15 +1306,19 @@ impl Config {
                         label: "Cut".to_string(),
                         action: "cut".to_string(),
                         args: HashMap::new(),
-                        when: None,
+                        when: Some(context_keys::HAS_SELECTION.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: "Copy".to_string(),
                         action: "copy".to_string(),
                         args: HashMap::new(),
-                        when: None,
+                        when: Some(context_keys::HAS_SELECTION.to_string()),
                         checkbox: None,
+                    },
+                    MenuItem::DynamicSubmenu {
+                        label: "Copy with Formatting".to_string(),
+                        source: "copy_with_theme".to_string(),
                     },
                     MenuItem::Action {
                         label: "Paste".to_string(),
@@ -1090,7 +1347,7 @@ impl Config {
                         label: "Find in Selection".to_string(),
                         action: "find_in_selection".to_string(),
                         args: HashMap::new(),
-                        when: Some(crate::view::ui::context_keys::HAS_SELECTION.to_string()),
+                        when: Some(context_keys::HAS_SELECTION.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
@@ -1133,7 +1390,7 @@ impl Config {
                         action: "toggle_file_explorer".to_string(),
                         args: HashMap::new(),
                         when: None,
-                        checkbox: Some(crate::view::ui::context_keys::FILE_EXPLORER.to_string()),
+                        checkbox: Some(context_keys::FILE_EXPLORER.to_string()),
                     },
                     MenuItem::Separator { separator: true },
                     MenuItem::Action {
@@ -1141,21 +1398,21 @@ impl Config {
                         action: "toggle_line_numbers".to_string(),
                         args: HashMap::new(),
                         when: None,
-                        checkbox: Some(crate::view::ui::context_keys::LINE_NUMBERS.to_string()),
+                        checkbox: Some(context_keys::LINE_NUMBERS.to_string()),
                     },
                     MenuItem::Action {
                         label: "Line Wrap".to_string(),
                         action: "toggle_line_wrap".to_string(),
                         args: HashMap::new(),
                         when: None,
-                        checkbox: Some(crate::view::ui::context_keys::LINE_WRAP.to_string()),
+                        checkbox: Some(context_keys::LINE_WRAP.to_string()),
                     },
                     MenuItem::Action {
                         label: "Mouse Support".to_string(),
                         action: "toggle_mouse_capture".to_string(),
                         args: HashMap::new(),
                         when: None,
-                        checkbox: Some(crate::view::ui::context_keys::MOUSE_CAPTURE.to_string()),
+                        checkbox: Some(context_keys::MOUSE_CAPTURE.to_string()),
                     },
                     // Note: Compose Mode removed from menu - markdown_compose plugin provides this
                     MenuItem::Separator { separator: true },
@@ -1428,28 +1685,28 @@ impl Config {
                         label: "Show Hover Info".to_string(),
                         action: "lsp_hover".to_string(),
                         args: HashMap::new(),
-                        when: Some(crate::view::ui::context_keys::LSP_AVAILABLE.to_string()),
+                        when: Some(context_keys::LSP_AVAILABLE.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: "Go to Definition".to_string(),
                         action: "lsp_goto_definition".to_string(),
                         args: HashMap::new(),
-                        when: Some(crate::view::ui::context_keys::LSP_AVAILABLE.to_string()),
+                        when: Some(context_keys::LSP_AVAILABLE.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: "Find References".to_string(),
                         action: "lsp_references".to_string(),
                         args: HashMap::new(),
-                        when: Some(crate::view::ui::context_keys::LSP_AVAILABLE.to_string()),
+                        when: Some(context_keys::LSP_AVAILABLE.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: "Rename Symbol".to_string(),
                         action: "lsp_rename".to_string(),
                         args: HashMap::new(),
-                        when: Some(crate::view::ui::context_keys::LSP_AVAILABLE.to_string()),
+                        when: Some(context_keys::LSP_AVAILABLE.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Separator { separator: true },
@@ -1457,21 +1714,21 @@ impl Config {
                         label: "Show Completions".to_string(),
                         action: "lsp_completion".to_string(),
                         args: HashMap::new(),
-                        when: Some(crate::view::ui::context_keys::LSP_AVAILABLE.to_string()),
+                        when: Some(context_keys::LSP_AVAILABLE.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: "Show Signature Help".to_string(),
                         action: "lsp_signature_help".to_string(),
                         args: HashMap::new(),
-                        when: Some(crate::view::ui::context_keys::LSP_AVAILABLE.to_string()),
+                        when: Some(context_keys::LSP_AVAILABLE.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: "Code Actions".to_string(),
                         action: "lsp_code_actions".to_string(),
                         args: HashMap::new(),
-                        when: Some(crate::view::ui::context_keys::LSP_AVAILABLE.to_string()),
+                        when: Some(context_keys::LSP_AVAILABLE.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Separator { separator: true },
@@ -1479,7 +1736,7 @@ impl Config {
                         label: "Toggle Inlay Hints".to_string(),
                         action: "toggle_inlay_hints".to_string(),
                         args: HashMap::new(),
-                        when: Some(crate::view::ui::context_keys::LSP_AVAILABLE.to_string()),
+                        when: Some(context_keys::LSP_AVAILABLE.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
@@ -1487,7 +1744,7 @@ impl Config {
                         action: "toggle_mouse_hover".to_string(),
                         args: HashMap::new(),
                         when: None,
-                        checkbox: Some(crate::view::ui::context_keys::MOUSE_HOVER.to_string()),
+                        checkbox: Some(context_keys::MOUSE_HOVER.to_string()),
                     },
                     MenuItem::Separator { separator: true },
                     MenuItem::Action {
@@ -1514,18 +1771,14 @@ impl Config {
                         label: "New File".to_string(),
                         action: "file_explorer_new_file".to_string(),
                         args: HashMap::new(),
-                        when: Some(
-                            crate::view::ui::context_keys::FILE_EXPLORER_FOCUSED.to_string(),
-                        ),
+                        when: Some(context_keys::FILE_EXPLORER_FOCUSED.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: "New Folder".to_string(),
                         action: "file_explorer_new_directory".to_string(),
                         args: HashMap::new(),
-                        when: Some(
-                            crate::view::ui::context_keys::FILE_EXPLORER_FOCUSED.to_string(),
-                        ),
+                        when: Some(context_keys::FILE_EXPLORER_FOCUSED.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Separator { separator: true },
@@ -1533,27 +1786,21 @@ impl Config {
                         label: "Open".to_string(),
                         action: "file_explorer_open".to_string(),
                         args: HashMap::new(),
-                        when: Some(
-                            crate::view::ui::context_keys::FILE_EXPLORER_FOCUSED.to_string(),
-                        ),
+                        when: Some(context_keys::FILE_EXPLORER_FOCUSED.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: "Rename".to_string(),
                         action: "file_explorer_rename".to_string(),
                         args: HashMap::new(),
-                        when: Some(
-                            crate::view::ui::context_keys::FILE_EXPLORER_FOCUSED.to_string(),
-                        ),
+                        when: Some(context_keys::FILE_EXPLORER_FOCUSED.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Action {
                         label: "Delete".to_string(),
                         action: "file_explorer_delete".to_string(),
                         args: HashMap::new(),
-                        when: Some(
-                            crate::view::ui::context_keys::FILE_EXPLORER_FOCUSED.to_string(),
-                        ),
+                        when: Some(context_keys::FILE_EXPLORER_FOCUSED.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Separator { separator: true },
@@ -1561,9 +1808,7 @@ impl Config {
                         label: "Refresh".to_string(),
                         action: "file_explorer_refresh".to_string(),
                         args: HashMap::new(),
-                        when: Some(
-                            crate::view::ui::context_keys::FILE_EXPLORER_FOCUSED.to_string(),
-                        ),
+                        when: Some(context_keys::FILE_EXPLORER_FOCUSED.to_string()),
                         checkbox: None,
                     },
                     MenuItem::Separator { separator: true },
@@ -1571,20 +1816,15 @@ impl Config {
                         label: "Show Hidden Files".to_string(),
                         action: "file_explorer_toggle_hidden".to_string(),
                         args: HashMap::new(),
-                        when: Some(crate::view::ui::context_keys::FILE_EXPLORER.to_string()),
-                        checkbox: Some(
-                            crate::view::ui::context_keys::FILE_EXPLORER_SHOW_HIDDEN.to_string(),
-                        ),
+                        when: Some(context_keys::FILE_EXPLORER.to_string()),
+                        checkbox: Some(context_keys::FILE_EXPLORER_SHOW_HIDDEN.to_string()),
                     },
                     MenuItem::Action {
                         label: "Show Gitignored Files".to_string(),
                         action: "file_explorer_toggle_gitignored".to_string(),
                         args: HashMap::new(),
-                        when: Some(crate::view::ui::context_keys::FILE_EXPLORER.to_string()),
-                        checkbox: Some(
-                            crate::view::ui::context_keys::FILE_EXPLORER_SHOW_GITIGNORED
-                                .to_string(),
-                        ),
+                        when: Some(context_keys::FILE_EXPLORER.to_string()),
+                        checkbox: Some(context_keys::FILE_EXPLORER_SHOW_GITIGNORED.to_string()),
                     },
                 ],
             },
@@ -1666,141 +1906,6 @@ impl std::fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
-
-/// Directory paths for editor state and configuration
-///
-/// This struct holds all directory paths that the editor needs.
-/// Only the top-level `main` function should use `dirs::*` to construct this;
-/// all other code should receive it by construction/parameter passing.
-///
-/// This design ensures:
-/// - Tests can use isolated temp directories
-/// - Parallel tests don't interfere with each other
-/// - No hidden global state dependencies
-#[derive(Debug, Clone)]
-pub struct DirectoryContext {
-    /// Data directory for persistent state (recovery, sessions, history)
-    /// e.g., ~/.local/share/fresh on Linux, ~/Library/Application Support/fresh on macOS
-    pub data_dir: std::path::PathBuf,
-
-    /// Config directory for user configuration
-    /// e.g., ~/.config/fresh on Linux, ~/Library/Application Support/fresh on macOS
-    pub config_dir: std::path::PathBuf,
-
-    /// User's home directory (for file open dialog shortcuts)
-    pub home_dir: Option<std::path::PathBuf>,
-
-    /// User's documents directory (for file open dialog shortcuts)
-    pub documents_dir: Option<std::path::PathBuf>,
-
-    /// User's downloads directory (for file open dialog shortcuts)
-    pub downloads_dir: Option<std::path::PathBuf>,
-}
-
-impl DirectoryContext {
-    /// Create a DirectoryContext from the system directories
-    /// This should ONLY be called from main()
-    pub fn from_system() -> std::io::Result<Self> {
-        let data_dir = dirs::data_dir()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Could not determine data directory",
-                )
-            })?
-            .join("fresh");
-
-        #[allow(unused_mut)] // mut needed on macOS only
-        let mut config_dir = dirs::config_dir()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Could not determine config directory",
-                )
-            })?
-            .join("fresh");
-
-        // macOS: Prioritize ~/.config/fresh if it exists
-        #[cfg(target_os = "macos")]
-        if let Some(home) = dirs::home_dir() {
-            let xdg_config = home.join(".config").join("fresh");
-            if xdg_config.exists() {
-                config_dir = xdg_config;
-            }
-        }
-
-        Ok(Self {
-            data_dir,
-            config_dir,
-            home_dir: dirs::home_dir(),
-            documents_dir: dirs::document_dir(),
-            downloads_dir: dirs::download_dir(),
-        })
-    }
-
-    /// Create a DirectoryContext for testing with a temp directory
-    /// All paths point to subdirectories within the provided temp_dir
-    pub fn for_testing(temp_dir: &std::path::Path) -> Self {
-        Self {
-            data_dir: temp_dir.join("data"),
-            config_dir: temp_dir.join("config"),
-            home_dir: Some(temp_dir.join("home")),
-            documents_dir: Some(temp_dir.join("documents")),
-            downloads_dir: Some(temp_dir.join("downloads")),
-        }
-    }
-
-    /// Get the recovery directory path
-    pub fn recovery_dir(&self) -> std::path::PathBuf {
-        self.data_dir.join("recovery")
-    }
-
-    /// Get the sessions directory path
-    pub fn sessions_dir(&self) -> std::path::PathBuf {
-        self.data_dir.join("sessions")
-    }
-
-    /// Get the search history file path
-    pub fn search_history_path(&self) -> std::path::PathBuf {
-        self.data_dir.join("search_history.json")
-    }
-
-    /// Get the replace history file path
-    pub fn replace_history_path(&self) -> std::path::PathBuf {
-        self.data_dir.join("replace_history.json")
-    }
-
-    /// Get the terminals root directory
-    pub fn terminals_dir(&self) -> std::path::PathBuf {
-        self.data_dir.join("terminals")
-    }
-
-    /// Get the terminal directory for a specific working directory
-    pub fn terminal_dir_for(&self, working_dir: &std::path::Path) -> std::path::PathBuf {
-        let encoded = crate::session::encode_path_for_filename(working_dir);
-        self.terminals_dir().join(encoded)
-    }
-
-    /// Get the config file path
-    pub fn config_path(&self) -> std::path::PathBuf {
-        self.config_dir.join("config.json")
-    }
-
-    /// Get the themes directory path
-    pub fn themes_dir(&self) -> std::path::PathBuf {
-        self.config_dir.join("themes")
-    }
-
-    /// Get the grammars directory path
-    pub fn grammars_dir(&self) -> std::path::PathBuf {
-        self.config_dir.join("grammars")
-    }
-
-    /// Get the plugins directory path
-    pub fn plugins_dir(&self) -> std::path::PathBuf {
-        self.config_dir.join("plugins")
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1926,5 +2031,68 @@ mod tests {
 
         // Should have all default languages
         assert_eq!(loaded.languages.len(), defaults.languages.len());
+    }
+
+    #[test]
+    fn test_dynamic_submenu_expansion() {
+        // Test that DynamicSubmenu expands to Submenu with generated items
+        let dynamic = MenuItem::DynamicSubmenu {
+            label: "Test".to_string(),
+            source: "copy_with_theme".to_string(),
+        };
+
+        let expanded = dynamic.expand_dynamic();
+
+        // Should expand to a Submenu
+        match expanded {
+            MenuItem::Submenu { label, items } => {
+                assert_eq!(label, "Test");
+                // Should have items for each available theme
+                let themes = crate::view::theme::Theme::available_themes();
+                assert_eq!(items.len(), themes.len());
+
+                // Each item should be an Action with copy_with_theme
+                for (item, theme_name) in items.iter().zip(themes.iter()) {
+                    match item {
+                        MenuItem::Action {
+                            label,
+                            action,
+                            args,
+                            ..
+                        } => {
+                            assert_eq!(label, theme_name);
+                            assert_eq!(action, "copy_with_theme");
+                            assert_eq!(
+                                args.get("theme").and_then(|v| v.as_str()),
+                                Some(theme_name.as_str())
+                            );
+                        }
+                        _ => panic!("Expected Action item"),
+                    }
+                }
+            }
+            _ => panic!("Expected Submenu after expansion"),
+        }
+    }
+
+    #[test]
+    fn test_non_dynamic_item_unchanged() {
+        // Non-DynamicSubmenu items should be unchanged by expand_dynamic
+        let action = MenuItem::Action {
+            label: "Test".to_string(),
+            action: "test".to_string(),
+            args: HashMap::new(),
+            when: None,
+            checkbox: None,
+        };
+
+        let expanded = action.expand_dynamic();
+        match expanded {
+            MenuItem::Action { label, action, .. } => {
+                assert_eq!(label, "Test");
+                assert_eq!(action, "test");
+            }
+            _ => panic!("Action should remain Action after expand_dynamic"),
+        }
     }
 }

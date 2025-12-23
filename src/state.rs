@@ -84,11 +84,27 @@ pub struct EditorState {
     /// but navigation, selection, and copy are still allowed
     pub editing_disabled: bool,
 
+    /// Whether to show whitespace tab indicators (→) for this buffer
+    /// Set based on language config; defaults to true
+    pub show_whitespace_tabs: bool,
+
+    /// Whether pressing Tab should insert a tab character instead of spaces.
+    /// Set based on language config; defaults to false (insert spaces).
+    pub use_tabs: bool,
+
+    /// Tab size (number of spaces per tab character) for rendering.
+    /// Used for visual display of tab characters and indent calculations.
+    pub tab_size: usize,
+
     /// Semantic highlighter for word occurrence highlighting
     pub semantic_highlighter: SemanticHighlighter,
 
     /// View mode for this buffer (Source or Compose)
     pub view_mode: ViewMode,
+
+    /// Debug mode: show highlight/overlay byte ranges
+    /// When enabled, each character shows its byte position and highlight info
+    pub debug_highlight_mode: bool,
 
     /// Optional compose width for centered rendering
     pub compose_width: Option<u16>,
@@ -124,8 +140,12 @@ impl EditorState {
             text_properties: TextPropertyManager::new(),
             show_cursors: true,
             editing_disabled: false,
+            show_whitespace_tabs: true,
+            use_tabs: false,
+            tab_size: 4, // Default tab size
             semantic_highlighter: SemanticHighlighter::new(),
             view_mode: ViewMode::Source,
+            debug_highlight_mode: false,
             compose_width: None,
             compose_prev_line_numbers: None,
             compose_column_guides: None,
@@ -201,8 +221,12 @@ impl EditorState {
             text_properties: TextPropertyManager::new(),
             show_cursors: true,
             editing_disabled: false,
+            show_whitespace_tabs: true,
+            use_tabs: false,
+            tab_size: 4, // Default tab size
             semantic_highlighter,
             view_mode: ViewMode::Source,
+            debug_highlight_mode: false,
             compose_width: None,
             compose_prev_line_numbers: None,
             compose_column_guides: None,
@@ -389,9 +413,11 @@ impl EditorState {
 
             Event::ClearAnchor { cursor_id } => {
                 // Clear the anchor and reset deselect_on_move to cancel mark mode
+                // Also clear block selection if active
                 if let Some(cursor) = self.cursors.get_mut(*cursor_id) {
                     cursor.anchor = None;
                     cursor.deselect_on_move = true;
+                    cursor.clear_block_selection();
                 }
             }
 
@@ -568,6 +594,15 @@ impl EditorState {
     pub fn primary_cursor_mut(&mut self) -> &mut Cursor {
         self.cursors.primary_mut()
     }
+
+    /// Called when this buffer loses focus (e.g., switching to another buffer,
+    /// opening a prompt, focusing file explorer, etc.)
+    /// Dismisses transient popups like Hover and Signature Help.
+    pub fn on_focus_lost(&mut self) {
+        if self.popups.dismiss_transient() {
+            tracing::debug!("Dismissed transient popup on buffer focus loss");
+        }
+    }
 }
 
 /// Convert event overlay face to the actual overlay face
@@ -645,6 +680,7 @@ fn convert_popup_data_to_popup(data: &PopupData) -> Popup {
 
     let popup = Popup {
         title: data.title.clone(),
+        transient: data.transient,
         content,
         position,
         width: data.width,

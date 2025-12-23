@@ -3,17 +3,17 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Global flag to force Linux-style keybinding display (Ctrl instead of ⌘)
+/// Global flag to force Linux-style keybinding display (Alt/Shift instead of ⌥/⇧)
 /// This is primarily used in tests to ensure consistent output across platforms.
 static FORCE_LINUX_KEYBINDINGS: AtomicBool = AtomicBool::new(false);
 
-/// Force Linux-style keybinding display (Ctrl/Alt/Shift instead of ⌘/⌥/⇧)
+/// Force Linux-style keybinding display (Alt/Shift instead of ⌥/⇧)
 /// Call this in tests to ensure consistent output regardless of platform.
 pub fn set_force_linux_keybindings(force: bool) {
     FORCE_LINUX_KEYBINDINGS.store(force, Ordering::SeqCst);
 }
 
-/// Check if we should use macOS-style symbols for keybindings
+/// Check if we should use macOS-style symbols for Alt and Shift keybindings
 fn use_macos_symbols() -> bool {
     if FORCE_LINUX_KEYBINDINGS.load(Ordering::SeqCst) {
         return false;
@@ -22,14 +22,14 @@ fn use_macos_symbols() -> bool {
 }
 
 /// Format a keybinding as a user-friendly string
-/// On macOS, this will show ⌘ instead of Ctrl for better UX
+/// On macOS, uses native symbols for Alt (⌥) and Shift (⇧)
 pub fn format_keybinding(keycode: &KeyCode, modifiers: &KeyModifiers) -> String {
     let mut result = String::new();
 
-    // On macOS, show ⌘ (Cmd) symbol instead of Ctrl for the Control modifier
-    // This provides a more native experience for Mac users
+    // Control key is Ctrl on all platforms (crossterm's CONTROL modifier is the physical Ctrl key)
+    // On macOS, use native symbols for Alt and Shift only
     let (ctrl_label, alt_label, shift_label) = if use_macos_symbols() {
-        ("⌘", "⌥", "⇧")
+        ("Ctrl", "⌥", "⇧")
     } else {
         ("Ctrl", "Alt", "Shift")
     };
@@ -267,6 +267,7 @@ pub enum Action {
 
     // Clipboard
     Copy,
+    CopyWithTheme(String),
     Cut,
     Paste,
 
@@ -442,8 +443,16 @@ pub enum Action {
     // View toggles
     ToggleLineNumbers,
     ToggleMouseCapture,
+    ToggleDebugHighlights, // Debug mode: show highlight/overlay byte ranges
     SetBackground,
     SetBackgroundBlend,
+
+    // Buffer settings (per-buffer overrides)
+    SetTabSize,
+    SetLineEnding,
+    ToggleIndentationStyle,
+    ToggleTabIndicators,
+    ResetBufferSettings,
 
     // Config operations
     DumpConfig,
@@ -558,6 +567,11 @@ impl Action {
             "set_mark" => Some(Action::SetMark),
 
             "copy" => Some(Action::Copy),
+            "copy_with_theme" => {
+                // Empty theme = open theme picker prompt
+                let theme = args.get("theme").and_then(|v| v.as_str()).unwrap_or("");
+                Some(Action::CopyWithTheme(theme.to_string()))
+            }
             "cut" => Some(Action::Cut),
             "paste" => Some(Action::Paste),
 
@@ -739,10 +753,18 @@ impl Action {
 
             "toggle_line_numbers" => Some(Action::ToggleLineNumbers),
             "toggle_mouse_capture" => Some(Action::ToggleMouseCapture),
+            "toggle_debug_highlights" => Some(Action::ToggleDebugHighlights),
             "set_background" => Some(Action::SetBackground),
             "set_background_blend" => Some(Action::SetBackgroundBlend),
             "select_theme" => Some(Action::SelectTheme),
             "select_keybinding_map" => Some(Action::SelectKeybindingMap),
+
+            // Buffer settings
+            "set_tab_size" => Some(Action::SetTabSize),
+            "set_line_ending" => Some(Action::SetLineEnding),
+            "toggle_indentation_style" => Some(Action::ToggleIndentationStyle),
+            "toggle_tab_indicators" => Some(Action::ToggleTabIndicators),
+            "reset_buffer_settings" => Some(Action::ResetBufferSettings),
 
             "dump_config" => Some(Action::DumpConfig),
 
@@ -1532,6 +1554,8 @@ impl KeybindingResolver {
             Action::Recenter => "Recenter view on cursor".to_string(),
             Action::SetMark => "Set mark (start selection)".to_string(),
             Action::Copy => "Copy".to_string(),
+            Action::CopyWithTheme(theme) if theme.is_empty() => "Copy with formatting".to_string(),
+            Action::CopyWithTheme(theme) => format!("Copy with {} theme", theme),
             Action::Cut => "Cut".to_string(),
             Action::Paste => "Paste".to_string(),
             Action::AddCursorAbove => "Add cursor above".to_string(),
@@ -1665,8 +1689,16 @@ impl KeybindingResolver {
             Action::ToggleMouseHover => "Toggle LSP hover on mouse".to_string(),
             Action::ToggleLineNumbers => "Toggle line numbers".to_string(),
             Action::ToggleMouseCapture => "Toggle mouse support".to_string(),
+            Action::ToggleDebugHighlights => {
+                "Toggle debug highlight mode (show byte ranges)".to_string()
+            }
             Action::SetBackground => "Set ANSI background file".to_string(),
             Action::SetBackgroundBlend => "Set background blend ratio".to_string(),
+            Action::SetTabSize => "Set tab size for current buffer".to_string(),
+            Action::SetLineEnding => "Set line ending format (LF/CRLF)".to_string(),
+            Action::ToggleIndentationStyle => "Toggle indentation style (spaces/tabs)".to_string(),
+            Action::ToggleTabIndicators => "Toggle tab indicator visibility".to_string(),
+            Action::ResetBufferSettings => "Reset buffer settings to config".to_string(),
             Action::DumpConfig => "Dump config to file".to_string(),
             Action::Search => "Search for text in buffer".to_string(),
             Action::FindInSelection => "Search within selection".to_string(),

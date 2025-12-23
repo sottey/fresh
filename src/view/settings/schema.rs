@@ -91,10 +91,20 @@ pub enum SettingType {
     Enum { options: Vec<EnumOption> },
     /// Array of strings
     StringArray,
+    /// Array of objects with a schema (for keybindings, etc.)
+    ObjectArray {
+        item_schema: Box<SettingSchema>,
+        /// JSON pointer to field within item to display as preview (e.g., "/action")
+        display_field: Option<String>,
+    },
     /// Nested object (category)
     Object { properties: Vec<SettingSchema> },
     /// Map with string keys (for languages, lsp configs)
-    Map { value_schema: Box<SettingSchema> },
+    Map {
+        value_schema: Box<SettingSchema>,
+        /// JSON pointer to field within value to display as preview (e.g., "/command")
+        display_field: Option<String>,
+    },
     /// Complex type we can't edit directly
     Complex,
 }
@@ -378,11 +388,26 @@ fn determine_type(
         }
         Some("string") => SettingType::String,
         Some("array") => {
-            // Check if it's an array of strings
+            // Check if it's an array of strings or objects
             if let Some(ref items) = resolved.items {
                 let item_resolved = resolve_ref(items, defs);
                 if item_resolved.schema_type.as_ref().and_then(|t| t.primary()) == Some("string") {
                     return SettingType::StringArray;
+                }
+                // Check if items reference an object type
+                if let Some(ref ref_path) = items.ref_path {
+                    // Parse the item schema from the referenced definition
+                    let item_schema =
+                        parse_setting("item", "", item_resolved, defs, enum_values_map);
+
+                    // Only create ObjectArray if the item is an object with properties
+                    if matches!(item_schema.setting_type, SettingType::Object { .. }) {
+                        let display_field = get_display_field_for_ref(ref_path);
+                        return SettingType::ObjectArray {
+                            item_schema: Box::new(item_schema),
+                            display_field,
+                        };
+                    }
                 }
             }
             SettingType::Complex
@@ -395,8 +420,16 @@ fn determine_type(
                         let inner_resolved = resolve_ref(schema_box, defs);
                         let value_schema =
                             parse_setting("value", "", inner_resolved, defs, enum_values_map);
+
+                        // Determine display field based on the $ref path
+                        let display_field = schema_box
+                            .ref_path
+                            .as_ref()
+                            .and_then(|ref_path| get_display_field_for_ref(ref_path));
+
                         return SettingType::Map {
                             value_schema: Box::new(value_schema),
+                            display_field,
                         };
                     }
                     AdditionalProperties::Bool(true) => {
@@ -417,6 +450,21 @@ fn determine_type(
             SettingType::Complex
         }
         _ => SettingType::Complex,
+    }
+}
+
+/// Get the display field for a known $ref type
+/// This maps type names to the field that should be shown as a preview in map entries
+fn get_display_field_for_ref(ref_path: &str) -> Option<String> {
+    // Extract type name from ref path like "#/$defs/LspServerConfig"
+    let type_name = ref_path.strip_prefix("#/$defs/")?;
+
+    match type_name {
+        "LspServerConfig" => Some("/command".to_string()),
+        "LanguageConfig" => Some("/grammar".to_string()),
+        "KeymapConfig" => Some("/inherits".to_string()),
+        "Keybinding" => Some("/action".to_string()),
+        _ => None,
     }
 }
 

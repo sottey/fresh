@@ -232,6 +232,15 @@ pub fn get_all_commands() -> Vec<Command> {
             source: CommandSource::Builtin,
         },
         Command {
+            name: "Copy with Formatting".to_string(),
+            description: "Copy selection with syntax highlighting colors (as rich text)"
+                .to_string(),
+            action: Action::CopyWithTheme(String::new()),
+            contexts: vec![KeyContext::Normal],
+            custom_contexts: vec![],
+            source: CommandSource::Builtin,
+        },
+        Command {
             name: "Cut".to_string(),
             description: "Cut selection to clipboard".to_string(),
             action: Action::Cut,
@@ -480,6 +489,57 @@ pub fn get_all_commands() -> Vec<Command> {
             name: "Toggle Line Numbers".to_string(),
             description: "Show or hide line numbers in the gutter".to_string(),
             action: Action::ToggleLineNumbers,
+            contexts: vec![KeyContext::Normal],
+            custom_contexts: vec![],
+            source: CommandSource::Builtin,
+        },
+        Command {
+            name: "Debug: Toggle Highlight Debug Mode".to_string(),
+            description: "Show highlight/overlay byte ranges for debugging".to_string(),
+            action: Action::ToggleDebugHighlights,
+            contexts: vec![KeyContext::Normal],
+            custom_contexts: vec![],
+            source: CommandSource::Builtin,
+        },
+        // Buffer settings commands
+        Command {
+            name: "Set Tab Size".to_string(),
+            description: "Set the tab size for the current buffer".to_string(),
+            action: Action::SetTabSize,
+            contexts: vec![KeyContext::Normal],
+            custom_contexts: vec![],
+            source: CommandSource::Builtin,
+        },
+        Command {
+            name: "Set Line Ending".to_string(),
+            description: "Set line ending format: LF (Unix), CRLF (Windows), or CR (Classic Mac)"
+                .to_string(),
+            action: Action::SetLineEnding,
+            contexts: vec![KeyContext::Normal],
+            custom_contexts: vec![],
+            source: CommandSource::Builtin,
+        },
+        Command {
+            name: "Toggle Indentation: Spaces ↔ Tabs".to_string(),
+            description: "Switch between spaces and tabs for indentation".to_string(),
+            action: Action::ToggleIndentationStyle,
+            contexts: vec![KeyContext::Normal],
+            custom_contexts: vec![],
+            source: CommandSource::Builtin,
+        },
+        Command {
+            name: "Toggle Tab Indicators".to_string(),
+            description: "Show or hide tab arrow indicators (→)".to_string(),
+            action: Action::ToggleTabIndicators,
+            contexts: vec![KeyContext::Normal],
+            custom_contexts: vec![],
+            source: CommandSource::Builtin,
+        },
+        Command {
+            name: "Reset Buffer Settings".to_string(),
+            description: "Reset buffer settings (tab size, indentation) to config defaults"
+                .to_string(),
+            action: Action::ResetBufferSettings,
             contexts: vec![KeyContext::Normal],
             custom_contexts: vec![],
             source: CommandSource::Builtin,

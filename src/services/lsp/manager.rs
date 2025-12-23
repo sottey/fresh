@@ -8,7 +8,7 @@
 
 use crate::services::async_bridge::AsyncBridge;
 use crate::services::lsp::async_handler::LspHandle;
-use crate::services::lsp::client::LspServerConfig;
+use crate::types::LspServerConfig;
 use lsp_types::Uri;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -491,17 +491,30 @@ impl Drop for LspManager {
     }
 }
 
-/// Helper function to detect language from file extension using the config's languages section
+/// Helper function to detect language from file path using the config's languages section.
+///
+/// Checks in order:
+/// 1. File extension against `extensions`
+/// 2. Exact filename against `filenames`
 pub fn detect_language(
     path: &std::path::Path,
     languages: &std::collections::HashMap<String, crate::config::LanguageConfig>,
 ) -> Option<String> {
-    let extension = path.extension()?.to_str()?;
+    // Try extension first
+    if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
+        for (language_name, lang_config) in languages {
+            if lang_config.extensions.iter().any(|ext| ext == extension) {
+                return Some(language_name.clone());
+            }
+        }
+    }
 
-    // Search through configured languages for a matching extension
-    for (language_name, lang_config) in languages {
-        if lang_config.extensions.iter().any(|ext| ext == extension) {
-            return Some(language_name.clone());
+    // Try exact filename match
+    if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+        for (language_name, lang_config) in languages {
+            if lang_config.filenames.iter().any(|f| f == filename) {
+                return Some(language_name.clone());
+            }
         }
     }
 
@@ -622,33 +635,45 @@ mod tests {
             "rust".to_string(),
             crate::config::LanguageConfig {
                 extensions: vec!["rs".to_string()],
+                filenames: vec![],
                 grammar: "rust".to_string(),
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 highlighter: crate::config::HighlighterPreference::Auto,
                 textmate_grammar: None,
+                show_whitespace_tabs: false,
+                use_tabs: false,
+                tab_size: None,
             },
         );
         languages.insert(
             "javascript".to_string(),
             crate::config::LanguageConfig {
                 extensions: vec!["js".to_string(), "jsx".to_string()],
+                filenames: vec![],
                 grammar: "javascript".to_string(),
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 highlighter: crate::config::HighlighterPreference::Auto,
                 textmate_grammar: None,
+                show_whitespace_tabs: false,
+                use_tabs: false,
+                tab_size: None,
             },
         );
         languages.insert(
             "csharp".to_string(),
             crate::config::LanguageConfig {
                 extensions: vec!["cs".to_string()],
+                filenames: vec![],
                 grammar: "c_sharp".to_string(),
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 highlighter: crate::config::HighlighterPreference::Auto,
                 textmate_grammar: None,
+                show_whitespace_tabs: false,
+                use_tabs: false,
+                tab_size: None,
             },
         );
         languages

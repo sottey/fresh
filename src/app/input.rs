@@ -1,4 +1,3 @@
-use super::normalize_path;
 use super::*;
 use crate::services::plugins::hooks::HookArgs;
 impl Editor {
@@ -38,117 +37,12 @@ impl Editor {
             modifiers
         );
 
-        // Check if we're in a prompt, popup, or settings - these take priority over terminal handling
-        // so that command palette, open file dialog, settings dialog, etc. work correctly
-        let in_prompt_or_popup = self.is_prompting()
-            || self.active_state().popups.is_visible()
-            || self.menu_state.active_menu.is_some()
-            || self.settings_state.as_ref().map_or(false, |s| s.visible);
+        // Create key event for dispatch methods
+        let key_event = crossterm::event::KeyEvent::new(code, modifiers);
 
-        // Special handling for terminal mode - forward keys directly to terminal
-        // unless it's an escape sequence or UI keybinding
-        // Skip if we're in a prompt/popup (those need to handle keys normally)
-        if self.terminal_mode && !in_prompt_or_popup {
-            tracing::trace!(
-                "Terminal mode key handling: code={:?}, modifiers={:?}, keyboard_capture={}",
-                code,
-                modifiers,
-                self.keyboard_capture
-            );
-
-            // F9 always toggles keyboard capture mode (works even when capture is ON)
-            let is_toggle_capture = code == crossterm::event::KeyCode::F(9);
-            tracing::trace!("is_toggle_capture (F9)={}", is_toggle_capture);
-            if is_toggle_capture {
-                self.keyboard_capture = !self.keyboard_capture;
-                tracing::info!("Toggled keyboard_capture to {}", self.keyboard_capture);
-                if self.keyboard_capture {
-                    self.set_status_message(
-                        "Keyboard capture ON - all keys go to terminal (F9 to toggle)".to_string(),
-                    );
-                } else {
-                    self.set_status_message(
-                        "Keyboard capture OFF - UI bindings active (F9 to toggle)".to_string(),
-                    );
-                }
-                return Ok(());
-            }
-
-            // When keyboard capture is ON, forward ALL keys to terminal
-            if self.keyboard_capture {
-                tracing::trace!("Forwarding key to terminal (keyboard capture ON)");
-                self.send_terminal_key(code, modifiers);
-                return Ok(());
-            }
-
-            // When keyboard capture is OFF, check for UI keybindings first
-            let key_event = crossterm::event::KeyEvent::new(code, modifiers);
-            let ui_action = self.keybindings.resolve_terminal_ui_action(&key_event);
-
-            if !matches!(ui_action, Action::None) {
-                // Handle terminal escape specially - exits terminal mode
-                if matches!(ui_action, Action::TerminalEscape) {
-                    self.terminal_mode = false;
-                    self.key_context = crate::input::keybindings::KeyContext::Normal;
-                    // User explicitly exited - don't auto-resume when switching back
-                    self.terminal_mode_resume.remove(&self.active_buffer());
-                    self.sync_terminal_to_buffer(self.active_buffer());
-                    self.set_status_message(
-                        "Terminal mode disabled - read only (Ctrl+Space to resume)".to_string(),
-                    );
-                    return Ok(());
-                }
-
-                // For split navigation, exit terminal mode first
-                if matches!(
-                    ui_action,
-                    Action::NextSplit | Action::PrevSplit | Action::CloseSplit
-                ) {
-                    self.terminal_mode = false;
-                    self.key_context = crate::input::keybindings::KeyContext::Normal;
-                }
-
-                return self.handle_action(ui_action);
-            }
-
-            // Handle scrollback: Shift+PageUp exits terminal mode and uses file-backed buffer
-            if modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
-                && code == crossterm::event::KeyCode::PageUp
-            {
-                // Sync terminal content to buffer and exit terminal mode
-                self.terminal_mode = false;
-                self.key_context = crate::input::keybindings::KeyContext::Normal;
-                self.sync_terminal_to_buffer(self.active_buffer());
-                self.set_status_message(
-                    "Scrollback mode - use PageUp/Down to scroll (Ctrl+Space to resume)"
-                        .to_string(),
-                );
-                // Now scroll up using normal buffer scrolling
-                return self.handle_action(crate::input::keybindings::Action::MovePageUp);
-            }
-
-            // Forward all other keys to the terminal
-            self.send_terminal_key(code, modifiers);
+        // Try terminal input dispatch first (handles terminal mode and re-entry)
+        if self.dispatch_terminal_input(&key_event).is_some() {
             return Ok(());
-        }
-
-        // Toggle back into terminal mode when viewing a terminal buffer
-        // Skip if we're in a prompt/popup (those need to handle keys normally)
-        if self.is_terminal_buffer(self.active_buffer()) && !in_prompt_or_popup {
-            if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-                match code {
-                    crossterm::event::KeyCode::Char(' ')
-                    | crossterm::event::KeyCode::Char(']')
-                    | crossterm::event::KeyCode::Char('`') => {
-                        self.enter_terminal_mode();
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            } else if code == crossterm::event::KeyCode::Char('q') {
-                self.enter_terminal_mode();
-                return Ok(());
-            }
         }
 
         // Clear skip_ensure_visible flag so cursor becomes visible after key press
@@ -163,21 +57,25 @@ impl Editor {
 
         // Special case: Hover and Signature Help popups should be dismissed on any key press
         if matches!(context, crate::input::keybindings::KeyContext::Popup) {
-            // Check if the current popup is a hover or signature help popup (identified by title)
-            let is_dismissable_popup = self
+            // Check if the current popup is transient (hover, signature help)
+            let is_transient_popup = self
                 .active_state()
                 .popups
                 .top()
-                .and_then(|p| p.title.as_ref())
-                .is_some_and(|title| title == "Hover" || title == "Signature Help");
+                .is_some_and(|p| p.transient);
 
-            if is_dismissable_popup {
+            if is_transient_popup {
                 // Dismiss the popup on any key press
                 self.hide_popup();
-                tracing::debug!("Dismissed hover/signature help popup on key press");
+                tracing::debug!("Dismissed transient popup on key press");
                 // Recalculate context now that popup is gone
                 context = self.get_key_context();
             }
+        }
+
+        // Try hierarchical modal input dispatch first (Settings, Menu, Prompt, Popup)
+        if self.dispatch_modal_input(&key_event).is_some() {
+            return Ok(());
         }
 
         // Only check buffer mode keybindings if we're not in a higher-priority context
@@ -190,28 +88,12 @@ impl Editor {
 
         if should_check_mode_bindings {
             // Check buffer mode keybindings (for virtual buffers with custom modes)
-            if let Some(command_name) = self.resolve_mode_keybinding(code, modifiers) {
-                tracing::debug!("Mode keybinding resolved to command: {}", command_name);
-                // Execute the command via the command registry
-                let commands = self.command_registry.read().unwrap().get_all();
-                if let Some(cmd) = commands.iter().find(|c| c.name == command_name) {
-                    let action = cmd.action.clone();
-                    drop(commands);
-                    return self.handle_action(action);
-                } else if command_name == "close-buffer" {
-                    // Handle built-in mode commands
-                    let buffer_id = self.active_buffer();
-                    return self.close_buffer(buffer_id);
-                } else if command_name == "revert-buffer" {
-                    // Refresh the buffer (for virtual buffers, this would re-query data)
-                    self.set_status_message("Refreshing buffer...".to_string());
-                    return Ok(());
-                } else {
-                    // Try as a plugin action
-                    let action = Action::PluginAction(command_name.clone());
-                    drop(commands);
-                    return self.handle_action(action);
-                }
+            // Mode keybindings resolve to Action names (see Action::from_str)
+            if let Some(action_name) = self.resolve_mode_keybinding(code, modifiers) {
+                tracing::debug!("Mode keybinding resolved to action: {}", action_name);
+                let action = Action::from_str(&action_name, &std::collections::HashMap::new())
+                    .unwrap_or_else(|| Action::PluginAction(action_name));
+                return self.handle_action(action);
             }
         }
 
@@ -264,739 +146,10 @@ impl Editor {
             }
         }
 
-        // Handle file open dialog actions first (when active)
-        if self.handle_file_open_action(&action) {
-            return Ok(());
-        }
-
-        // Handle settings context (including search mode, help overlay, and confirmation dialog)
-        if matches!(context, crate::input::keybindings::KeyContext::Settings) {
-            // Check if help overlay is showing
-            let showing_help = self
-                .settings_state
-                .as_ref()
-                .map_or(false, |s| s.showing_help);
-
-            if showing_help {
-                // Any key closes the help overlay
-                match code {
-                    crossterm::event::KeyCode::Esc
-                    | crossterm::event::KeyCode::Char('?')
-                    | crossterm::event::KeyCode::Enter => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.hide_help();
-                        }
-                        return Ok(());
-                    }
-                    _ => return Ok(()), // Ignore other keys while help is showing
-                }
-            }
-
-            // Check if confirmation dialog is showing
-            let showing_confirm = self
-                .settings_state
-                .as_ref()
-                .map_or(false, |s| s.showing_confirm_dialog);
-
-            if showing_confirm {
-                // Handle confirmation dialog input
-                match code {
-                    crossterm::event::KeyCode::Left | crossterm::event::KeyCode::Up => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.confirm_dialog_prev();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Right | crossterm::event::KeyCode::Down => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.confirm_dialog_next();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Tab => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.confirm_dialog_next();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Enter => {
-                        // Execute the selected action
-                        let selection = self
-                            .settings_state
-                            .as_ref()
-                            .map(|s| s.confirm_dialog_selection)
-                            .unwrap_or(2);
-                        match selection {
-                            0 => {
-                                // Save and Exit
-                                self.save_settings();
-                                self.close_settings(false);
-                            }
-                            1 => {
-                                // Discard changes
-                                if let Some(ref mut state) = self.settings_state {
-                                    state.discard_changes();
-                                }
-                                self.close_settings(false);
-                            }
-                            _ => {
-                                // Cancel - just hide the dialog
-                                if let Some(ref mut state) = self.settings_state {
-                                    state.hide_confirm_dialog();
-                                }
-                            }
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Esc => {
-                        // Cancel - hide the dialog
-                        if let Some(ref mut state) = self.settings_state {
-                            state.hide_confirm_dialog();
-                        }
-                        return Ok(());
-                    }
-                    _ => return Ok(()),
-                }
-            }
-
-            // Check if text editing is active (for TextList controls)
-            let editing_text = self
-                .settings_state
-                .as_ref()
-                .map_or(false, |s| s.editing_text);
-
-            if editing_text {
-                // In text editing mode, handle input for TextList controls
-                match code {
-                    crossterm::event::KeyCode::Char(c) if modifiers.is_empty() => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.text_insert(c);
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Backspace => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.text_backspace();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Left => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.text_move_left();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Right => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.text_move_right();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Up => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.text_focus_prev();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Down => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.text_focus_next();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Enter => {
-                        if let Some(ref mut state) = self.settings_state {
-                            // Add the item and record change
-                            state.text_add_item();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Esc => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.stop_editing();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Delete => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.text_remove_focused();
-                        }
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
-
-            // Check if a dropdown is open
-            let dropdown_open = self
-                .settings_state
-                .as_ref()
-                .map_or(false, |s| s.is_dropdown_open());
-
-            if dropdown_open {
-                // Handle dropdown navigation
-                match code {
-                    crossterm::event::KeyCode::Up => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.dropdown_prev();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Down => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.dropdown_next();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Enter => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.dropdown_confirm();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Esc => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.dropdown_cancel();
-                        }
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
-
-            // Check if number editing is active
-            let number_editing = self
-                .settings_state
-                .as_ref()
-                .map_or(false, |s| s.is_number_editing());
-
-            if number_editing {
-                // Handle number input
-                match code {
-                    crossterm::event::KeyCode::Char(c) if c.is_ascii_digit() || c == '-' => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.number_insert(c);
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Backspace => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.number_backspace();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Enter => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.number_confirm();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Esc => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.number_cancel();
-                        }
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
-
-            // Check if search is active
-            let search_active = self
-                .settings_state
-                .as_ref()
-                .map_or(false, |s| s.search_active);
-
-            if search_active {
-                // In search mode, handle input specially
-                match code {
-                    crossterm::event::KeyCode::Char(c) if modifiers.is_empty() => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.search_push_char(c);
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Backspace => {
-                        if let Some(ref mut state) = self.settings_state {
-                            if state.search_query.is_empty() {
-                                state.cancel_search();
-                            } else {
-                                state.search_pop_char();
-                            }
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Esc => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.cancel_search();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Enter => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.jump_to_search_result();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Up => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.search_prev();
-                        }
-                        return Ok(());
-                    }
-                    crossterm::event::KeyCode::Down => {
-                        if let Some(ref mut state) = self.settings_state {
-                            state.search_next();
-                        }
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            } else {
-                // Not in search mode - normal settings navigation
-                match action {
-                    Action::MoveUp => {
-                        self.settings_navigate_up();
-                        return Ok(());
-                    }
-                    Action::MoveDown => {
-                        self.settings_navigate_down();
-                        return Ok(());
-                    }
-                    // Route other settings actions to handle_action
-                    Action::SettingsToggleFocus
-                    | Action::SettingsActivate
-                    | Action::SettingsSearch
-                    | Action::SettingsSave
-                    | Action::SettingsReset
-                    | Action::SettingsHelp
-                    | Action::SettingsIncrement
-                    | Action::SettingsDecrement
-                    | Action::CloseSettings => {
-                        return self.handle_action(action);
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Handle the action
-        match action {
-            // Prompt mode actions - delegate to handle_action
-            Action::PromptConfirm => {
-                return self.handle_action(action);
-            }
-            Action::PromptCancel => {
-                self.cancel_prompt();
-            }
-            Action::PromptBackspace => {
-                if let Some(prompt) = self.prompt_mut() {
-                    // If there's a selection, delete it; otherwise delete one character backward
-                    if prompt.has_selection() {
-                        prompt.delete_selection();
-                    } else if prompt.cursor_pos > 0 {
-                        let byte_pos = prompt.cursor_pos;
-                        let mut char_start = byte_pos - 1;
-                        while char_start > 0 && !prompt.input.is_char_boundary(char_start) {
-                            char_start -= 1;
-                        }
-                        prompt.input.remove(char_start);
-                        prompt.cursor_pos = char_start;
-                    }
-                }
-                self.update_prompt_suggestions();
-            }
-            Action::PromptDelete => {
-                if let Some(prompt) = self.prompt_mut() {
-                    // If there's a selection, delete it; otherwise delete one character forward
-                    if prompt.has_selection() {
-                        prompt.delete_selection();
-                    } else if prompt.cursor_pos < prompt.input.len() {
-                        let mut char_end = prompt.cursor_pos + 1;
-                        while char_end < prompt.input.len()
-                            && !prompt.input.is_char_boundary(char_end)
-                        {
-                            char_end += 1;
-                        }
-                        prompt.input.drain(prompt.cursor_pos..char_end);
-                    }
-                }
-                self.update_prompt_suggestions();
-            }
-            Action::PromptMoveLeft => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.clear_selection();
-                    if prompt.cursor_pos > 0 {
-                        let mut new_pos = prompt.cursor_pos - 1;
-                        while new_pos > 0 && !prompt.input.is_char_boundary(new_pos) {
-                            new_pos -= 1;
-                        }
-                        prompt.cursor_pos = new_pos;
-                    }
-                }
-            }
-            Action::PromptMoveRight => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.clear_selection();
-                    if prompt.cursor_pos < prompt.input.len() {
-                        let mut new_pos = prompt.cursor_pos + 1;
-                        while new_pos < prompt.input.len()
-                            && !prompt.input.is_char_boundary(new_pos)
-                        {
-                            new_pos += 1;
-                        }
-                        prompt.cursor_pos = new_pos;
-                    }
-                }
-            }
-            Action::PromptMoveStart => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.clear_selection();
-                    prompt.cursor_pos = 0;
-                }
-            }
-            Action::PromptMoveEnd => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.clear_selection();
-                    prompt.cursor_pos = prompt.input.len();
-                }
-            }
-            Action::PromptSelectPrev => {
-                // Extract hook data before borrowing prompt mutably
-                let hook_data = if let Some(prompt) = self.prompt_mut() {
-                    if !prompt.suggestions.is_empty() {
-                        // Suggestions exist: navigate suggestions
-                        if let Some(selected) = prompt.selected_suggestion {
-                            // Don't wrap around - stay at 0 if already at the beginning
-                            let new_selected = if selected == 0 { 0 } else { selected - 1 };
-                            prompt.selected_suggestion = Some(new_selected);
-                            // Update input to match selected suggestion (but not for plugin prompts)
-                            if !matches!(prompt.prompt_type, PromptType::Plugin { .. }) {
-                                if let Some(suggestion) = prompt.suggestions.get(new_selected) {
-                                    prompt.input = suggestion.get_value().to_string();
-                                    prompt.cursor_pos = prompt.input.len();
-                                }
-                            }
-                            // Extract data for plugin hook
-                            if let PromptType::Plugin { ref custom_type } = prompt.prompt_type {
-                                Some((custom_type.clone(), new_selected))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                // Fire selection changed hook for plugin prompts (outside the borrow)
-                if let Some((custom_type, new_selected)) = hook_data {
-                    self.plugin_manager.run_hook(
-                        "prompt_selection_changed",
-                        HookArgs::PromptSelectionChanged {
-                            prompt_type: custom_type,
-                            selected_index: new_selected,
-                        },
-                    );
-                }
-
-                // Handle history navigation for prompts without suggestions
-                if let Some(prompt) = self.prompt_mut() {
-                    if prompt.suggestions.is_empty() {
-                        // No suggestions: navigate history (Up arrow)
-                        let prompt_type = prompt.prompt_type.clone();
-                        let current_input = prompt.input.clone();
-
-                        // Get the appropriate history based on prompt type
-                        let history_item = match prompt_type {
-                            PromptType::Search
-                            | PromptType::ReplaceSearch
-                            | PromptType::QueryReplaceSearch => {
-                                self.search_history.navigate_prev(&current_input)
-                            }
-                            PromptType::Replace { .. } | PromptType::QueryReplace { .. } => {
-                                self.replace_history.navigate_prev(&current_input)
-                            }
-                            _ => None,
-                        };
-
-                        // Update prompt input if history item exists
-                        if let Some(history_text) = history_item {
-                            if let Some(prompt) = self.prompt_mut() {
-                                prompt.set_input(history_text.clone());
-
-                                // For search prompts, update highlights incrementally
-                                if matches!(
-                                    prompt_type,
-                                    PromptType::Search
-                                        | PromptType::ReplaceSearch
-                                        | PromptType::QueryReplaceSearch
-                                ) {
-                                    self.update_search_highlights(&history_text);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Action::PromptSelectNext => {
-                // Extract hook data before borrowing prompt mutably
-                let hook_data = if let Some(prompt) = self.prompt_mut() {
-                    if !prompt.suggestions.is_empty() {
-                        // Suggestions exist: navigate suggestions
-                        if let Some(selected) = prompt.selected_suggestion {
-                            // Don't wrap around - stay at the end if already at the last item
-                            let new_selected = (selected + 1).min(prompt.suggestions.len() - 1);
-                            prompt.selected_suggestion = Some(new_selected);
-                            // Update input to match selected suggestion (but not for plugin prompts)
-                            if !matches!(prompt.prompt_type, PromptType::Plugin { .. }) {
-                                if let Some(suggestion) = prompt.suggestions.get(new_selected) {
-                                    prompt.input = suggestion.get_value().to_string();
-                                    prompt.cursor_pos = prompt.input.len();
-                                }
-                            }
-                            // Extract data for plugin hook
-                            if let PromptType::Plugin { ref custom_type } = prompt.prompt_type {
-                                Some((custom_type.clone(), new_selected))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                // Fire selection changed hook for plugin prompts (outside the borrow)
-                if let Some((custom_type, new_selected)) = hook_data {
-                    self.plugin_manager.run_hook(
-                        "prompt_selection_changed",
-                        HookArgs::PromptSelectionChanged {
-                            prompt_type: custom_type,
-                            selected_index: new_selected,
-                        },
-                    );
-                }
-
-                // Handle history navigation for prompts without suggestions
-                if let Some(prompt) = self.prompt_mut() {
-                    if prompt.suggestions.is_empty() {
-                        // No suggestions: navigate history (Down arrow)
-                        let prompt_type = prompt.prompt_type.clone();
-
-                        // Get the appropriate history based on prompt type
-                        let history_item = match prompt_type {
-                            PromptType::Search
-                            | PromptType::ReplaceSearch
-                            | PromptType::QueryReplaceSearch => self.search_history.navigate_next(),
-                            PromptType::Replace { .. } | PromptType::QueryReplace { .. } => {
-                                self.replace_history.navigate_next()
-                            }
-                            _ => None,
-                        };
-
-                        // Update prompt input if history item exists
-                        if let Some(history_text) = history_item {
-                            if let Some(prompt) = self.prompt_mut() {
-                                prompt.set_input(history_text.clone());
-
-                                // For search prompts, update highlights incrementally
-                                if matches!(
-                                    prompt_type,
-                                    PromptType::Search
-                                        | PromptType::ReplaceSearch
-                                        | PromptType::QueryReplaceSearch
-                                ) {
-                                    self.update_search_highlights(&history_text);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Action::PromptPageUp => {
-                if let Some(prompt) = self.prompt_mut() {
-                    if !prompt.suggestions.is_empty() {
-                        if let Some(selected) = prompt.selected_suggestion {
-                            // Move up by 10, but stop at 0 instead of wrapping
-                            prompt.selected_suggestion = Some(selected.saturating_sub(10));
-                        }
-                    }
-                }
-            }
-            Action::PromptPageDown => {
-                if let Some(prompt) = self.prompt_mut() {
-                    if !prompt.suggestions.is_empty() {
-                        if let Some(selected) = prompt.selected_suggestion {
-                            // Move down by 10, but stop at the end instead of wrapping
-                            let len = prompt.suggestions.len();
-                            let new_pos = selected + 10;
-                            prompt.selected_suggestion = Some(new_pos.min(len - 1));
-                        }
-                    }
-                }
-            }
-            Action::PromptAcceptSuggestion => {
-                if let Some(prompt) = self.prompt_mut() {
-                    if let Some(selected) = prompt.selected_suggestion {
-                        if let Some(suggestion) = prompt.suggestions.get(selected) {
-                            // Don't accept disabled suggestions (greyed out commands)
-                            if !suggestion.disabled {
-                                prompt.input = suggestion.get_value().to_string();
-                                prompt.cursor_pos = prompt.input.len();
-                                prompt.clear_selection();
-                            }
-                        }
-                    }
-                }
-                // Refresh suggestions after accepting (important for path completion)
-                self.update_prompt_suggestions();
-            }
-            Action::PromptMoveWordLeft => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.move_word_left();
-                }
-            }
-            Action::PromptMoveWordRight => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.move_word_right();
-                }
-            }
-            // Advanced prompt editing actions
-            Action::PromptDeleteWordForward => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.delete_word_forward();
-                }
-                self.update_prompt_suggestions();
-            }
-            Action::PromptDeleteWordBackward => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.delete_word_backward();
-                }
-                self.update_prompt_suggestions();
-            }
-            Action::PromptDeleteToLineEnd => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.delete_to_end();
-                }
-                self.update_prompt_suggestions();
-            }
-            Action::PromptCopy => {
-                if let Some(prompt) = &self.prompt {
-                    // If there's a selection, copy selected text; otherwise copy entire input
-                    let text = if let Some(selected) = prompt.selected_text() {
-                        selected
-                    } else {
-                        prompt.get_text()
-                    };
-                    self.clipboard.copy(text);
-                    self.set_status_message("Copied".to_string());
-                }
-            }
-            Action::PromptCut => {
-                // Get text first (selected or entire input)
-                let text = if let Some(prompt) = &self.prompt {
-                    if let Some(selected) = prompt.selected_text() {
-                        selected
-                    } else {
-                        prompt.get_text()
-                    }
-                } else {
-                    String::new()
-                };
-                // Update clipboard before taking mutable borrow
-                self.clipboard.copy(text);
-                // Now cut the text (delete selection or clear entire input)
-                if let Some(prompt) = self.prompt_mut() {
-                    if prompt.has_selection() {
-                        prompt.delete_selection();
-                    } else {
-                        prompt.clear();
-                    }
-                }
-                self.set_status_message("Cut".to_string());
-                self.update_prompt_suggestions();
-            }
-            Action::PromptPaste => {
-                let text = self.clipboard.paste().unwrap_or_default();
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.insert_str(&text);
-                }
-                self.update_prompt_suggestions();
-            }
-            // Prompt selection actions
-            Action::PromptMoveLeftSelecting => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.move_left_selecting();
-                }
-            }
-            Action::PromptMoveRightSelecting => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.move_right_selecting();
-                }
-            }
-            Action::PromptMoveHomeSelecting => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.move_home_selecting();
-                }
-            }
-            Action::PromptMoveEndSelecting => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.move_end_selecting();
-                }
-            }
-            Action::PromptSelectWordLeft => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.move_word_left_selecting();
-                }
-            }
-            Action::PromptSelectWordRight => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.move_word_right_selecting();
-                }
-            }
-            Action::PromptSelectAll => {
-                if let Some(prompt) = self.prompt_mut() {
-                    prompt.selection_anchor = Some(0);
-                    prompt.cursor_pos = prompt.input.len();
-                }
-            }
-
-            // Popup mode actions
-            Action::PopupSelectNext => {
-                self.popup_select_next();
-            }
-            Action::PopupSelectPrev => {
-                self.popup_select_prev();
-            }
-            Action::PopupPageUp => {
-                self.popup_page_up();
-            }
-            Action::PopupPageDown => {
-                self.popup_page_down();
-            }
-            Action::PopupConfirm => {
-                return self.handle_action(action);
-            }
-            Action::PopupCancel => {
-                return self.handle_action(action);
-            }
-
-            // Normal mode actions - delegate to handle_action
-            _ => {
-                return self.handle_action(action);
-            }
-        }
-
-        Ok(())
+        // Note: Modal components (Settings, Menu, Prompt, Popup, File Browser) are now
+        // handled by dispatch_modal_input using the InputHandler system.
+        // All remaining actions delegate to handle_action.
+        self.handle_action(action)
     }
 
     /// Handle an action (for normal mode and command execution)
@@ -1095,6 +248,7 @@ impl Editor {
                 self.toggle_auto_revert();
             }
             Action::Copy => self.copy_selection(),
+            Action::CopyWithTheme(theme) => self.copy_selection_with_theme(&theme),
             Action::Cut => {
                 if self.is_editing_disabled() {
                     self.set_status_message("Editing disabled in this buffer".to_string());
@@ -1110,42 +264,10 @@ impl Editor {
                 self.paste()
             }
             Action::Undo => {
-                if self.is_editing_disabled() {
-                    self.set_status_message("Editing disabled in this buffer".to_string());
-                    return Ok(());
-                }
-                let event_log = self.active_event_log_mut();
-                let before_idx = event_log.current_index();
-                let can_undo = event_log.can_undo();
-                let events = event_log.undo();
-                let after_idx = self.active_event_log().current_index();
-                tracing::debug!(
-                    "Undo: before_idx={}, after_idx={}, can_undo={}, events_count={}",
-                    before_idx,
-                    after_idx,
-                    can_undo,
-                    events.len()
-                );
-                // Apply all inverse events collected during undo
-                for event in &events {
-                    tracing::debug!("Undo applying event: {:?}", event);
-                    self.apply_event_to_active_buffer(event);
-                }
-                // Update modified status based on event log position
-                self.update_modified_from_event_log();
+                self.handle_undo();
             }
             Action::Redo => {
-                if self.is_editing_disabled() {
-                    self.set_status_message("Editing disabled in this buffer".to_string());
-                    return Ok(());
-                }
-                let events = self.active_event_log_mut().redo();
-                // Apply all events collected during redo
-                for event in events {
-                    self.apply_event_to_active_buffer(&event);
-                }
-                // Update modified status based on event log position
-                self.update_modified_from_event_log();
+                self.handle_redo();
             }
             Action::ShowHelp => {
                 self.open_help_manual();
@@ -1192,68 +314,7 @@ impl Editor {
                 self.set_status_message(format!("Line wrap {}", state));
             }
             Action::ToggleComposeMode => {
-                let default_wrap = self.config.editor.line_wrap;
-                let default_line_numbers = self.config.editor.line_numbers;
-                let active_split = self.split_manager.active_split();
-                let mut view_mode = {
-                    if let Some(vs) = self.split_view_states.get(&active_split) {
-                        vs.view_mode.clone()
-                    } else {
-                        self.active_state().view_mode.clone()
-                    }
-                };
-
-                view_mode = match view_mode {
-                    crate::state::ViewMode::Compose => crate::state::ViewMode::Source,
-                    _ => crate::state::ViewMode::Compose,
-                };
-
-                // Update split view state
-                let current_line_numbers = self.active_state().margins.show_line_numbers;
-                if let Some(vs) = self.split_view_states.get_mut(&active_split) {
-                    vs.view_mode = view_mode.clone();
-                    // In Compose mode, disable builtin line wrap - the plugin handles
-                    // wrapping by inserting Break tokens in the view transform pipeline.
-                    // In Source mode, respect the user's default_wrap preference.
-                    vs.viewport.line_wrap_enabled = match view_mode {
-                        crate::state::ViewMode::Compose => false,
-                        crate::state::ViewMode::Source => default_wrap,
-                    };
-                    match view_mode {
-                        crate::state::ViewMode::Compose => {
-                            vs.compose_prev_line_numbers = Some(current_line_numbers);
-                            self.active_state_mut().margins.set_line_numbers(false);
-                        }
-                        crate::state::ViewMode::Source => {
-                            // Clear compose width to remove margins
-                            vs.compose_width = None;
-                            vs.view_transform = None;
-                            let restore = vs
-                                .compose_prev_line_numbers
-                                .take()
-                                .unwrap_or(default_line_numbers);
-                            self.active_state_mut().margins.set_line_numbers(restore);
-                        }
-                    }
-                }
-
-                // Keep buffer-level view mode for status/use
-                {
-                    let state = self.active_state_mut();
-                    state.view_mode = view_mode.clone();
-                    // Note: viewport.line_wrap_enabled is now handled in SplitViewState above
-                    // Clear compose state when switching to Source mode
-                    if matches!(view_mode, crate::state::ViewMode::Source) {
-                        state.compose_width = None;
-                        state.view_transform = None;
-                    }
-                }
-
-                let mode_label = match view_mode {
-                    crate::state::ViewMode::Compose => "Compose",
-                    crate::state::ViewMode::Source => "Source",
-                };
-                self.set_status_message(format!("Mode: {}", mode_label));
+                self.handle_toggle_compose_mode();
             }
             Action::SetComposeWidth => {
                 let active_split = self.split_manager.active_split();
@@ -1315,141 +376,10 @@ impl Editor {
                 self.request_code_actions()?;
             }
             Action::LspRestart => {
-                // Get the language for the current buffer
-                if let Some(metadata) = self.buffer_metadata.get(&self.active_buffer()) {
-                    if let Some(path) = metadata.file_path() {
-                        if let Some(language) = crate::services::lsp::manager::detect_language(
-                            path,
-                            &self.config.languages,
-                        ) {
-                            let restart_result = if let Some(lsp) = self.lsp.as_mut() {
-                                Some(lsp.manual_restart(&language))
-                            } else {
-                                None
-                            };
-
-                            if let Some((success, message)) = restart_result {
-                                self.status_message = Some(message);
-                                if success {
-                                    // Re-send didOpen for all buffers of this language
-                                    let buffers_for_language: Vec<_> = self
-                                        .buffer_metadata
-                                        .iter()
-                                        .filter_map(|(buf_id, meta)| {
-                                            if let Some(p) = meta.file_path() {
-                                                if crate::services::lsp::manager::detect_language(
-                                                    p,
-                                                    &self.config.languages,
-                                                ) == Some(language.clone())
-                                                {
-                                                    Some((*buf_id, p.clone()))
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect();
-
-                                    for (buffer_id, buf_path) in buffers_for_language {
-                                        if let Some(state) = self.buffers.get(&buffer_id) {
-                                            let content = match state.buffer.to_string() {
-                                                Some(c) => c,
-                                                None => continue, // Skip buffers that aren't fully loaded
-                                            };
-                                            let uri: Option<lsp_types::Uri> =
-                                                url::Url::from_file_path(&buf_path).ok().and_then(
-                                                    |u| u.as_str().parse::<lsp_types::Uri>().ok(),
-                                                );
-                                            if let Some(uri) = uri {
-                                                if let Some(lang_id) =
-                                                    crate::services::lsp::manager::detect_language(
-                                                        &buf_path,
-                                                        &self.config.languages,
-                                                    )
-                                                {
-                                                    if let Some(lsp) = self.lsp.as_mut() {
-                                                        if let Some(handle) =
-                                                            lsp.get_or_spawn(&lang_id)
-                                                        {
-                                                            let _ = handle
-                                                                .did_open(uri, content, lang_id);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                self.status_message = Some("No LSP manager available".to_string());
-                            }
-                        } else {
-                            self.status_message =
-                                Some("No LSP server configured for this file type".to_string());
-                        }
-                    } else {
-                        self.status_message =
-                            Some("Current buffer has no associated file".to_string());
-                    }
-                }
+                self.handle_lsp_restart();
             }
             Action::LspStop => {
-                // Get list of running LSP servers
-                let running_servers: Vec<String> = if let Some(lsp) = &self.lsp {
-                    lsp.running_servers()
-                } else {
-                    Vec::new()
-                };
-
-                if running_servers.is_empty() {
-                    self.set_status_message("No LSP servers are currently running".to_string());
-                } else {
-                    // Create suggestions from running servers
-                    let suggestions: Vec<crate::input::commands::Suggestion> = running_servers
-                        .iter()
-                        .map(|lang| {
-                            let description = if let Some(lsp) = &self.lsp {
-                                lsp.get_config(lang)
-                                    .map(|c| format!("Command: {}", c.command))
-                            } else {
-                                None
-                            };
-                            crate::input::commands::Suggestion {
-                                text: lang.clone(),
-                                description,
-                                value: Some(lang.clone()),
-                                disabled: false,
-                                keybinding: None,
-                                source: None,
-                            }
-                        })
-                        .collect();
-
-                    // Start prompt with suggestions
-                    self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
-                        "Stop LSP server: ".to_string(),
-                        PromptType::StopLspServer,
-                        suggestions,
-                    ));
-
-                    // If only one server, pre-fill the input with it
-                    if running_servers.len() == 1 {
-                        if let Some(prompt) = self.prompt.as_mut() {
-                            prompt.input = running_servers[0].clone();
-                            prompt.cursor_pos = prompt.input.len();
-                            prompt.selected_suggestion = Some(0);
-                        }
-                    } else {
-                        // Auto-select first suggestion
-                        if let Some(prompt) = self.prompt.as_mut() {
-                            if !prompt.suggestions.is_empty() {
-                                prompt.selected_suggestion = Some(0);
-                            }
-                        }
-                    }
-                }
+                self.handle_lsp_stop();
             }
             Action::ToggleInlayHints => {
                 self.toggle_inlay_hints();
@@ -1551,6 +481,46 @@ impl Editor {
             Action::ToggleLineNumbers => self.toggle_line_numbers(),
             Action::ToggleMouseCapture => self.toggle_mouse_capture(),
             Action::ToggleMouseHover => self.toggle_mouse_hover(),
+            Action::ToggleDebugHighlights => self.toggle_debug_highlights(),
+            // Buffer settings
+            Action::SetTabSize => {
+                let current = self
+                    .buffers
+                    .get(&self.active_buffer())
+                    .map(|s| s.tab_size.to_string())
+                    .unwrap_or_else(|| "4".to_string());
+                self.start_prompt_with_initial_text(
+                    "Tab size: ".to_string(),
+                    PromptType::SetTabSize,
+                    current,
+                );
+            }
+            Action::SetLineEnding => {
+                self.start_set_line_ending_prompt();
+            }
+            Action::ToggleIndentationStyle => {
+                if let Some(state) = self.buffers.get_mut(&self.active_buffer()) {
+                    state.use_tabs = !state.use_tabs;
+                    let status = if state.use_tabs {
+                        "Indentation: Tabs"
+                    } else {
+                        "Indentation: Spaces"
+                    };
+                    self.set_status_message(status.to_string());
+                }
+            }
+            Action::ToggleTabIndicators => {
+                if let Some(state) = self.buffers.get_mut(&self.active_buffer()) {
+                    state.show_whitespace_tabs = !state.show_whitespace_tabs;
+                    let status = if state.show_whitespace_tabs {
+                        "Tab indicators: Visible"
+                    } else {
+                        "Tab indicators: Hidden"
+                    };
+                    self.set_status_message(status.to_string());
+                }
+            }
+            Action::ResetBufferSettings => self.reset_buffer_settings(),
             Action::FocusFileExplorer => self.focus_file_explorer(),
             Action::FocusEditor => self.focus_editor(),
             Action::FileExplorerUp => self.file_explorer_navigate_up(),
@@ -1593,129 +563,30 @@ impl Editor {
 
             // Menu navigation actions
             Action::MenuActivate => {
-                // Open the first menu
-                self.menu_state.open_menu(0);
+                self.handle_menu_activate();
             }
             Action::MenuClose => {
-                self.menu_state.close_menu();
+                self.handle_menu_close();
             }
             Action::MenuLeft => {
-                // If in a submenu, close it and go back to parent
-                // Otherwise, go to the previous menu
-                if !self.menu_state.close_submenu() {
-                    let total_menus =
-                        self.config.menu.menus.len() + self.menu_state.plugin_menus.len();
-                    self.menu_state.prev_menu(total_menus);
-                }
+                self.handle_menu_left();
             }
             Action::MenuRight => {
-                // If on a submenu item, open it
-                // Otherwise, go to the next menu
-                let all_menus: Vec<crate::config::Menu> = self
-                    .config
-                    .menu
-                    .menus
-                    .iter()
-                    .chain(self.menu_state.plugin_menus.iter())
-                    .cloned()
-                    .collect();
-
-                if !self.menu_state.open_submenu(&all_menus) {
-                    let total_menus =
-                        self.config.menu.menus.len() + self.menu_state.plugin_menus.len();
-                    self.menu_state.next_menu(total_menus);
-                }
+                self.handle_menu_right();
             }
             Action::MenuUp => {
-                if let Some(active_idx) = self.menu_state.active_menu {
-                    let all_menus: Vec<crate::config::Menu> = self
-                        .config
-                        .menu
-                        .menus
-                        .iter()
-                        .chain(self.menu_state.plugin_menus.iter())
-                        .cloned()
-                        .collect();
-                    if let Some(menu) = all_menus.get(active_idx) {
-                        self.menu_state.prev_item(menu);
-                    }
-                }
+                self.handle_menu_up();
             }
             Action::MenuDown => {
-                if let Some(active_idx) = self.menu_state.active_menu {
-                    let all_menus: Vec<crate::config::Menu> = self
-                        .config
-                        .menu
-                        .menus
-                        .iter()
-                        .chain(self.menu_state.plugin_menus.iter())
-                        .cloned()
-                        .collect();
-                    if let Some(menu) = all_menus.get(active_idx) {
-                        self.menu_state.next_item(menu);
-                    }
-                }
+                self.handle_menu_down();
             }
             Action::MenuExecute => {
-                // Execute the highlighted menu item's action, or open submenu if it's a submenu
-                let all_menus: Vec<crate::config::Menu> = self
-                    .config
-                    .menu
-                    .menus
-                    .iter()
-                    .chain(self.menu_state.plugin_menus.iter())
-                    .cloned()
-                    .collect();
-
-                // Check if highlighted item is a submenu - if so, open it
-                if self.menu_state.is_highlighted_submenu(&all_menus) {
-                    self.menu_state.open_submenu(&all_menus);
-                    return Ok(());
-                }
-
-                // Update context before checking if action is enabled
-                use crate::view::ui::context_keys;
-                self.menu_state
-                    .context
-                    .set(context_keys::HAS_SELECTION, self.has_active_selection())
-                    .set(
-                        context_keys::FILE_EXPLORER_FOCUSED,
-                        self.key_context == crate::input::keybindings::KeyContext::FileExplorer,
-                    );
-
-                if let Some((action_name, args)) =
-                    self.menu_state.get_highlighted_action(&all_menus)
-                {
-                    // Close the menu
-                    self.menu_state.close_menu();
-
-                    // Parse and execute the action
-                    // First try built-in actions, then fall back to plugin actions
-                    if let Some(action) = Action::from_str(&action_name, &args) {
-                        return self.handle_action(action);
-                    } else {
-                        // Treat as a plugin action (global Lua function)
-                        return self.handle_action(Action::PluginAction(action_name));
-                    }
+                if let Some(action) = self.handle_menu_execute() {
+                    return self.handle_action(action);
                 }
             }
             Action::MenuOpen(menu_name) => {
-                // Find the menu by name and open it
-                let all_menus: Vec<crate::config::Menu> = self
-                    .config
-                    .menu
-                    .menus
-                    .iter()
-                    .chain(self.menu_state.plugin_menus.iter())
-                    .cloned()
-                    .collect();
-
-                for (idx, menu) in all_menus.iter().enumerate() {
-                    if menu.label.eq_ignore_ascii_case(&menu_name) {
-                        self.menu_state.open_menu(idx);
-                        break;
-                    }
-                }
+                self.handle_menu_open(&menu_name);
             }
 
             Action::SwitchKeybindingMap(map_name) => {
@@ -2046,2137 +917,81 @@ impl Editor {
                 self.settings_decrement_current();
             }
             Action::PromptConfirm => {
-                // Handle prompt confirmation (same logic as in handle_key)
                 if let Some((input, prompt_type, selected_index)) = self.confirm_prompt() {
-                    use std::path::Path;
-                    match prompt_type {
-                        PromptType::OpenFile => {
-                            let input_path = Path::new(&input);
-                            let resolved_path = if input_path.is_absolute() {
-                                normalize_path(input_path)
-                            } else {
-                                normalize_path(&self.working_dir.join(input_path))
-                            };
-
-                            if let Err(e) = self.open_file(&resolved_path) {
-                                self.set_status_message(format!("Error opening file: {e}"));
-                            } else {
-                                self.set_status_message(format!(
-                                    "Opened {}",
-                                    resolved_path.display()
-                                ));
-                            }
+                    use super::prompt_actions::PromptResult;
+                    match self.handle_prompt_confirm_input(input, prompt_type, selected_index) {
+                        PromptResult::ExecuteAction(action) => {
+                            return self.handle_action(action);
                         }
-                        PromptType::SwitchProject => {
-                            let input_path = Path::new(&input);
-                            let resolved_path = if input_path.is_absolute() {
-                                normalize_path(input_path)
-                            } else {
-                                normalize_path(&self.working_dir.join(input_path))
-                            };
-
-                            if resolved_path.is_dir() {
-                                self.change_working_dir(resolved_path);
-                            } else {
-                                self.set_status_message(format!(
-                                    "Not a directory: {}",
-                                    resolved_path.display()
-                                ));
-                            }
+                        PromptResult::EarlyReturn => {
+                            return Ok(());
                         }
-                        PromptType::SaveFileAs => {
-                            // Resolve path: if relative, make it relative to working_dir
-                            let input_path = Path::new(&input);
-                            let full_path = if input_path.is_absolute() {
-                                normalize_path(input_path)
-                            } else {
-                                normalize_path(&self.working_dir.join(input_path))
-                            };
-
-                            // Debug: log event log state before save
-                            let before_idx = self.active_event_log().current_index();
-                            let before_len = self.active_event_log().len();
-                            tracing::debug!(
-                                "SaveFileAs BEFORE: event_log index={}, len={}",
-                                before_idx,
-                                before_len
-                            );
-
-                            // Save the buffer to the new file
-                            match self.active_state_mut().buffer.save_to_file(&full_path) {
-                                Ok(()) => {
-                                    // Debug: log event log state after buffer save
-                                    let after_save_idx = self.active_event_log().current_index();
-                                    let after_save_len = self.active_event_log().len();
-                                    tracing::debug!(
-                                        "SaveFileAs AFTER buffer.save_to_file: event_log index={}, len={}",
-                                        after_save_idx, after_save_len
-                                    );
-
-                                    // Update metadata with the new path
-                                    let metadata = BufferMetadata::with_file(
-                                        full_path.clone(),
-                                        &self.working_dir,
-                                    );
-                                    self.buffer_metadata.insert(self.active_buffer(), metadata);
-
-                                    // Mark the event log position as saved (for undo modified tracking)
-                                    self.active_event_log_mut().mark_saved();
-                                    tracing::debug!(
-                                        "SaveFileAs AFTER mark_saved: event_log index={}, len={}",
-                                        self.active_event_log().current_index(),
-                                        self.active_event_log().len()
-                                    );
-
-                                    // Record the file modification time so auto-revert won't trigger
-                                    // for our own save. This is critical for preserving undo history.
-                                    if let Ok(metadata) = std::fs::metadata(&full_path) {
-                                        if let Ok(mtime) = metadata.modified() {
-                                            self.file_mod_times.insert(full_path.clone(), mtime);
-                                        }
-                                    }
-
-                                    // Notify LSP of the new file if applicable
-                                    self.notify_lsp_save();
-
-                                    // Emit file saved event
-                                    self.emit_event(
-                                        crate::model::control_event::events::FILE_SAVED.name,
-                                        serde_json::json!({"path": full_path.display().to_string()}),
-                                    );
-
-                                    // Fire AfterFileSave hook for plugins
-                                    self.plugin_manager.run_hook(
-                                        "after_file_save",
-                                        crate::services::plugins::hooks::HookArgs::AfterFileSave {
-                                            buffer_id: self.active_buffer(),
-                                            path: full_path.clone(),
-                                        },
-                                    );
-
-                                    // Check if we should close the buffer after saving
-                                    if let Some(buffer_to_close) = self.pending_close_buffer.take()
-                                    {
-                                        if let Err(e) = self.force_close_buffer(buffer_to_close) {
-                                            self.set_status_message(format!(
-                                                "Saved, but cannot close buffer: {}",
-                                                e
-                                            ));
-                                        } else {
-                                            self.set_status_message("Saved and closed".to_string());
-                                        }
-                                    } else {
-                                        self.set_status_message(format!(
-                                            "Saved as: {}",
-                                            full_path.display()
-                                        ));
-                                    }
-                                }
-                                Err(e) => {
-                                    // Clear pending close on error
-                                    self.pending_close_buffer = None;
-                                    self.set_status_message(format!("Error saving file: {}", e));
-                                }
-                            }
-                        }
-                        PromptType::Search => {
-                            self.perform_search(&input);
-                        }
-                        PromptType::ReplaceSearch => {
-                            self.perform_search(&input);
-                            self.start_prompt(
-                                format!("Replace '{}' with: ", input),
-                                PromptType::Replace {
-                                    search: input.clone(),
-                                },
-                            );
-                        }
-                        PromptType::Replace { search } => {
-                            // Use interactive or batch replace based on confirm_each flag
-                            if self.search_confirm_each {
-                                self.start_interactive_replace(&search, &input);
-                            } else {
-                                self.perform_replace(&search, &input);
-                            }
-                        }
-                        PromptType::QueryReplaceSearch => {
-                            self.perform_search(&input);
-                            self.start_prompt(
-                                format!("Query replace '{}' with: ", input),
-                                PromptType::QueryReplace {
-                                    search: input.clone(),
-                                },
-                            );
-                        }
-                        PromptType::QueryReplace { search } => {
-                            // Use interactive or batch replace based on confirm_each flag
-                            if self.search_confirm_each {
-                                self.start_interactive_replace(&search, &input);
-                            } else {
-                                self.perform_replace(&search, &input);
-                            }
-                        }
-                        PromptType::Command => {
-                            let commands = self.command_registry.read().unwrap().get_all();
-                            if let Some(cmd) = commands.iter().find(|c| c.name == input) {
-                                let action = cmd.action.clone();
-                                let cmd_name = cmd.name.clone();
-                                self.set_status_message(format!("Executing: {}", cmd_name));
-                                // Record command usage for history
-                                self.command_registry
-                                    .write()
-                                    .unwrap()
-                                    .record_usage(&cmd_name);
-                                return self.handle_action(action);
-                            } else {
-                                self.set_status_message(format!("Unknown command: {input}"));
-                            }
-                        }
-                        PromptType::GotoLine => match input.trim().parse::<usize>() {
-                            Ok(line_num) if line_num > 0 => {
-                                self.goto_line_col(line_num, None);
-                                self.set_status_message(format!("Jumped to line {}", line_num));
-                            }
-                            Ok(_) => {
-                                self.set_status_message("Line number must be positive".to_string());
-                            }
-                            Err(_) => {
-                                self.set_status_message(format!("Invalid line number: {}", input));
-                            }
-                        },
-                        PromptType::SetBackgroundFile => {
-                            if let Err(e) = self.load_ansi_background(&input) {
-                                self.set_status_message(format!(
-                                    "Failed to load background: {}",
-                                    e
-                                ));
-                            }
-                        }
-                        PromptType::SetBackgroundBlend => {
-                            let parsed = input.trim().parse::<f32>();
-                            match parsed {
-                                Ok(val) => {
-                                    let clamped = val.clamp(0.0, 1.0);
-                                    self.background_fade = clamped;
-                                    self.set_status_message(format!(
-                                        "Background blend set to {:.2}",
-                                        clamped
-                                    ));
-                                }
-                                Err(_) => {
-                                    self.set_status_message(format!(
-                                        "Invalid blend value: {}",
-                                        input
-                                    ));
-                                }
-                            }
-                        }
-                        PromptType::SetComposeWidth => {
-                            let buffer_id = self.active_buffer();
-                            let active_split = self.split_manager.active_split();
-                            let trimmed = input.trim();
-                            if trimmed.is_empty() {
-                                if let Some(state) = self.buffers.get_mut(&buffer_id) {
-                                    state.compose_width = None;
-                                }
-                                if let Some(vs) = self.split_view_states.get_mut(&active_split) {
-                                    vs.compose_width = None;
-                                }
-                                self.set_status_message(
-                                    "Compose width cleared (viewport)".to_string(),
-                                );
-                            } else {
-                                match trimmed.parse::<u16>() {
-                                    Ok(val) if val > 0 => {
-                                        if let Some(state) = self.buffers.get_mut(&buffer_id) {
-                                            state.compose_width = Some(val);
-                                        }
-                                        if let Some(vs) =
-                                            self.split_view_states.get_mut(&active_split)
-                                        {
-                                            vs.compose_width = Some(val);
-                                        }
-                                        self.set_status_message(format!(
-                                            "Compose width set to {}",
-                                            val
-                                        ));
-                                    }
-                                    _ => {
-                                        self.set_status_message(format!(
-                                            "Invalid compose width: {}",
-                                            input
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        PromptType::RecordMacro => {
-                            if let Some(c) = input.trim().chars().next() {
-                                if c.is_ascii_digit() {
-                                    self.toggle_macro_recording(c);
-                                } else {
-                                    self.set_status_message(
-                                        "Macro register must be 0-9".to_string(),
-                                    );
-                                }
-                            } else {
-                                self.set_status_message("No register specified".to_string());
-                            }
-                        }
-                        PromptType::PlayMacro => {
-                            if let Some(c) = input.trim().chars().next() {
-                                if c.is_ascii_digit() {
-                                    self.play_macro(c);
-                                } else {
-                                    self.set_status_message(
-                                        "Macro register must be 0-9".to_string(),
-                                    );
-                                }
-                            } else {
-                                self.set_status_message("No register specified".to_string());
-                            }
-                        }
-                        PromptType::SetBookmark => {
-                            if let Some(c) = input.trim().chars().next() {
-                                if c.is_ascii_digit() {
-                                    self.set_bookmark(c);
-                                } else {
-                                    self.set_status_message(
-                                        "Bookmark register must be 0-9".to_string(),
-                                    );
-                                }
-                            } else {
-                                self.set_status_message("No register specified".to_string());
-                            }
-                        }
-                        PromptType::JumpToBookmark => {
-                            if let Some(c) = input.trim().chars().next() {
-                                if c.is_ascii_digit() {
-                                    self.jump_to_bookmark(c);
-                                } else {
-                                    self.set_status_message(
-                                        "Bookmark register must be 0-9".to_string(),
-                                    );
-                                }
-                            } else {
-                                self.set_status_message("No register specified".to_string());
-                            }
-                        }
-                        PromptType::Plugin { custom_type } => {
-                            self.plugin_manager.run_hook(
-                                "prompt_confirmed",
-                                HookArgs::PromptConfirmed {
-                                    prompt_type: custom_type,
-                                    input,
-                                    selected_index,
-                                },
-                            );
-                        }
-                        PromptType::ConfirmRevert => {
-                            let input_lower = input.trim().to_lowercase();
-                            if input_lower == "r" || input_lower == "revert" {
-                                if let Err(e) = self.revert_file() {
-                                    self.set_status_message(format!("Failed to revert: {}", e));
-                                }
-                            } else {
-                                self.set_status_message("Revert cancelled".to_string());
-                            }
-                        }
-                        PromptType::ConfirmSaveConflict => {
-                            let input_lower = input.trim().to_lowercase();
-                            if input_lower == "o" || input_lower == "overwrite" {
-                                // Force save despite conflict
-                                if let Err(e) = self.save() {
-                                    self.set_status_message(format!("Failed to save: {}", e));
-                                }
-                            } else {
-                                self.set_status_message("Save cancelled".to_string());
-                            }
-                        }
-                        PromptType::ConfirmCloseBuffer { buffer_id } => {
-                            let input_lower = input.trim().to_lowercase();
-                            match input_lower.chars().next() {
-                                Some('s') => {
-                                    // Save and close
-                                    // Check if buffer has a file path
-                                    let has_path = self
-                                        .buffers
-                                        .get(&buffer_id)
-                                        .map(|s| s.buffer.file_path().is_some())
-                                        .unwrap_or(false);
-
-                                    if has_path {
-                                        // Save the buffer
-                                        let old_active = self.active_buffer();
-                                        self.set_active_buffer(buffer_id);
-                                        if let Err(e) = self.save() {
-                                            self.set_status_message(format!(
-                                                "Failed to save: {}",
-                                                e
-                                            ));
-                                            self.set_active_buffer(old_active);
-                                            return Ok(());
-                                        }
-                                        self.set_active_buffer(old_active);
-                                        // Now close the buffer
-                                        if let Err(e) = self.force_close_buffer(buffer_id) {
-                                            self.set_status_message(format!(
-                                                "Cannot close buffer: {}",
-                                                e
-                                            ));
-                                        } else {
-                                            self.set_status_message("Saved and closed".to_string());
-                                        }
-                                    } else {
-                                        // No file path - need SaveAs first
-                                        // Store the buffer_id so we can close after save
-                                        self.pending_close_buffer = Some(buffer_id);
-                                        self.start_prompt_with_initial_text(
-                                            "Save as: ".to_string(),
-                                            PromptType::SaveFileAs,
-                                            String::new(),
-                                        );
-                                    }
-                                }
-                                Some('d') => {
-                                    // Discard and close
-                                    if let Err(e) = self.force_close_buffer(buffer_id) {
-                                        self.set_status_message(format!(
-                                            "Cannot close buffer: {}",
-                                            e
-                                        ));
-                                    } else {
-                                        self.set_status_message(
-                                            "Buffer closed (changes discarded)".to_string(),
-                                        );
-                                    }
-                                }
-                                _ => {
-                                    // Cancel (default)
-                                    self.set_status_message("Close cancelled".to_string());
-                                }
-                            }
-                        }
-                        PromptType::ConfirmQuitWithModified => {
-                            let input_lower = input.trim().to_lowercase();
-                            if input_lower == "d" || input_lower == "discard" {
-                                // Force quit without saving
-                                self.should_quit = true;
-                            } else {
-                                self.set_status_message("Quit cancelled".to_string());
-                            }
-                        }
-                        PromptType::LspRename {
-                            original_text,
-                            start_pos,
-                            end_pos: _,
-                            overlay_handle,
-                        } => {
-                            // Perform LSP rename with the new name from the prompt input
-                            self.perform_lsp_rename(
-                                input,
-                                original_text,
-                                start_pos,
-                                overlay_handle,
-                            );
-                        }
-                        PromptType::FileExplorerRename {
-                            original_path,
-                            original_name,
-                        } => {
-                            // Perform file explorer rename with the new name from the prompt
-                            self.perform_file_explorer_rename(original_path, original_name, input);
-                        }
-                        PromptType::StopLspServer => {
-                            // Stop the selected LSP server
-                            let language = input.trim();
-                            if !language.is_empty() {
-                                if let Some(lsp) = &mut self.lsp {
-                                    if lsp.shutdown_server(language) {
-                                        // Update config to disable auto-start for this language
-                                        if let Some(lsp_config) = self.config.lsp.get_mut(language)
-                                        {
-                                            lsp_config.auto_start = false;
-                                            if let Err(e) = self.save_config() {
-                                                tracing::warn!(
-                                                    "Failed to save config after disabling LSP auto-start: {}",
-                                                    e
-                                                );
-                                            } else {
-                                                // Emit config_changed event so plugins can react
-                                                let config_path = self.dir_context.config_path();
-                                                self.emit_event(
-                                                    "config_changed",
-                                                    serde_json::json!({
-                                                        "path": config_path.to_string_lossy(),
-                                                    }),
-                                                );
-                                            }
-                                        }
-                                        self.set_status_message(format!(
-                                            "LSP server for '{}' stopped (auto-start disabled)",
-                                            language
-                                        ));
-                                    } else {
-                                        self.set_status_message(format!(
-                                            "No running LSP server found for '{}'",
-                                            language
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        PromptType::SelectTheme => {
-                            self.apply_theme(input.trim());
-                        }
-                        PromptType::SelectKeybindingMap => {
-                            self.apply_keybinding_map(input.trim());
-                        }
-                        PromptType::SwitchToTab => {
-                            // input is the buffer id as a string
-                            if let Ok(id) = input.trim().parse::<usize>() {
-                                self.switch_to_tab(BufferId(id));
-                            }
-                        }
-                        PromptType::QueryReplaceConfirm => {
-                            // This is handled by InsertChar, not PromptConfirm
-                            // But if somehow Enter is pressed, treat it as skip (n)
-                            if let Some(c) = input.chars().next() {
-                                let _ = self.handle_interactive_replace_key(c);
-                            }
-                        }
+                        PromptResult::Done => {}
                     }
                 }
             }
             Action::PopupConfirm => {
-                // Check if this is an LSP confirmation popup
-                let lsp_confirmation_action = if let Some(popup) = self.active_state().popups.top()
-                {
-                    if let Some(title) = &popup.title {
-                        if title.starts_with("Start LSP Server:") {
-                            if let Some(item) = popup.selected_item() {
-                                item.data.clone()
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                // Handle LSP confirmation if present
-                if let Some(action) = lsp_confirmation_action {
-                    self.hide_popup();
-                    self.handle_lsp_confirmation_response(&action);
+                use super::popup_actions::PopupConfirmResult;
+                if let PopupConfirmResult::EarlyReturn = self.handle_popup_confirm() {
                     return Ok(());
                 }
-
-                // If it's a completion popup, insert the selected item
-                let completion_text = if let Some(popup) = self.active_state().popups.top() {
-                    if let Some(title) = &popup.title {
-                        if title == "Completion" {
-                            if let Some(item) = popup.selected_item() {
-                                item.data.clone()
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                // Now perform the completion if we have text
-                if let Some(text) = completion_text {
-                    use crate::primitives::word_navigation::find_completion_word_start;
-
-                    let (cursor_id, cursor_pos, word_start) = {
-                        let state = self.active_state();
-                        let cursor_id = state.cursors.primary_id();
-                        let cursor_pos = state.cursors.primary().position;
-                        let word_start = find_completion_word_start(&state.buffer, cursor_pos);
-                        (cursor_id, cursor_pos, word_start)
-                    };
-
-                    let deleted_text = if word_start < cursor_pos {
-                        self.active_state_mut()
-                            .get_text_range(word_start, cursor_pos)
-                    } else {
-                        String::new()
-                    };
-
-                    if word_start < cursor_pos {
-                        let delete_event = crate::model::event::Event::Delete {
-                            range: word_start..cursor_pos,
-                            deleted_text,
-                            cursor_id,
-                        };
-
-                        self.active_event_log_mut().append(delete_event.clone());
-                        self.apply_event_to_active_buffer(&delete_event);
-
-                        let buffer_len = self.active_state().buffer.len();
-                        let insert_pos = word_start.min(buffer_len);
-
-                        let insert_event = crate::model::event::Event::Insert {
-                            position: insert_pos,
-                            text,
-                            cursor_id,
-                        };
-
-                        self.active_event_log_mut().append(insert_event.clone());
-                        self.apply_event_to_active_buffer(&insert_event);
-                    } else {
-                        let insert_event = crate::model::event::Event::Insert {
-                            position: cursor_pos,
-                            text,
-                            cursor_id,
-                        };
-
-                        self.active_event_log_mut().append(insert_event.clone());
-                        self.apply_event_to_active_buffer(&insert_event);
-                    }
-                }
-
-                self.hide_popup();
             }
             Action::PopupCancel => {
-                // Clear pending LSP confirmation if cancelling that popup
-                if self.pending_lsp_confirmation.is_some() {
-                    self.pending_lsp_confirmation = None;
-                    self.set_status_message("LSP server startup cancelled".to_string());
-                }
-                self.hide_popup();
+                self.handle_popup_cancel();
             }
             Action::InsertChar(c) => {
-                // Handle character insertion in prompt mode
                 if self.is_prompting() {
-                    // Check if this is the query-replace confirmation prompt
-                    if let Some(ref prompt) = self.prompt {
-                        if prompt.prompt_type == PromptType::QueryReplaceConfirm {
-                            return self.handle_interactive_replace_key(c);
-                        }
+                    return self.handle_insert_char_prompt(c);
+                } else {
+                    self.handle_insert_char_editor(c)?;
+                }
+            }
+            // Prompt clipboard actions
+            Action::PromptCopy => {
+                if let Some(prompt) = &self.prompt {
+                    let text = prompt.selected_text().unwrap_or_else(|| prompt.get_text());
+                    if !text.is_empty() {
+                        self.clipboard.copy(text);
+                        self.set_status_message("Copied".to_string());
                     }
-                    // Reset history navigation when user starts typing
-                    // This allows them to press Up to get back to history items
-                    if let Some(ref prompt) = self.prompt {
-                        match &prompt.prompt_type {
-                            PromptType::Search
-                            | PromptType::ReplaceSearch
-                            | PromptType::QueryReplaceSearch => {
-                                self.search_history.reset_navigation();
-                            }
-                            PromptType::Replace { .. } | PromptType::QueryReplace { .. } => {
-                                self.replace_history.reset_navigation();
-                            }
-                            _ => {}
-                        }
+                }
+            }
+            Action::PromptCut => {
+                if let Some(prompt) = &self.prompt {
+                    let text = prompt.selected_text().unwrap_or_else(|| prompt.get_text());
+                    if !text.is_empty() {
+                        self.clipboard.copy(text);
                     }
-
-                    if let Some(prompt) = self.prompt_mut() {
-                        // Use insert_str to properly handle selection deletion
-                        let s = c.to_string();
-                        prompt.insert_str(&s);
+                }
+                if let Some(prompt) = self.prompt.as_mut() {
+                    if prompt.has_selection() {
+                        prompt.delete_selection();
+                    } else {
+                        prompt.clear();
+                    }
+                }
+                self.set_status_message("Cut".to_string());
+                self.update_prompt_suggestions();
+            }
+            Action::PromptPaste => {
+                if let Some(text) = self.clipboard.paste() {
+                    if let Some(prompt) = self.prompt.as_mut() {
+                        prompt.insert_str(&text);
                     }
                     self.update_prompt_suggestions();
-                } else {
-                    // Check if editing is disabled (show_cursors = false)
-                    if self.is_editing_disabled() {
-                        self.set_status_message("Editing disabled in this buffer".to_string());
-                        return Ok(());
-                    }
-                    // Normal mode character insertion
-                    // Cancel any pending LSP requests since the text is changing
-                    self.cancel_pending_lsp_requests();
-
-                    if let Some(events) = self.action_to_events(Action::InsertChar(c)) {
-                        // Wrap multiple events (multi-cursor) in a Batch for atomic undo
-                        if events.len() > 1 {
-                            let batch = Event::Batch {
-                                events: events.clone(),
-                                description: format!("Insert '{}'", c),
-                            };
-                            self.active_event_log_mut().append(batch.clone());
-                            self.apply_event_to_active_buffer(&batch);
-                            // Note: LSP notifications now handled automatically by apply_event_to_active_buffer
-                        } else {
-                            // Single cursor - no need for batch
-                            for event in events {
-                                self.active_event_log_mut().append(event.clone());
-                                self.apply_event_to_active_buffer(&event);
-                                // Note: LSP notifications now handled automatically by apply_event_to_active_buffer
-                            }
-                        }
-                    }
-
-                    // Auto-trigger signature help on '(' and ','
-                    if c == '(' || c == ',' {
-                        let _ = self.request_signature_help();
-                    }
                 }
             }
             _ => {
-                // Convert action to events and apply them
-                // Get description before moving action
-                let action_description = format!("{:?}", action);
-
-                // Check if this is an editing action and editing is disabled
-                let is_editing_action = matches!(
-                    action,
-                    Action::InsertNewline
-                        | Action::InsertTab
-                        | Action::DeleteForward
-                        | Action::DeleteWordBackward
-                        | Action::DeleteWordForward
-                        | Action::DeleteLine
-                        | Action::IndentSelection
-                        | Action::DedentSelection
-                        | Action::ToggleComment
-                );
-
-                if is_editing_action && self.is_editing_disabled() {
-                    self.set_status_message("Editing disabled in this buffer".to_string());
-                    return Ok(());
-                }
-
-                if let Some(events) = self.action_to_events(action) {
-                    // Wrap multiple events (multi-cursor) in a Batch for atomic undo
-                    if events.len() > 1 {
-                        let batch = Event::Batch {
-                            events: events.clone(),
-                            description: action_description,
-                        };
-                        self.active_event_log_mut().append(batch.clone());
-                        self.apply_event_to_active_buffer(&batch);
-                        // Note: LSP notifications now handled automatically by apply_event_to_active_buffer
-
-                        // Track position history for all events in the batch
-                        for event in &events {
-                            // Track cursor movements in position history (but not during navigation)
-                            if !self.in_navigation {
-                                if let Event::MoveCursor {
-                                    new_position,
-                                    new_anchor,
-                                    ..
-                                } = event
-                                {
-                                    self.position_history.record_movement(
-                                        self.active_buffer(),
-                                        *new_position,
-                                        *new_anchor,
-                                    );
-                                }
-                            }
-                        }
-                    } else {
-                        // Single cursor - no need for batch
-                        for event in events {
-                            self.active_event_log_mut().append(event.clone());
-                            self.apply_event_to_active_buffer(&event);
-                            // Note: LSP notifications now handled automatically by apply_event_to_active_buffer
-
-                            // Track cursor movements in position history (but not during navigation)
-                            if !self.in_navigation {
-                                if let Event::MoveCursor {
-                                    new_position,
-                                    new_anchor,
-                                    ..
-                                } = event
-                                {
-                                    self.position_history.record_movement(
-                                        self.active_buffer(),
-                                        new_position,
-                                        new_anchor,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+                // TODO: Why do we have this catch-all? It seems like actions should either:
+                // 1. Be handled explicitly above (like InsertChar, PopupConfirm, etc.)
+                // 2. Or be converted to events consistently
+                // This catch-all makes it unclear which actions go through event conversion
+                // vs. direct handling. Consider making this explicit or removing the pattern.
+                self.apply_action_as_events(action)?;
             }
         }
 
         Ok(())
-    }
-
-    /// Handle a mouse event
-    /// Returns true if a re-render is needed
-    pub fn handle_mouse(
-        &mut self,
-        mouse_event: crossterm::event::MouseEvent,
-    ) -> std::io::Result<bool> {
-        use crossterm::event::{MouseButton, MouseEventKind};
-
-        let col = mouse_event.column;
-        let row = mouse_event.row;
-
-        // When settings modal is open, capture all mouse events
-        if self.settings_state.as_ref().map_or(false, |s| s.visible) {
-            return self.handle_settings_mouse(mouse_event);
-        }
-
-        // Cancel LSP rename prompt on any mouse interaction
-        let mut needs_render = false;
-        if let Some(ref prompt) = self.prompt {
-            if matches!(prompt.prompt_type, PromptType::LspRename { .. }) {
-                self.cancel_prompt();
-                needs_render = true;
-            }
-        }
-
-        // Update mouse cursor position for software cursor rendering (used by GPM)
-        // When GPM is active, we always need to re-render to update the cursor position
-        let cursor_moved = self.mouse_cursor_position != Some((col, row));
-        self.mouse_cursor_position = Some((col, row));
-        if self.gpm_active && cursor_moved {
-            needs_render = true;
-        }
-
-        tracing::debug!(
-            "handle_mouse: kind={:?}, col={}, row={}",
-            mouse_event.kind,
-            col,
-            row
-        );
-
-        match mouse_event.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                // Detect double clicks using configured time window AND same position
-                let is_double_click = if let (Some(previous_time), Some(previous_pos)) =
-                    (self.previous_click_time, self.previous_click_position)
-                {
-                    let now = std::time::Instant::now();
-                    let double_click_threshold =
-                        std::time::Duration::from_millis(self.config.editor.double_click_time_ms);
-                    let within_time = now.duration_since(previous_time) < double_click_threshold;
-                    let same_position = previous_pos == (col, row);
-                    within_time && same_position
-                } else {
-                    false
-                };
-
-                if is_double_click {
-                    // Double click detected - both clicks within time threshold AND at same position
-                    self.handle_mouse_double_click(col, row)?;
-                    self.previous_click_time = None;
-                    self.previous_click_position = None;
-                    needs_render = true;
-                    return Ok(needs_render);
-                } else {
-                    // Not a double click - store time and position for next click
-                    self.previous_click_time = Some(std::time::Instant::now());
-                    self.previous_click_position = Some((col, row));
-                }
-                self.handle_mouse_click(col, row)?;
-                needs_render = true;
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                self.handle_mouse_drag(col, row)?;
-                needs_render = true;
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                // Check if we were dragging a separator to trigger terminal resize
-                let was_dragging_separator = self.mouse_state.dragging_separator.is_some();
-
-                // Stop dragging and clear drag state
-                self.mouse_state.dragging_scrollbar = None;
-                self.mouse_state.drag_start_row = None;
-                self.mouse_state.drag_start_top_byte = None;
-                self.mouse_state.dragging_separator = None;
-                self.mouse_state.drag_start_position = None;
-                self.mouse_state.drag_start_ratio = None;
-                self.mouse_state.dragging_file_explorer = false;
-                self.mouse_state.drag_start_explorer_width = None;
-                // Clear text selection drag state (selection remains in cursor)
-                self.mouse_state.dragging_text_selection = false;
-                self.mouse_state.drag_selection_split = None;
-                self.mouse_state.drag_selection_anchor = None;
-
-                // If we finished dragging a separator, resize visible terminals
-                if was_dragging_separator {
-                    self.resize_visible_terminals();
-                }
-
-                needs_render = true;
-            }
-            MouseEventKind::Moved => {
-                // Dispatch MouseMove hook to plugins (fire-and-forget, no blocking check)
-                {
-                    // Find content rect for the split under the mouse
-                    let content_rect = self
-                        .cached_layout
-                        .split_areas
-                        .iter()
-                        .find(|(_, _, content_rect, _, _, _)| {
-                            col >= content_rect.x
-                                && col < content_rect.x + content_rect.width
-                                && row >= content_rect.y
-                                && row < content_rect.y + content_rect.height
-                        })
-                        .map(|(_, _, rect, _, _, _)| *rect);
-
-                    let (content_x, content_y) = content_rect.map(|r| (r.x, r.y)).unwrap_or((0, 0));
-
-                    self.plugin_manager.run_hook(
-                        "mouse_move",
-                        HookArgs::MouseMove {
-                            column: col,
-                            row,
-                            content_x,
-                            content_y,
-                        },
-                    );
-                }
-
-                // Only re-render if hover target actually changed
-                // (preserve needs_render if already set, e.g., for GPM cursor updates)
-                let hover_changed = self.update_hover_target(col, row);
-                needs_render = needs_render || hover_changed;
-
-                // Track LSP hover state for mouse-triggered hover popups
-                self.update_lsp_hover_state(col, row);
-            }
-            MouseEventKind::ScrollUp => {
-                // Check if file browser is active and should handle scroll
-                if self.is_file_open_active() && self.handle_file_open_scroll(-3) {
-                    needs_render = true;
-                } else {
-                    // Dismiss hover/signature help popups on scroll
-                    self.dismiss_transient_popups();
-                    self.handle_mouse_scroll(col, row, -3)?;
-                    // Sync viewport from SplitViewState to EditorState so rendering sees the scroll
-                    self.sync_split_view_state_to_editor_state();
-                    needs_render = true;
-                }
-            }
-            MouseEventKind::ScrollDown => {
-                // Check if file browser is active and should handle scroll
-                if self.is_file_open_active() && self.handle_file_open_scroll(3) {
-                    needs_render = true;
-                } else {
-                    // Dismiss hover/signature help popups on scroll
-                    self.dismiss_transient_popups();
-                    self.handle_mouse_scroll(col, row, 3)?;
-                    // Sync viewport from SplitViewState to EditorState so rendering sees the scroll
-                    self.sync_split_view_state_to_editor_state();
-                    needs_render = true;
-                }
-            }
-            _ => {
-                // Ignore other mouse events for now
-            }
-        }
-
-        self.mouse_state.last_position = Some((col, row));
-        Ok(needs_render)
-    }
-
-    /// Update the current hover target based on mouse position
-    /// Returns true if the hover target changed (requiring a re-render)
-    pub(super) fn update_hover_target(&mut self, col: u16, row: u16) -> bool {
-        let old_target = self.mouse_state.hover_target.clone();
-        let new_target = self.compute_hover_target(col, row);
-        let changed = old_target != new_target;
-        self.mouse_state.hover_target = new_target.clone();
-
-        // If a menu is currently open and we're hovering over a different menu bar item,
-        // switch to that menu automatically
-        if let Some(active_menu_idx) = self.menu_state.active_menu {
-            if let Some(HoverTarget::MenuBarItem(hovered_menu_idx)) = new_target.clone() {
-                if hovered_menu_idx != active_menu_idx {
-                    self.menu_state.open_menu(hovered_menu_idx);
-                    return true; // Force re-render since menu changed
-                }
-            }
-
-            // If hovering over a menu dropdown item, check if it's a submenu and open it
-            if let Some(HoverTarget::MenuDropdownItem(_, item_idx)) = new_target.clone() {
-                let all_menus: Vec<crate::config::Menu> = self
-                    .config
-                    .menu
-                    .menus
-                    .iter()
-                    .chain(self.menu_state.plugin_menus.iter())
-                    .cloned()
-                    .collect();
-
-                // Clear any open submenus since we're at the main dropdown level
-                if !self.menu_state.submenu_path.is_empty() {
-                    self.menu_state.submenu_path.clear();
-                    self.menu_state.highlighted_item = Some(item_idx);
-                    return true;
-                }
-
-                // Check if the hovered item is a submenu
-                if let Some(menu) = all_menus.get(active_menu_idx) {
-                    if let Some(crate::config::MenuItem::Submenu { items, .. }) =
-                        menu.items.get(item_idx)
-                    {
-                        if !items.is_empty() {
-                            self.menu_state.submenu_path.push(item_idx);
-                            self.menu_state.highlighted_item = Some(0);
-                            return true;
-                        }
-                    }
-                }
-                // Update highlighted item for non-submenu items too
-                if self.menu_state.highlighted_item != Some(item_idx) {
-                    self.menu_state.highlighted_item = Some(item_idx);
-                    return true;
-                }
-            }
-
-            // If hovering over a submenu item, handle submenu navigation
-            if let Some(HoverTarget::SubmenuItem(depth, item_idx)) = new_target {
-                // Truncate submenu path to this depth (close any deeper submenus)
-                if self.menu_state.submenu_path.len() > depth {
-                    self.menu_state.submenu_path.truncate(depth);
-                }
-
-                let all_menus: Vec<crate::config::Menu> = self
-                    .config
-                    .menu
-                    .menus
-                    .iter()
-                    .chain(self.menu_state.plugin_menus.iter())
-                    .cloned()
-                    .collect();
-
-                // Get the items at this depth
-                if let Some(items) = self
-                    .menu_state
-                    .get_current_items(&all_menus, active_menu_idx)
-                {
-                    // Check if hovered item is a submenu - if so, open it
-                    if let Some(crate::config::MenuItem::Submenu {
-                        items: sub_items, ..
-                    }) = items.get(item_idx)
-                    {
-                        if !sub_items.is_empty()
-                            && !self.menu_state.submenu_path.contains(&item_idx)
-                        {
-                            self.menu_state.submenu_path.push(item_idx);
-                            self.menu_state.highlighted_item = Some(0);
-                            return true;
-                        }
-                    }
-                    // Update highlighted item
-                    if self.menu_state.highlighted_item != Some(item_idx) {
-                        self.menu_state.highlighted_item = Some(item_idx);
-                        return true;
-                    }
-                }
-            }
-        }
-
-        changed
-    }
-
-    /// Update LSP hover state based on mouse position
-    /// Tracks position for debounced hover requests
-    fn update_lsp_hover_state(&mut self, col: u16, row: u16) {
-        // Find which split the mouse is over
-        let split_info = self
-            .cached_layout
-            .split_areas
-            .iter()
-            .find(|(_, _, content_rect, _, _, _)| {
-                col >= content_rect.x
-                    && col < content_rect.x + content_rect.width
-                    && row >= content_rect.y
-                    && row < content_rect.y + content_rect.height
-            })
-            .map(|(split_id, buffer_id, content_rect, _, _, _)| {
-                (*split_id, *buffer_id, *content_rect)
-            });
-
-        let Some((split_id, buffer_id, content_rect)) = split_info else {
-            // Mouse is not over editor content - clear hover state and dismiss popup
-            if self.mouse_state.lsp_hover_state.is_some() {
-                self.mouse_state.lsp_hover_state = None;
-                self.mouse_state.lsp_hover_request_sent = false;
-                self.dismiss_transient_popups();
-            }
-            return;
-        };
-
-        // Get cached mappings and gutter width for this split
-        let cached_mappings = self
-            .cached_layout
-            .view_line_mappings
-            .get(&split_id)
-            .cloned();
-        let gutter_width = self
-            .buffers
-            .get(&buffer_id)
-            .map(|s| s.margins.left_total_width() as u16)
-            .unwrap_or(0);
-        let fallback = self
-            .buffers
-            .get(&buffer_id)
-            .map(|s| s.buffer.len())
-            .unwrap_or(0);
-
-        // Convert screen position to buffer byte position
-        let Some(byte_pos) = Self::screen_to_buffer_position(
-            col,
-            row,
-            content_rect,
-            gutter_width,
-            &cached_mappings,
-            fallback,
-            false, // Don't include gutter
-        ) else {
-            // Mouse is in gutter - clear hover state
-            if self.mouse_state.lsp_hover_state.is_some() {
-                self.mouse_state.lsp_hover_state = None;
-                self.mouse_state.lsp_hover_request_sent = false;
-                self.dismiss_transient_popups();
-            }
-            return;
-        };
-
-        // Check if we're still hovering the same position
-        if let Some((old_pos, _, _, _)) = self.mouse_state.lsp_hover_state {
-            if old_pos == byte_pos {
-                // Same position - keep existing state
-                return;
-            }
-            // Position changed - reset state and dismiss popup
-            self.dismiss_transient_popups();
-        }
-
-        // Start tracking new hover position
-        self.mouse_state.lsp_hover_state = Some((byte_pos, std::time::Instant::now(), col, row));
-        self.mouse_state.lsp_hover_request_sent = false;
-    }
-
-    /// Compute what hover target is at the given position
-    fn compute_hover_target(&self, col: u16, row: u16) -> Option<HoverTarget> {
-        // Check suggestions area first (command palette, autocomplete)
-        if let Some((inner_rect, start_idx, _visible_count, total_count)) =
-            &self.cached_layout.suggestions_area
-        {
-            if col >= inner_rect.x
-                && col < inner_rect.x + inner_rect.width
-                && row >= inner_rect.y
-                && row < inner_rect.y + inner_rect.height
-            {
-                let relative_row = (row - inner_rect.y) as usize;
-                let item_idx = start_idx + relative_row;
-
-                if item_idx < *total_count {
-                    return Some(HoverTarget::SuggestionItem(item_idx));
-                }
-            }
-        }
-
-        // Check popups (they're rendered on top)
-        // Check from top to bottom (reverse order since last popup is on top)
-        for (popup_idx, _popup_rect, inner_rect, scroll_offset, num_items) in
-            self.cached_layout.popup_areas.iter().rev()
-        {
-            if col >= inner_rect.x
-                && col < inner_rect.x + inner_rect.width
-                && row >= inner_rect.y
-                && row < inner_rect.y + inner_rect.height
-                && *num_items > 0
-            {
-                // Calculate which item is being hovered
-                let relative_row = (row - inner_rect.y) as usize;
-                let item_idx = scroll_offset + relative_row;
-
-                if item_idx < *num_items {
-                    return Some(HoverTarget::PopupListItem(*popup_idx, item_idx));
-                }
-            }
-        }
-
-        // Check file browser popup
-        if self.is_file_open_active() {
-            if let Some(hover) = self.compute_file_browser_hover(col, row) {
-                return Some(hover);
-            }
-        }
-
-        // Check menu bar (row 0)
-        if row == 0 {
-            let all_menus: Vec<crate::config::Menu> = self
-                .config
-                .menu
-                .menus
-                .iter()
-                .chain(self.menu_state.plugin_menus.iter())
-                .cloned()
-                .collect();
-
-            if let Some(menu_idx) = self.menu_state.get_menu_at_position(&all_menus, col) {
-                return Some(HoverTarget::MenuBarItem(menu_idx));
-            }
-        }
-
-        // Check menu dropdown items if a menu is open (including submenus)
-        if let Some(active_idx) = self.menu_state.active_menu {
-            let all_menus: Vec<crate::config::Menu> = self
-                .config
-                .menu
-                .menus
-                .iter()
-                .chain(self.menu_state.plugin_menus.iter())
-                .cloned()
-                .collect();
-
-            if let Some(menu) = all_menus.get(active_idx) {
-                if let Some(hover) =
-                    self.compute_menu_dropdown_hover(col, row, menu, active_idx, &all_menus)
-                {
-                    return Some(hover);
-                }
-            }
-        }
-
-        // Check file explorer close button and border (for resize)
-        if let Some(explorer_area) = self.cached_layout.file_explorer_area {
-            // Close button is at position: explorer_area.x + explorer_area.width - 3 to -1
-            let close_button_x = explorer_area.x + explorer_area.width.saturating_sub(3);
-            if row == explorer_area.y
-                && col >= close_button_x
-                && col < explorer_area.x + explorer_area.width
-            {
-                return Some(HoverTarget::FileExplorerCloseButton);
-            }
-
-            // The border is at the right edge of the file explorer area
-            let border_x = explorer_area.x + explorer_area.width;
-            if col == border_x
-                && row >= explorer_area.y
-                && row < explorer_area.y + explorer_area.height
-            {
-                return Some(HoverTarget::FileExplorerBorder);
-            }
-        }
-
-        // Check split separators
-        for (split_id, direction, sep_x, sep_y, sep_length) in &self.cached_layout.separator_areas {
-            let is_on_separator = match direction {
-                SplitDirection::Horizontal => {
-                    row == *sep_y && col >= *sep_x && col < sep_x + sep_length
-                }
-                SplitDirection::Vertical => {
-                    col == *sep_x && row >= *sep_y && row < sep_y + sep_length
-                }
-            };
-
-            if is_on_separator {
-                return Some(HoverTarget::SplitSeparator(*split_id, *direction));
-            }
-        }
-
-        // Check tab areas using cached hit regions (computed during rendering)
-        // Check split control buttons first (they're on top of the tab row)
-        for (split_id, btn_row, start_col, end_col) in &self.cached_layout.close_split_areas {
-            if row == *btn_row && col >= *start_col && col < *end_col {
-                return Some(HoverTarget::CloseSplitButton(*split_id));
-            }
-        }
-
-        for (split_id, btn_row, start_col, end_col) in &self.cached_layout.maximize_split_areas {
-            if row == *btn_row && col >= *start_col && col < *end_col {
-                return Some(HoverTarget::MaximizeSplitButton(*split_id));
-            }
-        }
-
-        for (split_id, buffer_id, tab_row, start_col, end_col, close_start) in
-            &self.cached_layout.tab_areas
-        {
-            if row == *tab_row && col >= *start_col && col < *end_col {
-                // Check if hovering over the close button
-                if col >= *close_start {
-                    return Some(HoverTarget::TabCloseButton(*buffer_id, *split_id));
-                }
-                // Otherwise, return TabName for hover effect on tab name
-                return Some(HoverTarget::TabName(*buffer_id, *split_id));
-            }
-        }
-
-        // Check scrollbars
-        for (split_id, _buffer_id, _content_rect, scrollbar_rect, thumb_start, thumb_end) in
-            &self.cached_layout.split_areas
-        {
-            if col >= scrollbar_rect.x
-                && col < scrollbar_rect.x + scrollbar_rect.width
-                && row >= scrollbar_rect.y
-                && row < scrollbar_rect.y + scrollbar_rect.height
-            {
-                let relative_row = row.saturating_sub(scrollbar_rect.y) as usize;
-                let is_on_thumb = relative_row >= *thumb_start && relative_row < *thumb_end;
-
-                if is_on_thumb {
-                    return Some(HoverTarget::ScrollbarThumb(*split_id));
-                } else {
-                    return Some(HoverTarget::ScrollbarTrack(*split_id));
-                }
-            }
-        }
-
-        // No hover target
-        None
-    }
-
-    /// Handle mouse double click (down event)
-    /// Double-click in editor area selects the word under the cursor.
-    pub(super) fn handle_mouse_double_click(&mut self, col: u16, row: u16) -> std::io::Result<()> {
-        tracing::debug!("handle_mouse_double_click at col={}, row={}", col, row);
-
-        // Is it in the file open dialog?
-        if self.handle_file_open_double_click(col, row) {
-            return Ok(());
-        }
-
-        // Find which split/buffer was clicked and handle double-click
-        let split_areas = self.cached_layout.split_areas.clone();
-        for (split_id, buffer_id, content_rect, _scrollbar_rect, _thumb_start, _thumb_end) in
-            &split_areas
-        {
-            if col >= content_rect.x
-                && col < content_rect.x + content_rect.width
-                && row >= content_rect.y
-                && row < content_rect.y + content_rect.height
-            {
-                // Double-clicked on an editor split
-                if self.is_terminal_buffer(*buffer_id) {
-                    self.key_context = crate::input::keybindings::KeyContext::Terminal;
-                    // Don't select word in terminal buffers
-                    return Ok(());
-                }
-
-                self.key_context = crate::input::keybindings::KeyContext::Normal;
-
-                // Position cursor at click location and select word
-                self.handle_editor_double_click(col, row, *split_id, *buffer_id, *content_rect)?;
-                return Ok(());
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle double-click in editor content area - selects the word under cursor
-    fn handle_editor_double_click(
-        &mut self,
-        col: u16,
-        row: u16,
-        split_id: crate::model::event::SplitId,
-        buffer_id: BufferId,
-        content_rect: ratatui::layout::Rect,
-    ) -> std::io::Result<()> {
-        use crate::model::event::Event;
-
-        // Focus this split
-        self.focus_split(split_id, buffer_id);
-
-        // Get cached view line mappings for this split
-        let cached_mappings = self
-            .cached_layout
-            .view_line_mappings
-            .get(&split_id)
-            .cloned();
-
-        // Get fallback from SplitViewState viewport
-        let fallback = self
-            .split_view_states
-            .get(&split_id)
-            .map(|vs| vs.viewport.top_byte)
-            .unwrap_or(0);
-
-        // Calculate clicked position in buffer
-        if let Some(state) = self.buffers.get_mut(&buffer_id) {
-            let gutter_width = state.margins.left_total_width() as u16;
-
-            let Some(target_position) = Self::screen_to_buffer_position(
-                col,
-                row,
-                content_rect,
-                gutter_width,
-                &cached_mappings,
-                fallback,
-                true, // Allow gutter clicks
-            ) else {
-                return Ok(());
-            };
-
-            // Move cursor to clicked position first
-            let primary_cursor_id = state.cursors.primary_id();
-            let event = Event::MoveCursor {
-                cursor_id: primary_cursor_id,
-                old_position: 0,
-                new_position: target_position,
-                old_anchor: None,
-                new_anchor: None,
-                old_sticky_column: 0,
-                new_sticky_column: 0,
-            };
-
-            if let Some(event_log) = self.event_logs.get_mut(&buffer_id) {
-                event_log.append(event.clone());
-            }
-            state.apply(&event);
-        }
-
-        // Now select the word under cursor
-        self.handle_action(Action::SelectWord)?;
-
-        Ok(())
-    }
-    /// Handle mouse click (down event)
-    pub(super) fn handle_mouse_click(&mut self, col: u16, row: u16) -> std::io::Result<()> {
-        // Check if click is on suggestions (command palette, autocomplete)
-        if let Some((inner_rect, start_idx, _visible_count, total_count)) =
-            &self.cached_layout.suggestions_area.clone()
-        {
-            if col >= inner_rect.x
-                && col < inner_rect.x + inner_rect.width
-                && row >= inner_rect.y
-                && row < inner_rect.y + inner_rect.height
-            {
-                let relative_row = (row - inner_rect.y) as usize;
-                let item_idx = start_idx + relative_row;
-
-                if item_idx < *total_count {
-                    // Select and execute the clicked suggestion
-                    if let Some(prompt) = &mut self.prompt {
-                        prompt.selected_suggestion = Some(item_idx);
-                    }
-                    // Execute the suggestion (same as pressing Enter)
-                    return self.handle_action(Action::PromptConfirm);
-                }
-            }
-        }
-
-        // Check if click is on a popup (they're rendered on top)
-        for (_popup_idx, _popup_rect, inner_rect, scroll_offset, num_items) in
-            self.cached_layout.popup_areas.iter().rev()
-        {
-            if col >= inner_rect.x
-                && col < inner_rect.x + inner_rect.width
-                && row >= inner_rect.y
-                && row < inner_rect.y + inner_rect.height
-                && *num_items > 0
-            {
-                // Calculate which item was clicked
-                let relative_row = (row - inner_rect.y) as usize;
-                let item_idx = scroll_offset + relative_row;
-
-                if item_idx < *num_items {
-                    // Select and execute the clicked item
-                    let state = self.active_state_mut();
-                    if let Some(popup) = state.popups.top_mut() {
-                        if let crate::view::popup::PopupContent::List { items: _, selected } =
-                            &mut popup.content
-                        {
-                            *selected = item_idx;
-                        }
-                    }
-                    // Execute the popup selection (same as pressing Enter)
-                    return self.handle_action(Action::PopupConfirm);
-                }
-            }
-        }
-
-        // Check if click is on the file browser popup
-        if self.is_file_open_active() {
-            if self.handle_file_open_click(col, row) {
-                return Ok(());
-            }
-        }
-
-        // Check if click is on menu bar (row 0)
-        if row == 0 {
-            let all_menus: Vec<crate::config::Menu> = self
-                .config
-                .menu
-                .menus
-                .iter()
-                .chain(self.menu_state.plugin_menus.iter())
-                .cloned()
-                .collect();
-
-            if let Some(menu_idx) = self.menu_state.get_menu_at_position(&all_menus, col) {
-                // Toggle menu: if same menu is open, close it; otherwise open clicked menu
-                if self.menu_state.active_menu == Some(menu_idx) {
-                    self.menu_state.close_menu();
-                } else {
-                    self.menu_state.open_menu(menu_idx);
-                }
-            } else {
-                // Clicked on menu bar but not on a menu label - close any open menu
-                self.menu_state.close_menu();
-            }
-            return Ok(());
-        }
-
-        // Check if click is on an open menu dropdown
-        if let Some(active_idx) = self.menu_state.active_menu {
-            let all_menus: Vec<crate::config::Menu> = self
-                .config
-                .menu
-                .menus
-                .iter()
-                .chain(self.menu_state.plugin_menus.iter())
-                .cloned()
-                .collect();
-
-            if let Some(menu) = all_menus.get(active_idx) {
-                // Handle click on menu dropdown chain (including submenus)
-                if let Some(click_result) =
-                    self.handle_menu_dropdown_click(col, row, menu, active_idx, &all_menus)?
-                {
-                    return click_result;
-                }
-            }
-
-            // Click outside the dropdown - close the menu
-            self.menu_state.close_menu();
-            return Ok(());
-        }
-
-        // Check if click is on file explorer
-        if let Some(explorer_area) = self.cached_layout.file_explorer_area {
-            if col >= explorer_area.x
-                && col < explorer_area.x + explorer_area.width
-                && row >= explorer_area.y
-                && row < explorer_area.y + explorer_area.height
-            {
-                self.handle_file_explorer_click(col, row, explorer_area)?;
-                return Ok(());
-            }
-        }
-
-        // Check if click is on a scrollbar
-        let scrollbar_hit = self.cached_layout.split_areas.iter().find_map(
-            |(split_id, buffer_id, _content_rect, scrollbar_rect, thumb_start, thumb_end)| {
-                if col >= scrollbar_rect.x
-                    && col < scrollbar_rect.x + scrollbar_rect.width
-                    && row >= scrollbar_rect.y
-                    && row < scrollbar_rect.y + scrollbar_rect.height
-                {
-                    let relative_row = row.saturating_sub(scrollbar_rect.y) as usize;
-                    let is_on_thumb = relative_row >= *thumb_start && relative_row < *thumb_end;
-                    Some((*split_id, *buffer_id, *scrollbar_rect, is_on_thumb))
-                } else {
-                    None
-                }
-            },
-        );
-
-        if let Some((split_id, buffer_id, scrollbar_rect, is_on_thumb)) = scrollbar_hit {
-            self.focus_split(split_id, buffer_id);
-
-            if is_on_thumb {
-                // Click on thumb - start drag from current position (don't jump)
-                self.mouse_state.dragging_scrollbar = Some(split_id);
-                self.mouse_state.drag_start_row = Some(row);
-                // Record the current viewport position from SplitViewState
-                if let Some(view_state) = self.split_view_states.get(&split_id) {
-                    self.mouse_state.drag_start_top_byte = Some(view_state.viewport.top_byte);
-                }
-            } else {
-                // Click on track - jump to position
-                self.mouse_state.dragging_scrollbar = Some(split_id);
-                self.handle_scrollbar_jump(col, row, split_id, buffer_id, scrollbar_rect)?;
-            }
-            return Ok(());
-        }
-
-        // Check if click is on file explorer border (for drag resizing)
-        if let Some(explorer_area) = self.cached_layout.file_explorer_area {
-            let border_x = explorer_area.x + explorer_area.width;
-            if col == border_x
-                && row >= explorer_area.y
-                && row < explorer_area.y + explorer_area.height
-            {
-                // Start file explorer border drag
-                self.mouse_state.dragging_file_explorer = true;
-                self.mouse_state.drag_start_position = Some((col, row));
-                self.mouse_state.drag_start_explorer_width = Some(self.file_explorer_width_percent);
-                return Ok(());
-            }
-        }
-
-        // Check if click is on a split separator (for drag resizing)
-        for (split_id, direction, sep_x, sep_y, sep_length) in &self.cached_layout.separator_areas {
-            let is_on_separator = match direction {
-                SplitDirection::Horizontal => {
-                    // Horizontal separator: spans full width at a specific y
-                    row == *sep_y && col >= *sep_x && col < sep_x + sep_length
-                }
-                SplitDirection::Vertical => {
-                    // Vertical separator: spans full height at a specific x
-                    col == *sep_x && row >= *sep_y && row < sep_y + sep_length
-                }
-            };
-
-            if is_on_separator {
-                // Start separator drag
-                self.mouse_state.dragging_separator = Some((*split_id, *direction));
-                self.mouse_state.drag_start_position = Some((col, row));
-                // Store the initial ratio
-                if let Some(ratio) = self.split_manager.get_ratio(*split_id) {
-                    self.mouse_state.drag_start_ratio = Some(ratio);
-                }
-                return Ok(());
-            }
-        }
-
-        // Check if click is on a close split button
-        let close_split_click = self
-            .cached_layout
-            .close_split_areas
-            .iter()
-            .find(|(_, btn_row, start_col, end_col)| {
-                row == *btn_row && col >= *start_col && col < *end_col
-            })
-            .map(|(split_id, _, _, _)| *split_id);
-
-        if let Some(split_id) = close_split_click {
-            if let Err(e) = self.split_manager.close_split(split_id) {
-                self.set_status_message(format!("Cannot close split: {}", e));
-            } else {
-                // Update active buffer to match the new active split
-                let new_active_split = self.split_manager.active_split();
-                if let Some(buffer_id) = self.split_manager.buffer_for_split(new_active_split) {
-                    self.set_active_buffer(buffer_id);
-                }
-                self.set_status_message("Split closed".to_string());
-            }
-            return Ok(());
-        }
-
-        // Check if click is on a maximize split button
-        let maximize_split_click = self
-            .cached_layout
-            .maximize_split_areas
-            .iter()
-            .find(|(_, btn_row, start_col, end_col)| {
-                row == *btn_row && col >= *start_col && col < *end_col
-            })
-            .map(|(split_id, _, _, _)| *split_id);
-
-        if let Some(_split_id) = maximize_split_click {
-            // Toggle maximize state
-            match self.split_manager.toggle_maximize() {
-                Ok(maximized) => {
-                    if maximized {
-                        self.set_status_message("Maximized split".to_string());
-                    } else {
-                        self.set_status_message("Restored all splits".to_string());
-                    }
-                }
-                Err(e) => self.set_status_message(e),
-            }
-            return Ok(());
-        }
-
-        // Check if click is on a tab using cached hit areas (computed during rendering)
-        let tab_click = self.cached_layout.tab_areas.iter().find_map(
-            |(split_id, buffer_id, tab_row, start_col, end_col, close_start)| {
-                if row == *tab_row && col >= *start_col && col < *end_col {
-                    let is_close_button = col >= *close_start;
-                    Some((*split_id, *buffer_id, is_close_button))
-                } else {
-                    None
-                }
-            },
-        );
-
-        if let Some((split_id, clicked_buffer, clicked_close)) = tab_click {
-            self.focus_split(split_id, clicked_buffer);
-
-            // Handle close button click - use close_tab logic
-            if clicked_close {
-                self.close_tab_in_split(clicked_buffer, split_id);
-                return Ok(());
-            }
-            return Ok(());
-        }
-
-        // Check if click is in editor content area
-        tracing::debug!(
-            "handle_mouse_click: checking {} split_areas for click at ({}, {})",
-            self.cached_layout.split_areas.len(),
-            col,
-            row
-        );
-        for (split_id, buffer_id, content_rect, _scrollbar_rect, _thumb_start, _thumb_end) in
-            &self.cached_layout.split_areas
-        {
-            tracing::debug!(
-                "  split_id={:?}, content_rect=({}, {}, {}x{})",
-                split_id,
-                content_rect.x,
-                content_rect.y,
-                content_rect.width,
-                content_rect.height
-            );
-            if col >= content_rect.x
-                && col < content_rect.x + content_rect.width
-                && row >= content_rect.y
-                && row < content_rect.y + content_rect.height
-            {
-                // Click in editor - focus split and position cursor
-                tracing::debug!("  -> HIT! calling handle_editor_click");
-                self.handle_editor_click(col, row, *split_id, *buffer_id, *content_rect)?;
-                return Ok(());
-            }
-        }
-        tracing::debug!("  -> No split area hit");
-
-        Ok(())
-    }
-
-    /// Handle mouse drag event
-    pub(super) fn handle_mouse_drag(&mut self, col: u16, row: u16) -> std::io::Result<()> {
-        // If dragging scrollbar, update scroll position
-        if let Some(dragging_split_id) = self.mouse_state.dragging_scrollbar {
-            // Find the buffer and scrollbar rect for this split
-            for (split_id, buffer_id, _content_rect, scrollbar_rect, _thumb_start, _thumb_end) in
-                &self.cached_layout.split_areas
-            {
-                if *split_id == dragging_split_id {
-                    // Check if we started dragging from the thumb (have drag_start_row)
-                    if self.mouse_state.drag_start_row.is_some() {
-                        // Relative drag from thumb
-                        self.handle_scrollbar_drag_relative(
-                            row,
-                            *split_id,
-                            *buffer_id,
-                            *scrollbar_rect,
-                        )?;
-                    } else {
-                        // Jump drag (started from track)
-                        self.handle_scrollbar_jump(
-                            col,
-                            row,
-                            *split_id,
-                            *buffer_id,
-                            *scrollbar_rect,
-                        )?;
-                    }
-                    return Ok(());
-                }
-            }
-        }
-
-        // If dragging separator, update split ratio
-        if let Some((split_id, direction)) = self.mouse_state.dragging_separator {
-            self.handle_separator_drag(col, row, split_id, direction)?;
-            return Ok(());
-        }
-
-        // If dragging file explorer border, update width
-        if self.mouse_state.dragging_file_explorer {
-            self.handle_file_explorer_border_drag(col)?;
-            return Ok(());
-        }
-
-        // If dragging to select text
-        if self.mouse_state.dragging_text_selection {
-            self.handle_text_selection_drag(col, row)?;
-            return Ok(());
-        }
-
-        Ok(())
-    }
-
-    /// Handle text selection drag - extends selection from anchor to current position
-    fn handle_text_selection_drag(&mut self, col: u16, row: u16) -> std::io::Result<()> {
-        use crate::model::event::Event;
-
-        let Some(split_id) = self.mouse_state.drag_selection_split else {
-            return Ok(());
-        };
-        let Some(anchor_position) = self.mouse_state.drag_selection_anchor else {
-            return Ok(());
-        };
-
-        // Find the buffer for this split
-        let buffer_id = self
-            .cached_layout
-            .split_areas
-            .iter()
-            .find(|(sid, _, _, _, _, _)| *sid == split_id)
-            .map(|(_, bid, _, _, _, _)| *bid);
-
-        let Some(buffer_id) = buffer_id else {
-            return Ok(());
-        };
-
-        // Find the content rect for this split
-        let content_rect = self
-            .cached_layout
-            .split_areas
-            .iter()
-            .find(|(sid, _, _, _, _, _)| *sid == split_id)
-            .map(|(_, _, rect, _, _, _)| *rect);
-
-        let Some(content_rect) = content_rect else {
-            return Ok(());
-        };
-
-        // Get cached view line mappings for this split
-        let cached_mappings = self
-            .cached_layout
-            .view_line_mappings
-            .get(&split_id)
-            .cloned();
-
-        // Get fallback from SplitViewState viewport
-        let fallback = self
-            .split_view_states
-            .get(&split_id)
-            .map(|vs| vs.viewport.top_byte)
-            .unwrap_or(0);
-
-        // Calculate the target position from screen coordinates
-        if let Some(state) = self.buffers.get_mut(&buffer_id) {
-            let gutter_width = state.margins.left_total_width() as u16;
-
-            let Some(target_position) = Self::screen_to_buffer_position(
-                col,
-                row,
-                content_rect,
-                gutter_width,
-                &cached_mappings,
-                fallback,
-                true, // Allow gutter clicks for drag selection
-            ) else {
-                return Ok(());
-            };
-
-            // Move cursor to target position while keeping anchor to create selection
-            let primary_cursor_id = state.cursors.primary_id();
-            let event = Event::MoveCursor {
-                cursor_id: primary_cursor_id,
-                old_position: 0,
-                new_position: target_position,
-                old_anchor: None,
-                new_anchor: Some(anchor_position), // Keep anchor to maintain selection
-                old_sticky_column: 0,
-                new_sticky_column: 0,
-            };
-
-            if let Some(event_log) = self.event_logs.get_mut(&buffer_id) {
-                event_log.append(event.clone());
-            }
-            state.apply(&event);
-        }
-
-        Ok(())
-    }
-
-    /// Handle file explorer border drag for resizing
-    pub(super) fn handle_file_explorer_border_drag(&mut self, col: u16) -> std::io::Result<()> {
-        let Some((start_col, _start_row)) = self.mouse_state.drag_start_position else {
-            return Ok(());
-        };
-        let Some(start_width) = self.mouse_state.drag_start_explorer_width else {
-            return Ok(());
-        };
-
-        // Calculate the delta in screen space
-        let delta = col as i32 - start_col as i32;
-        let total_width = self.terminal_width as i32;
-
-        if total_width > 0 {
-            // Convert screen delta to percentage delta
-            let percent_delta = delta as f32 / total_width as f32;
-            // Clamp the new width between 10% and 50%
-            let new_width = (start_width + percent_delta).clamp(0.1, 0.5);
-            self.file_explorer_width_percent = new_width;
-        }
-
-        Ok(())
-    }
-
-    /// Handle separator drag for split resizing
-    pub(super) fn handle_separator_drag(
-        &mut self,
-        col: u16,
-        row: u16,
-        split_id: SplitId,
-        direction: SplitDirection,
-    ) -> std::io::Result<()> {
-        let Some((start_col, start_row)) = self.mouse_state.drag_start_position else {
-            return Ok(());
-        };
-        let Some(start_ratio) = self.mouse_state.drag_start_ratio else {
-            return Ok(());
-        };
-        let Some(editor_area) = self.cached_layout.editor_content_area else {
-            return Ok(());
-        };
-
-        // Calculate the delta in screen space
-        let (delta, total_size) = match direction {
-            SplitDirection::Horizontal => {
-                // For horizontal splits, we move the separator up/down (row changes)
-                let delta = row as i32 - start_row as i32;
-                let total = editor_area.height as i32;
-                (delta, total)
-            }
-            SplitDirection::Vertical => {
-                // For vertical splits, we move the separator left/right (col changes)
-                let delta = col as i32 - start_col as i32;
-                let total = editor_area.width as i32;
-                (delta, total)
-            }
-        };
-
-        // Convert screen delta to ratio delta
-        // The ratio represents the fraction of space the first split gets
-        if total_size > 0 {
-            let ratio_delta = delta as f32 / total_size as f32;
-            let new_ratio = (start_ratio + ratio_delta).clamp(0.1, 0.9);
-
-            // Update the split ratio
-            let _ = self.split_manager.set_ratio(split_id, new_ratio);
-        }
-
-        Ok(())
-    }
-
-    /// Handle mouse events when settings modal is open
-    fn handle_settings_mouse(
-        &mut self,
-        mouse_event: crossterm::event::MouseEvent,
-    ) -> std::io::Result<bool> {
-        use crate::view::settings::{FocusPanel, SettingsHit};
-        use crossterm::event::{MouseButton, MouseEventKind};
-
-        let col = mouse_event.column;
-        let row = mouse_event.row;
-
-        // Track hover position and compute hover hit for visual feedback
-        match mouse_event.kind {
-            MouseEventKind::Moved => {
-                // Compute hover hit from cached layout
-                let hover_hit = self
-                    .cached_layout
-                    .settings_layout
-                    .as_ref()
-                    .and_then(|layout| layout.hit_test(col, row));
-
-                if let Some(ref mut state) = self.settings_state {
-                    let old_hit = state.hover_hit;
-                    state.hover_position = Some((col, row));
-                    state.hover_hit = hover_hit;
-                    // Re-render if hover target changed
-                    return Ok(old_hit != hover_hit);
-                }
-                return Ok(false);
-            }
-            MouseEventKind::ScrollUp => {
-                return Ok(self.settings_scroll_up(3));
-            }
-            MouseEventKind::ScrollDown => {
-                return Ok(self.settings_scroll_down(3));
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                return Ok(self.settings_scrollbar_drag(col, row));
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                // Handle click below
-            }
-            _ => return Ok(false),
-        }
-
-        // Use cached settings layout for hit testing
-        let hit = self
-            .cached_layout
-            .settings_layout
-            .as_ref()
-            .and_then(|layout| layout.hit_test(col, row));
-
-        let Some(hit) = hit else {
-            return Ok(false);
-        };
-
-        // Check if a dropdown is open and click is outside of it
-        // If so, cancel the dropdown and consume the click
-        if let Some(ref mut state) = self.settings_state {
-            if state.is_dropdown_open() {
-                let is_click_on_open_dropdown = matches!(
-                    hit,
-                    SettingsHit::ControlDropdown(idx) if idx == state.selected_item
-                );
-                if !is_click_on_open_dropdown {
-                    // Click outside dropdown - cancel and restore original value
-                    state.dropdown_cancel();
-                    return Ok(true);
-                }
-            }
-        }
-
-        match hit {
-            SettingsHit::Outside => {
-                // Click outside modal - close settings
-                if let Some(ref mut state) = self.settings_state {
-                    state.visible = false;
-                }
-            }
-            SettingsHit::Category(idx) => {
-                if let Some(ref mut state) = self.settings_state {
-                    state.focus_panel = FocusPanel::Categories;
-                    state.selected_category = idx;
-                    state.selected_item = 0;
-                    state.scroll_panel = crate::view::ui::ScrollablePanel::new();
-                    state.sub_focus = None;
-                }
-            }
-            SettingsHit::Item(idx) => {
-                if let Some(ref mut state) = self.settings_state {
-                    state.focus_panel = FocusPanel::Settings;
-                    state.selected_item = idx;
-                }
-            }
-            SettingsHit::ControlToggle(idx) => {
-                if let Some(ref mut state) = self.settings_state {
-                    state.focus_panel = FocusPanel::Settings;
-                    state.selected_item = idx;
-                }
-                self.settings_activate_current();
-            }
-            SettingsHit::ControlDecrement(idx) => {
-                if let Some(ref mut state) = self.settings_state {
-                    state.focus_panel = FocusPanel::Settings;
-                    state.selected_item = idx;
-                }
-                self.settings_decrement_current();
-            }
-            SettingsHit::ControlIncrement(idx) => {
-                if let Some(ref mut state) = self.settings_state {
-                    state.focus_panel = FocusPanel::Settings;
-                    state.selected_item = idx;
-                }
-                self.settings_increment_current();
-            }
-            SettingsHit::ControlDropdown(idx) => {
-                if let Some(ref mut state) = self.settings_state {
-                    state.focus_panel = FocusPanel::Settings;
-                    state.selected_item = idx;
-                }
-                self.settings_activate_current();
-            }
-            SettingsHit::ControlText(idx) => {
-                if let Some(ref mut state) = self.settings_state {
-                    state.focus_panel = FocusPanel::Settings;
-                    state.selected_item = idx;
-                    state.start_editing();
-                }
-            }
-            SettingsHit::ControlTextListRow(idx, _row_idx) => {
-                if let Some(ref mut state) = self.settings_state {
-                    state.focus_panel = FocusPanel::Settings;
-                    state.selected_item = idx;
-                    state.start_editing();
-                }
-            }
-            SettingsHit::ControlMapRow(idx, _row_idx) => {
-                if let Some(ref mut state) = self.settings_state {
-                    state.focus_panel = FocusPanel::Settings;
-                    state.selected_item = idx;
-                }
-            }
-            SettingsHit::SaveButton => {
-                self.save_settings();
-            }
-            SettingsHit::CancelButton => {
-                if let Some(ref mut state) = self.settings_state {
-                    state.visible = false;
-                }
-            }
-            SettingsHit::ResetButton => {
-                if let Some(ref mut state) = self.settings_state {
-                    state.reset_current_to_default();
-                }
-            }
-            SettingsHit::Background => {
-                // Click on background inside modal - do nothing
-            }
-            SettingsHit::Scrollbar => {
-                self.settings_scrollbar_click(row);
-            }
-            SettingsHit::SettingsPanel => {
-                // Click on settings panel area - do nothing (scroll handled above)
-            }
-        }
-
-        Ok(true)
-    }
-
-    /// Scroll settings panel up by delta items
-    fn settings_scroll_up(&mut self, delta: usize) -> bool {
-        self.settings_state
-            .as_mut()
-            .map(|state| state.scroll_up(delta))
-            .unwrap_or(false)
-    }
-
-    /// Scroll settings panel down by delta items
-    fn settings_scroll_down(&mut self, delta: usize) -> bool {
-        self.settings_state
-            .as_mut()
-            .map(|state| state.scroll_down(delta))
-            .unwrap_or(false)
-    }
-
-    /// Handle scrollbar click at the given row position
-    fn settings_scrollbar_click(&mut self, row: u16) {
-        if let Some(ref scrollbar_area) = self
-            .cached_layout
-            .settings_layout
-            .as_ref()
-            .and_then(|l| l.scrollbar_area)
-        {
-            if scrollbar_area.height > 0 {
-                let relative_y = row.saturating_sub(scrollbar_area.y);
-                let ratio = relative_y as f32 / scrollbar_area.height as f32;
-                if let Some(ref mut state) = self.settings_state {
-                    state.scroll_to_ratio(ratio);
-                }
-            }
-        }
-    }
-
-    /// Handle scrollbar drag at the given position
-    fn settings_scrollbar_drag(&mut self, col: u16, row: u16) -> bool {
-        if let Some(ref scrollbar_area) = self
-            .cached_layout
-            .settings_layout
-            .as_ref()
-            .and_then(|l| l.scrollbar_area)
-        {
-            // Check if we're in or near the scrollbar area (allow some horizontal tolerance)
-            let in_scrollbar_x = col >= scrollbar_area.x.saturating_sub(1)
-                && col <= scrollbar_area.x + scrollbar_area.width;
-            if in_scrollbar_x && scrollbar_area.height > 0 {
-                let relative_y = row.saturating_sub(scrollbar_area.y);
-                let ratio = relative_y as f32 / scrollbar_area.height as f32;
-                if let Some(ref mut state) = self.settings_state {
-                    return state.scroll_to_ratio(ratio);
-                }
-            }
-        }
-        false
     }
 
     /// Handle mouse wheel scroll event
@@ -4252,7 +1067,9 @@ impl Editor {
             if let Some(tokens) = view_transform_tokens {
                 // Use view-aware scrolling with the transform's tokens
                 use crate::view::ui::view_pipeline::ViewLineIterator;
-                let view_lines: Vec<_> = ViewLineIterator::new(&tokens).collect();
+                let tab_size = self.config.editor.tab_size;
+                let view_lines: Vec<_> =
+                    ViewLineIterator::new(&tokens, false, false, tab_size).collect();
                 view_state
                     .viewport
                     .scroll_view_lines(&view_lines, delta as isize);
@@ -4616,7 +1433,7 @@ impl Editor {
     /// Calculate buffer byte position from screen coordinates
     ///
     /// Returns None if the position cannot be determined (e.g., click in gutter for click handler)
-    fn screen_to_buffer_position(
+    pub(crate) fn screen_to_buffer_position(
         col: u16,
         row: u16,
         content_rect: ratatui::layout::Rect,
@@ -4881,206 +1698,56 @@ impl Editor {
         Ok(())
     }
 
-    /// Compute hover target for menu dropdown chain (main dropdown and submenus)
-    fn compute_menu_dropdown_hover(
-        &self,
-        col: u16,
-        row: u16,
-        menu: &crate::config::Menu,
-        menu_index: usize,
-        all_menus: &[crate::config::Menu],
-    ) -> Option<HoverTarget> {
-        use crate::config::MenuItem;
+    /// Start the line ending selection prompt
+    fn start_set_line_ending_prompt(&mut self) {
+        use crate::model::buffer::LineEnding;
 
-        // Calculate dropdown positions for the entire chain
-        let mut x_offset = 0usize;
-        for (idx, m) in all_menus.iter().enumerate() {
-            if idx == menu_index {
-                break;
-            }
-            x_offset += m.label.len() + 3;
-        }
+        let current_line_ending = self.active_state().buffer.line_ending();
 
-        let mut current_items: &[MenuItem] = &menu.items;
-        let mut current_x = x_offset as u16;
-        let mut current_y = 1u16;
+        let options = [
+            (LineEnding::LF, "LF", "Unix/Linux/Mac"),
+            (LineEnding::CRLF, "CRLF", "Windows"),
+            (LineEnding::CR, "CR", "Classic Mac"),
+        ];
 
-        let mut dropdown_rects = Vec::new();
+        let current_index = options
+            .iter()
+            .position(|(le, _, _)| *le == current_line_ending)
+            .unwrap_or(0);
 
-        for depth in 0..=self.menu_state.submenu_path.len() {
-            let max_width = current_items
-                .iter()
-                .filter_map(|item| match item {
-                    MenuItem::Action { label, .. } => Some(label.len() + 20),
-                    MenuItem::Submenu { label, .. } => Some(label.len() + 20),
-                    MenuItem::Separator { .. } => Some(20),
-                })
-                .max()
-                .unwrap_or(20)
-                .min(40) as u16;
-
-            let dropdown_height = current_items.len() as u16 + 2;
-
-            dropdown_rects.push((
-                current_x,
-                current_y,
-                max_width,
-                dropdown_height,
-                depth,
-                current_items.len(),
-            ));
-
-            if depth < self.menu_state.submenu_path.len() {
-                let submenu_idx = self.menu_state.submenu_path[depth];
-                if let Some(MenuItem::Submenu { items, .. }) = current_items.get(submenu_idx) {
-                    let next_x = current_x + max_width - 1;
-                    let next_y = current_y + submenu_idx as u16 + 1;
-                    current_items = items;
-                    current_x = next_x;
-                    current_y = next_y;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Check from deepest submenu to main dropdown
-        for (dx, dy, width, height, depth, item_count) in dropdown_rects.iter().rev() {
-            if col >= *dx && col < dx + width && row >= *dy && row < dy + height {
-                let item_row = row.saturating_sub(*dy + 1);
-                let item_idx = item_row as usize;
-
-                if item_idx < *item_count {
-                    if *depth == 0 {
-                        return Some(HoverTarget::MenuDropdownItem(menu_index, item_idx));
+        let suggestions: Vec<crate::input::commands::Suggestion> = options
+            .iter()
+            .map(|(le, name, desc)| {
+                let is_current = *le == current_line_ending;
+                crate::input::commands::Suggestion {
+                    text: format!("{} ({})", name, desc),
+                    description: if is_current {
+                        Some("current".to_string())
                     } else {
-                        return Some(HoverTarget::SubmenuItem(*depth, item_idx));
-                    }
+                        None
+                    },
+                    value: Some(name.to_string()),
+                    disabled: false,
+                    keybinding: None,
+                    source: None,
                 }
+            })
+            .collect();
+
+        self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
+            "Line ending: ".to_string(),
+            PromptType::SetLineEnding,
+            suggestions,
+        ));
+
+        if let Some(prompt) = self.prompt.as_mut() {
+            if !prompt.suggestions.is_empty() {
+                prompt.selected_suggestion = Some(current_index);
+                let (_, name, desc) = options[current_index];
+                prompt.input = format!("{} ({})", name, desc);
+                prompt.cursor_pos = prompt.input.len();
             }
         }
-
-        None
-    }
-
-    /// Handle click on menu dropdown chain (main dropdown and any open submenus)
-    /// Returns Some(Ok(())) if click was handled, None if click was outside all dropdowns
-    fn handle_menu_dropdown_click(
-        &mut self,
-        col: u16,
-        row: u16,
-        menu: &crate::config::Menu,
-        menu_index: usize,
-        all_menus: &[crate::config::Menu],
-    ) -> std::io::Result<Option<std::io::Result<()>>> {
-        use crate::config::MenuItem;
-
-        // Calculate dropdown positions for the entire chain
-        // Similar to render_dropdown_chain but for hit testing
-
-        // Calculate the x position of the top-level dropdown
-        let mut x_offset = 0usize;
-        for (idx, m) in all_menus.iter().enumerate() {
-            if idx == menu_index {
-                break;
-            }
-            x_offset += m.label.len() + 3;
-        }
-
-        let mut current_items: &[MenuItem] = &menu.items;
-        let mut current_x = x_offset as u16;
-        let mut current_y = 1u16; // Below menu bar
-
-        // Check each dropdown level from deepest to shallowest
-        // This ensures clicks on nested submenus take priority
-        let mut dropdown_rects = Vec::new();
-
-        for depth in 0..=self.menu_state.submenu_path.len() {
-            let max_width = current_items
-                .iter()
-                .filter_map(|item| match item {
-                    MenuItem::Action { label, .. } => Some(label.len() + 20),
-                    MenuItem::Submenu { label, .. } => Some(label.len() + 20),
-                    MenuItem::Separator { .. } => Some(20),
-                })
-                .max()
-                .unwrap_or(20)
-                .min(40) as u16;
-
-            let dropdown_height = current_items.len() as u16 + 2;
-
-            dropdown_rects.push((
-                current_x,
-                current_y,
-                max_width,
-                dropdown_height,
-                depth,
-                current_items.to_vec(),
-            ));
-
-            // Navigate to next level if there is one
-            if depth < self.menu_state.submenu_path.len() {
-                let submenu_idx = self.menu_state.submenu_path[depth];
-                if let Some(MenuItem::Submenu { items, .. }) = current_items.get(submenu_idx) {
-                    let next_x = current_x + max_width - 1;
-                    let next_y = current_y + submenu_idx as u16 + 1;
-                    current_items = items;
-                    current_x = next_x;
-                    current_y = next_y;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Check clicks from deepest submenu to main dropdown
-        for (dx, dy, width, height, depth, items) in dropdown_rects.iter().rev() {
-            if col >= *dx && col < dx + width && row >= *dy && row < dy + height {
-                // Click is inside this dropdown
-                let item_row = row.saturating_sub(*dy + 1); // -1 for border
-                let item_idx = item_row as usize;
-
-                if item_idx < items.len() {
-                    // Check what kind of item was clicked
-                    match &items[item_idx] {
-                        MenuItem::Separator { .. } => {
-                            // Clicked on separator - do nothing but consume the click
-                            return Ok(Some(Ok(())));
-                        }
-                        MenuItem::Submenu {
-                            items: submenu_items,
-                            ..
-                        } => {
-                            // Clicked on submenu - open it
-                            // First, truncate submenu_path to this depth
-                            self.menu_state.submenu_path.truncate(*depth);
-                            // Then add this submenu
-                            if !submenu_items.is_empty() {
-                                self.menu_state.submenu_path.push(item_idx);
-                                self.menu_state.highlighted_item = Some(0);
-                            }
-                            return Ok(Some(Ok(())));
-                        }
-                        MenuItem::Action { action, args, .. } => {
-                            // Clicked on action - execute it
-                            let action_name = action.clone();
-                            let action_args = args.clone();
-
-                            self.menu_state.close_menu();
-
-                            if let Some(action) = Action::from_str(&action_name, &action_args) {
-                                return Ok(Some(self.handle_action(action)));
-                            }
-                            return Ok(Some(Ok(())));
-                        }
-                    }
-                }
-                return Ok(Some(Ok(())));
-            }
-        }
-
-        // Click was outside all dropdowns
-        Ok(None)
     }
 
     /// Start the theme selection prompt with available themes
@@ -5366,7 +2033,7 @@ impl Editor {
     }
 
     /// Switch to a tab by its BufferId
-    fn switch_to_tab(&mut self, buffer_id: BufferId) {
+    pub(crate) fn switch_to_tab(&mut self, buffer_id: BufferId) {
         // Verify the buffer exists and is open in the current split
         let active_split = self.split_manager.active_split();
         let is_valid = self
@@ -5391,6 +2058,147 @@ impl Editor {
             self.position_history.commit_pending_movement();
 
             self.set_active_buffer(buffer_id);
+        }
+    }
+
+    /// Handle character insertion in prompt mode.
+    fn handle_insert_char_prompt(&mut self, c: char) -> std::io::Result<()> {
+        // Check if this is the query-replace confirmation prompt
+        if let Some(ref prompt) = self.prompt {
+            if prompt.prompt_type == PromptType::QueryReplaceConfirm {
+                return self.handle_interactive_replace_key(c);
+            }
+        }
+
+        // Reset history navigation when user starts typing
+        // This allows them to press Up to get back to history items
+        if let Some(ref prompt) = self.prompt {
+            match &prompt.prompt_type {
+                PromptType::Search | PromptType::ReplaceSearch | PromptType::QueryReplaceSearch => {
+                    self.search_history.reset_navigation();
+                }
+                PromptType::Replace { .. } | PromptType::QueryReplace { .. } => {
+                    self.replace_history.reset_navigation();
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(prompt) = self.prompt_mut() {
+            // Use insert_str to properly handle selection deletion
+            let s = c.to_string();
+            prompt.insert_str(&s);
+        }
+        self.update_prompt_suggestions();
+        Ok(())
+    }
+
+    /// Handle character insertion in normal editor mode.
+    fn handle_insert_char_editor(&mut self, c: char) -> std::io::Result<()> {
+        // Check if editing is disabled (show_cursors = false)
+        if self.is_editing_disabled() {
+            self.set_status_message("Editing disabled in this buffer".to_string());
+            return Ok(());
+        }
+
+        // Cancel any pending LSP requests since the text is changing
+        self.cancel_pending_lsp_requests();
+
+        if let Some(events) = self.action_to_events(Action::InsertChar(c)) {
+            // Wrap multiple events (multi-cursor) in a Batch for atomic undo
+            if events.len() > 1 {
+                let batch = Event::Batch {
+                    events: events.clone(),
+                    description: format!("Insert '{}'", c),
+                };
+                self.active_event_log_mut().append(batch.clone());
+                self.apply_event_to_active_buffer(&batch);
+            } else {
+                // Single cursor - no need for batch
+                for event in events {
+                    self.active_event_log_mut().append(event.clone());
+                    self.apply_event_to_active_buffer(&event);
+                }
+            }
+        }
+
+        // Auto-trigger signature help on '(' and ','
+        if c == '(' || c == ',' {
+            let _ = self.request_signature_help();
+        }
+
+        Ok(())
+    }
+
+    /// Apply an action by converting it to events.
+    ///
+    /// This is the catch-all handler for actions that can be converted to buffer events
+    /// (cursor movements, text edits, etc.). It handles batching for multi-cursor,
+    /// position history tracking, and editing permission checks.
+    fn apply_action_as_events(&mut self, action: Action) -> std::io::Result<()> {
+        // Get description before moving action
+        let action_description = format!("{:?}", action);
+
+        // Check if this is an editing action and editing is disabled
+        let is_editing_action = matches!(
+            action,
+            Action::InsertNewline
+                | Action::InsertTab
+                | Action::DeleteForward
+                | Action::DeleteWordBackward
+                | Action::DeleteWordForward
+                | Action::DeleteLine
+                | Action::IndentSelection
+                | Action::DedentSelection
+                | Action::ToggleComment
+        );
+
+        if is_editing_action && self.is_editing_disabled() {
+            self.set_status_message("Editing disabled in this buffer".to_string());
+            return Ok(());
+        }
+
+        if let Some(events) = self.action_to_events(action) {
+            // Wrap multiple events (multi-cursor) in a Batch for atomic undo
+            if events.len() > 1 {
+                let batch = Event::Batch {
+                    events: events.clone(),
+                    description: action_description,
+                };
+                self.active_event_log_mut().append(batch.clone());
+                self.apply_event_to_active_buffer(&batch);
+
+                // Track position history for all events in the batch
+                for event in &events {
+                    self.track_cursor_movement(event);
+                }
+            } else {
+                // Single cursor - no need for batch
+                for event in events {
+                    self.active_event_log_mut().append(event.clone());
+                    self.apply_event_to_active_buffer(&event);
+                    self.track_cursor_movement(&event);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Track cursor movement in position history if applicable.
+    fn track_cursor_movement(&mut self, event: &Event) {
+        if self.in_navigation {
+            return;
+        }
+
+        if let Event::MoveCursor {
+            new_position,
+            new_anchor,
+            ..
+        } = event
+        {
+            self.position_history
+                .record_movement(self.active_buffer(), *new_position, *new_anchor);
         }
     }
 }

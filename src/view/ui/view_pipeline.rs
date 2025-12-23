@@ -115,14 +115,6 @@ impl LineStart {
     }
 }
 
-/// Standard tab width for terminal display
-pub const TAB_WIDTH: usize = 8;
-
-/// Expand a tab to spaces based on current column
-fn tab_expansion_width(col: usize) -> usize {
-    TAB_WIDTH - (col % TAB_WIDTH)
-}
-
 /// Iterator that converts a token stream into display lines
 pub struct ViewLineIterator<'a> {
     tokens: &'a [ViewTokenWire],
@@ -133,50 +125,38 @@ pub struct ViewLineIterator<'a> {
     binary_mode: bool,
     /// Whether to parse ANSI escape sequences (giving them zero visual width)
     ansi_aware: bool,
+    /// Tab width for rendering (number of spaces per tab)
+    tab_size: usize,
 }
 
 impl<'a> ViewLineIterator<'a> {
-    pub fn new(tokens: &'a [ViewTokenWire]) -> Self {
-        Self {
-            tokens,
-            token_idx: 0,
-            next_line_start: LineStart::Beginning,
-            binary_mode: false,
-            ansi_aware: false,
-        }
-    }
-
-    /// Create a new ViewLineIterator with binary mode enabled
-    pub fn with_binary_mode(tokens: &'a [ViewTokenWire], binary: bool) -> Self {
-        Self {
-            tokens,
-            token_idx: 0,
-            next_line_start: LineStart::Beginning,
-            binary_mode: binary,
-            ansi_aware: false,
-        }
-    }
-
-    /// Create a new ViewLineIterator with ANSI awareness enabled
-    pub fn with_ansi_aware(tokens: &'a [ViewTokenWire], ansi_aware: bool) -> Self {
-        Self {
-            tokens,
-            token_idx: 0,
-            next_line_start: LineStart::Beginning,
-            binary_mode: false,
-            ansi_aware,
-        }
-    }
-
-    /// Create a new ViewLineIterator with both binary mode and ANSI awareness configurable
-    pub fn with_options(tokens: &'a [ViewTokenWire], binary_mode: bool, ansi_aware: bool) -> Self {
+    /// Create a new ViewLineIterator with all options
+    ///
+    /// - `tokens`: The token stream to convert to display lines
+    /// - `binary_mode`: Whether to render unprintable chars as code points
+    /// - `ansi_aware`: Whether to parse ANSI escape sequences (giving them zero visual width)
+    /// - `tab_size`: Tab width for rendering (number of spaces per tab, must be > 0)
+    pub fn new(
+        tokens: &'a [ViewTokenWire],
+        binary_mode: bool,
+        ansi_aware: bool,
+        tab_size: usize,
+    ) -> Self {
+        debug_assert!(tab_size > 0, "tab_size must be > 0");
         Self {
             tokens,
             token_idx: 0,
             next_line_start: LineStart::Beginning,
             binary_mode,
             ansi_aware,
+            tab_size,
         }
+    }
+
+    /// Expand a tab to spaces based on current column and configured tab_size
+    #[inline]
+    fn tab_expansion_width(&self, col: usize) -> usize {
+        self.tab_size - (col % self.tab_size)
     }
 }
 
@@ -334,7 +314,7 @@ impl<'a> Iterator for ViewLineIterator<'a> {
                             // Tab expands to spaces - record start position
                             let tab_start_pos = char_source_bytes.len();
                             tab_starts.insert(tab_start_pos);
-                            let spaces = tab_expansion_width(col);
+                            let spaces = self.tab_expansion_width(col);
 
                             // Tab is ONE character that expands to multiple visual columns
                             let char_idx = char_source_bytes.len();
@@ -534,8 +514,12 @@ impl Layout {
     }
 
     /// Build a Layout from a token stream
-    pub fn from_tokens(tokens: &[ViewTokenWire], source_range: Range<usize>) -> Self {
-        let lines: Vec<ViewLine> = ViewLineIterator::new(tokens).collect();
+    pub fn from_tokens(
+        tokens: &[ViewTokenWire],
+        source_range: Range<usize>,
+        tab_size: usize,
+    ) -> Self {
+        let lines: Vec<ViewLine> = ViewLineIterator::new(tokens, false, false, tab_size).collect();
         Self::new(lines, source_range)
     }
 
@@ -644,7 +628,7 @@ mod tests {
             make_newline_token(Some(13)),
         ];
 
-        let lines: Vec<_> = ViewLineIterator::new(&tokens).collect();
+        let lines: Vec<_> = ViewLineIterator::new(&tokens, false, false, 4).collect();
 
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].text, "Line 1\n");
@@ -665,7 +649,7 @@ mod tests {
             make_newline_token(Some(21)),
         ];
 
-        let lines: Vec<_> = ViewLineIterator::new(&tokens).collect();
+        let lines: Vec<_> = ViewLineIterator::new(&tokens, false, false, 4).collect();
 
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].line_start, LineStart::Beginning);
@@ -690,7 +674,7 @@ mod tests {
             make_newline_token(Some(6)),
         ];
 
-        let lines: Vec<_> = ViewLineIterator::new(&tokens).collect();
+        let lines: Vec<_> = ViewLineIterator::new(&tokens, false, false, 4).collect();
 
         assert_eq!(lines.len(), 2);
 
@@ -738,7 +722,7 @@ mod tests {
             make_newline_token(Some(33)),
         ];
 
-        let lines: Vec<_> = ViewLineIterator::new(&tokens).collect();
+        let lines: Vec<_> = ViewLineIterator::new(&tokens, false, false, 4).collect();
 
         assert_eq!(lines.len(), 5);
 
@@ -819,12 +803,12 @@ mod tests {
         ];
 
         // Without binary mode - control chars would be rendered raw or as replacement
-        let lines_normal: Vec<_> = ViewLineIterator::new(&tokens).collect();
+        let lines_normal: Vec<_> = ViewLineIterator::new(&tokens, false, false, 4).collect();
         assert_eq!(lines_normal.len(), 1);
         // In normal mode, we don't format control chars specially
 
         // With binary mode - control chars should be formatted as <XX>
-        let lines_binary: Vec<_> = ViewLineIterator::with_binary_mode(&tokens, true).collect();
+        let lines_binary: Vec<_> = ViewLineIterator::new(&tokens, true, false, 4).collect();
         assert_eq!(lines_binary.len(), 1);
         assert!(
             lines_binary[0].text.contains("<00>"),
@@ -849,7 +833,7 @@ mod tests {
             style: None,
         }];
 
-        let lines: Vec<_> = ViewLineIterator::with_binary_mode(&tokens, true).collect();
+        let lines: Vec<_> = ViewLineIterator::new(&tokens, true, false, 4).collect();
 
         // Should have rendered the 0x1A as <1A>
         let combined: String = lines.iter().map(|l| l.text.as_str()).collect();
@@ -871,7 +855,7 @@ mod tests {
             make_newline_token(Some(15)),
         ];
 
-        let lines: Vec<_> = ViewLineIterator::with_binary_mode(&tokens, true).collect();
+        let lines: Vec<_> = ViewLineIterator::new(&tokens, true, false, 4).collect();
         assert_eq!(lines.len(), 1);
         assert!(
             lines[0].text.contains("Normal text 123"),
@@ -889,7 +873,7 @@ mod tests {
             make_newline_token(Some(6)),
         ];
 
-        let lines: Vec<_> = ViewLineIterator::new(&tokens).collect();
+        let lines: Vec<_> = ViewLineIterator::new(&tokens, false, false, 4).collect();
         assert_eq!(lines.len(), 1);
 
         // visual_to_char should have one entry per visual column
@@ -952,7 +936,7 @@ mod tests {
             make_newline_token(Some(5)),
         ];
 
-        let lines: Vec<_> = ViewLineIterator::new(&tokens).collect();
+        let lines: Vec<_> = ViewLineIterator::new(&tokens, false, false, 4).collect();
         assert_eq!(lines.len(), 1);
 
         // a=1 col, 你=2 cols, b=1 col, \n=1 col = 5 total visual width
@@ -996,6 +980,155 @@ mod tests {
             lines[0].source_byte_at_visual_col(4),
             Some(5),
             "Column 4 (newline) should map to byte 5"
+        );
+    }
+
+    // ==================== CRLF Mode Tests ====================
+
+    /// Test that ViewLineIterator correctly maps char_source_bytes for CRLF content.
+    /// In CRLF mode, the Newline token is emitted at the \r position, and \n is skipped.
+    /// This test verifies that char_source_bytes correctly tracks source byte positions.
+    #[test]
+    fn test_crlf_char_source_bytes_single_line() {
+        // Simulate CRLF content "abc\r\n" where:
+        // - bytes: a=0, b=1, c=2, \r=3, \n=4
+        // - Newline token at source_offset=3 (position of \r)
+        let tokens = vec![
+            make_text_token("abc", Some(0)),
+            make_newline_token(Some(3)), // \r position in CRLF
+        ];
+
+        let lines: Vec<_> = ViewLineIterator::new(&tokens, false, false, 4).collect();
+        assert_eq!(lines.len(), 1);
+
+        // The ViewLine should have: 'a', 'b', 'c', '\n'
+        assert_eq!(lines[0].text, "abc\n");
+
+        // char_source_bytes should correctly map each display char to source bytes
+        assert_eq!(
+            lines[0].char_source_bytes.len(),
+            4,
+            "Expected 4 chars: a, b, c, newline"
+        );
+        assert_eq!(
+            lines[0].char_source_bytes[0],
+            Some(0),
+            "char 'a' should map to byte 0"
+        );
+        assert_eq!(
+            lines[0].char_source_bytes[1],
+            Some(1),
+            "char 'b' should map to byte 1"
+        );
+        assert_eq!(
+            lines[0].char_source_bytes[2],
+            Some(2),
+            "char 'c' should map to byte 2"
+        );
+        assert_eq!(
+            lines[0].char_source_bytes[3],
+            Some(3),
+            "newline should map to byte 3 (\\r position)"
+        );
+    }
+
+    /// Test CRLF char_source_bytes across multiple lines.
+    /// This is the critical test for the accumulating offset bug.
+    #[test]
+    fn test_crlf_char_source_bytes_multiple_lines() {
+        // Simulate CRLF content "abc\r\ndef\r\nghi\r\n" where:
+        // Line 1: a=0, b=1, c=2, \r=3, \n=4 (5 bytes)
+        // Line 2: d=5, e=6, f=7, \r=8, \n=9 (5 bytes)
+        // Line 3: g=10, h=11, i=12, \r=13, \n=14 (5 bytes)
+        let tokens = vec![
+            // Line 1
+            make_text_token("abc", Some(0)),
+            make_newline_token(Some(3)), // \r at byte 3
+            // Line 2
+            make_text_token("def", Some(5)),
+            make_newline_token(Some(8)), // \r at byte 8
+            // Line 3
+            make_text_token("ghi", Some(10)),
+            make_newline_token(Some(13)), // \r at byte 13
+        ];
+
+        let lines: Vec<_> = ViewLineIterator::new(&tokens, false, false, 4).collect();
+        assert_eq!(lines.len(), 3);
+
+        // Line 1 verification
+        assert_eq!(lines[0].text, "abc\n");
+        assert_eq!(
+            lines[0].char_source_bytes,
+            vec![Some(0), Some(1), Some(2), Some(3)],
+            "Line 1 char_source_bytes mismatch"
+        );
+
+        // Line 2 verification - THIS IS WHERE THE BUG WOULD MANIFEST
+        // If there's an off-by-one per line, line 2 might have wrong offsets
+        assert_eq!(lines[1].text, "def\n");
+        assert_eq!(
+            lines[1].char_source_bytes,
+            vec![Some(5), Some(6), Some(7), Some(8)],
+            "Line 2 char_source_bytes mismatch - possible CRLF offset drift"
+        );
+
+        // Line 3 verification - error accumulates
+        assert_eq!(lines[2].text, "ghi\n");
+        assert_eq!(
+            lines[2].char_source_bytes,
+            vec![Some(10), Some(11), Some(12), Some(13)],
+            "Line 3 char_source_bytes mismatch - CRLF offset drift accumulated"
+        );
+    }
+
+    /// Test CRLF visual column to source byte mapping.
+    /// Verifies source_byte_at_visual_col works correctly for CRLF content.
+    #[test]
+    fn test_crlf_visual_to_source_mapping() {
+        // CRLF content "ab\r\ncd\r\n"
+        // Line 1: a=0, b=1, \r=2, \n=3
+        // Line 2: c=4, d=5, \r=6, \n=7
+        let tokens = vec![
+            make_text_token("ab", Some(0)),
+            make_newline_token(Some(2)),
+            make_text_token("cd", Some(4)),
+            make_newline_token(Some(6)),
+        ];
+
+        let lines: Vec<_> = ViewLineIterator::new(&tokens, false, false, 4).collect();
+
+        // Line 1: visual columns 0,1 should map to bytes 0,1
+        assert_eq!(
+            lines[0].source_byte_at_visual_col(0),
+            Some(0),
+            "Line 1 col 0"
+        );
+        assert_eq!(
+            lines[0].source_byte_at_visual_col(1),
+            Some(1),
+            "Line 1 col 1"
+        );
+        assert_eq!(
+            lines[0].source_byte_at_visual_col(2),
+            Some(2),
+            "Line 1 col 2 (newline)"
+        );
+
+        // Line 2: visual columns 0,1 should map to bytes 4,5
+        assert_eq!(
+            lines[1].source_byte_at_visual_col(0),
+            Some(4),
+            "Line 2 col 0"
+        );
+        assert_eq!(
+            lines[1].source_byte_at_visual_col(1),
+            Some(5),
+            "Line 2 col 1"
+        );
+        assert_eq!(
+            lines[1].source_byte_at_visual_col(2),
+            Some(6),
+            "Line 2 col 2 (newline)"
         );
     }
 }

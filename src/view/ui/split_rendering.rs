@@ -48,6 +48,103 @@ fn push_span_with_map(
     spans.push(Span::styled(text, style));
 }
 
+/// Debug tag style - dim/muted color to distinguish from actual content
+fn debug_tag_style() -> Style {
+    Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM)
+}
+
+/// Push a debug tag span (no map entries since these aren't real content)
+fn push_debug_tag(spans: &mut Vec<Span<'static>>, map: &mut Vec<Option<usize>>, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    // Debug tags don't map to source positions - they're visual-only
+    for ch in text.chars() {
+        let width = char_width(ch);
+        for _ in 0..width {
+            map.push(None);
+        }
+    }
+    spans.push(Span::styled(text, debug_tag_style()));
+}
+
+/// Context for tracking active spans in debug mode
+#[derive(Default)]
+struct DebugSpanTracker {
+    /// Currently active highlight span (byte range)
+    active_highlight: Option<Range<usize>>,
+    /// Currently active overlay spans (byte ranges)
+    active_overlays: Vec<Range<usize>>,
+}
+
+impl DebugSpanTracker {
+    /// Get opening tags for spans that start at this byte position
+    fn get_opening_tags(
+        &mut self,
+        byte_pos: Option<usize>,
+        highlight_spans: &[crate::primitives::highlighter::HighlightSpan],
+        viewport_overlays: &[(crate::view::overlay::Overlay, Range<usize>)],
+    ) -> Vec<String> {
+        let mut tags = Vec::new();
+
+        if let Some(bp) = byte_pos {
+            // Check if we're entering a new highlight span
+            if let Some(span) = highlight_spans.iter().find(|s| s.range.start == bp) {
+                tags.push(format!("<hl:{}-{}>", span.range.start, span.range.end));
+                self.active_highlight = Some(span.range.clone());
+            }
+
+            // Check if we're entering new overlay spans
+            for (overlay, range) in viewport_overlays.iter() {
+                if range.start == bp {
+                    let overlay_type = match &overlay.face {
+                        crate::view::overlay::OverlayFace::Underline { .. } => "ul",
+                        crate::view::overlay::OverlayFace::Background { .. } => "bg",
+                        crate::view::overlay::OverlayFace::Foreground { .. } => "fg",
+                        crate::view::overlay::OverlayFace::Style { .. } => "st",
+                    };
+                    tags.push(format!("<{}:{}-{}>", overlay_type, range.start, range.end));
+                    self.active_overlays.push(range.clone());
+                }
+            }
+        }
+
+        tags
+    }
+
+    /// Get closing tags for spans that end at this byte position
+    fn get_closing_tags(&mut self, byte_pos: Option<usize>) -> Vec<String> {
+        let mut tags = Vec::new();
+
+        if let Some(bp) = byte_pos {
+            // Check if we're exiting the active highlight span
+            if let Some(ref range) = self.active_highlight {
+                if bp >= range.end {
+                    tags.push("</hl>".to_string());
+                    self.active_highlight = None;
+                }
+            }
+
+            // Check if we're exiting any overlay spans
+            let mut closed_indices = Vec::new();
+            for (i, range) in self.active_overlays.iter().enumerate() {
+                if bp >= range.end {
+                    tags.push("</ov>".to_string());
+                    closed_indices.push(i);
+                }
+            }
+            // Remove closed overlays (in reverse order to preserve indices)
+            for i in closed_indices.into_iter().rev() {
+                self.active_overlays.remove(i);
+            }
+        }
+
+        tags
+    }
+}
+
 /// Processed view data containing display lines from the view pipeline
 struct ViewData {
     /// Display lines with all token information preserved
@@ -970,6 +1067,7 @@ impl SplitRenderer {
     ) -> ViewData {
         // Check if buffer is binary before building tokens
         let is_binary = state.buffer.is_binary();
+        let line_ending = state.buffer.line_ending();
 
         // Build base token stream from source
         let base_tokens = Self::build_base_tokens(
@@ -978,6 +1076,7 @@ impl SplitRenderer {
             estimated_line_length,
             visible_count,
             is_binary,
+            line_ending,
         );
 
         // Use plugin transform if available, otherwise use base tokens
@@ -995,7 +1094,7 @@ impl SplitRenderer {
         let is_binary = state.buffer.is_binary();
         let ansi_aware = !is_binary; // ANSI parsing for normal text files
         let source_lines: Vec<ViewLine> =
-            ViewLineIterator::with_options(&tokens, is_binary, ansi_aware).collect();
+            ViewLineIterator::new(&tokens, is_binary, ansi_aware, state.tab_size).collect();
 
         // Inject virtual lines (LineAbove/LineBelow) from VirtualTextManager
         let lines = Self::inject_virtual_lines(source_lines, state);
@@ -1118,7 +1217,9 @@ impl SplitRenderer {
         estimated_line_length: usize,
         visible_count: usize,
         is_binary: bool,
+        line_ending: crate::model::buffer::LineEnding,
     ) -> Vec<crate::services::plugins::api::ViewTokenWire> {
+        use crate::model::buffer::LineEnding;
         use crate::services::plugins::api::{ViewTokenWire, ViewTokenWireKind};
 
         let mut tokens = Vec::new();
@@ -1141,11 +1242,44 @@ impl SplitRenderer {
         while lines_seen < max_lines {
             if let Some((line_start, line_content)) = iter.next() {
                 let mut byte_offset = 0usize;
+                let content_bytes = line_content.as_bytes();
+                let mut skip_next_lf = false; // Track if we should skip \n after \r in CRLF
                 for ch in line_content.chars() {
                     let ch_len = ch.len_utf8();
                     let source_offset = Some(line_start + byte_offset);
 
                     match ch {
+                        '\r' => {
+                            // In CRLF mode with \r\n: emit Newline at \r position, skip the \n
+                            // This allows cursor at \r (end of line) to be visible
+                            // In LF/Unix files, ANY \r is unusual and should be shown as <0D>
+                            let is_crlf_file = line_ending == LineEnding::CRLF;
+                            let next_byte = content_bytes.get(byte_offset + 1);
+                            if is_crlf_file && next_byte == Some(&b'\n') {
+                                // CRLF: emit Newline token at \r position for cursor visibility
+                                tokens.push(ViewTokenWire {
+                                    source_offset,
+                                    kind: ViewTokenWireKind::Newline,
+                                    style: None,
+                                });
+                                // Mark to skip the following \n in the char iterator
+                                skip_next_lf = true;
+                                byte_offset += ch_len;
+                                continue;
+                            }
+                            // LF file or standalone \r - show as control character
+                            tokens.push(ViewTokenWire {
+                                source_offset,
+                                kind: ViewTokenWireKind::BinaryByte(ch as u8),
+                                style: None,
+                            });
+                        }
+                        '\n' if skip_next_lf => {
+                            // Skip \n that follows \r in CRLF mode (already emitted Newline at \r)
+                            skip_next_lf = false;
+                            byte_offset += ch_len;
+                            continue;
+                        }
                         '\n' => {
                             tokens.push(ViewTokenWire {
                                 source_offset,
@@ -1386,6 +1520,7 @@ impl SplitRenderer {
         estimated_line_length: usize,
         visible_count: usize,
         is_binary: bool,
+        line_ending: crate::model::buffer::LineEnding,
     ) -> Vec<crate::services::plugins::api::ViewTokenWire> {
         Self::build_base_tokens(
             buffer,
@@ -1393,6 +1528,7 @@ impl SplitRenderer {
             estimated_line_length,
             visible_count,
             is_binary,
+            line_ending,
         )
     }
 
@@ -1977,6 +2113,13 @@ impl SplitRenderer {
             // Track visible characters separately from byte position for ANSI handling
             let mut visible_char_count = 0usize;
 
+            // Debug mode: track active highlight/overlay spans for WordPerfect-style reveal codes
+            let mut debug_tracker = if state.debug_highlight_mode {
+                Some(DebugSpanTracker::default())
+            } else {
+                None
+            };
+
             let mut chars_iterator = line_content.chars().peekable();
             while let Some(ch) = chars_iterator.next() {
                 // Get source byte for this character using character index
@@ -2017,12 +2160,8 @@ impl SplitRenderer {
                 // Performance: skip expensive style calculations for characters beyond visible range
                 // Use visible_char_count (not byte_index) since ANSI codes don't take up visible space
                 if visible_char_count > max_chars_to_process {
-                    // Fast path: just count remaining characters without processing
+                    // Fast path: skip remaining characters without processing
                     // This is critical for performance with very long lines (e.g., 100KB single line)
-                    byte_index += ch.len_utf8();
-                    for remaining_ch in chars_iterator.by_ref() {
-                        byte_index += remaining_ch.len_utf8();
-                    }
                     break;
                 }
 
@@ -2089,15 +2228,21 @@ impl SplitRenderer {
                     });
 
                     // Determine display character (tabs already expanded in ViewLineIterator)
-                    // Show tab indicator (→) at the start of tab expansions
+                    // Show tab indicator (→) at the start of tab expansions (if enabled for this language)
                     let tab_indicator: String;
                     let display_char: &str = if is_cursor && lsp_waiting && is_active {
                         "⋯"
+                    } else if debug_tracker.is_some() && ch == '\r' {
+                        // Debug mode: show CR explicitly
+                        "\\r"
+                    } else if debug_tracker.is_some() && ch == '\n' {
+                        // Debug mode: show LF explicitly
+                        "\\n"
                     } else if is_cursor && is_active && ch == '\n' {
                         ""
                     } else if ch == '\n' {
                         ""
-                    } else if is_tab_start {
+                    } else if is_tab_start && state.show_whitespace_tabs {
                         // Visual indicator for tab: show → at the first position
                         tab_indicator = "→".to_string();
                         &tab_indicator
@@ -2125,6 +2270,29 @@ impl SplitRenderer {
                     }
 
                     if !display_char.is_empty() {
+                        // Debug mode: insert opening tags for spans starting at this position
+                        if let Some(ref mut tracker) = debug_tracker {
+                            let opening_tags = tracker.get_opening_tags(
+                                byte_pos,
+                                highlight_spans,
+                                viewport_overlays,
+                            );
+                            for tag in opening_tags {
+                                push_debug_tag(&mut line_spans, &mut line_view_map, tag);
+                            }
+                        }
+
+                        // Debug mode: show byte position before each character
+                        if debug_tracker.is_some() {
+                            if let Some(bp) = byte_pos {
+                                push_debug_tag(
+                                    &mut line_spans,
+                                    &mut line_view_map,
+                                    format!("[{}]", bp),
+                                );
+                            }
+                        }
+
                         push_span_with_map(
                             &mut line_spans,
                             &mut line_view_map,
@@ -2132,6 +2300,17 @@ impl SplitRenderer {
                             style,
                             byte_pos,
                         );
+
+                        // Debug mode: insert closing tags for spans ending at this position
+                        // Check using the NEXT byte position to see if we're leaving a span
+                        if let Some(ref mut tracker) = debug_tracker {
+                            // Look ahead to next byte position to determine closing tags
+                            let next_byte_pos = byte_pos.map(|bp| bp + ch.len_utf8());
+                            let closing_tags = tracker.get_closing_tags(next_byte_pos);
+                            for tag in closing_tags {
+                                push_debug_tag(&mut line_spans, &mut line_view_map, tag);
+                            }
+                        }
                     }
 
                     // Track cursor position for zero-width characters
@@ -3497,4 +3676,401 @@ mod tests {
     // - test_wrapped_continuation
     // - test_injected_header_then_source
     // - test_mixed_scenario
+
+    // ==================== CRLF Tokenization Tests ====================
+
+    use crate::model::buffer::LineEnding;
+    use crate::services::plugins::api::{ViewTokenWire, ViewTokenWireKind};
+
+    /// Helper to extract source_offset from tokens for easier assertion
+    fn extract_token_offsets(tokens: &[ViewTokenWire]) -> Vec<(String, Option<usize>)> {
+        tokens
+            .iter()
+            .map(|t| {
+                let kind_str = match &t.kind {
+                    ViewTokenWireKind::Text(s) => format!("Text({})", s),
+                    ViewTokenWireKind::Newline => "Newline".to_string(),
+                    ViewTokenWireKind::Space => "Space".to_string(),
+                    ViewTokenWireKind::Break => "Break".to_string(),
+                    ViewTokenWireKind::BinaryByte(b) => format!("Byte(0x{:02x})", b),
+                };
+                (kind_str, t.source_offset)
+            })
+            .collect()
+    }
+
+    /// Test tokenization of CRLF content with a single line.
+    /// Verifies that Newline token is at \r position and \n is skipped.
+    #[test]
+    fn test_build_base_tokens_crlf_single_line() {
+        // Content: "abc\r\n" (5 bytes: a=0, b=1, c=2, \r=3, \n=4)
+        let content = b"abc\r\n";
+        let mut buffer = Buffer::from_bytes(content.to_vec());
+        buffer.set_line_ending(LineEnding::CRLF);
+
+        let tokens = SplitRenderer::build_base_tokens_for_hook(
+            &mut buffer,
+            0,     // top_byte
+            80,    // estimated_line_length
+            10,    // visible_count
+            false, // is_binary
+            LineEnding::CRLF,
+        );
+
+        let offsets = extract_token_offsets(&tokens);
+
+        // Should have: Text("abc") at 0, Newline at 3
+        // The \n at byte 4 should be skipped
+        assert!(
+            offsets
+                .iter()
+                .any(|(kind, off)| kind == "Text(abc)" && *off == Some(0)),
+            "Expected Text(abc) at offset 0, got: {:?}",
+            offsets
+        );
+        assert!(
+            offsets
+                .iter()
+                .any(|(kind, off)| kind == "Newline" && *off == Some(3)),
+            "Expected Newline at offset 3 (\\r position), got: {:?}",
+            offsets
+        );
+
+        // Verify there's only one Newline token
+        let newline_count = offsets.iter().filter(|(k, _)| k == "Newline").count();
+        assert_eq!(
+            newline_count, 1,
+            "Should have exactly 1 Newline token for CRLF, got {}: {:?}",
+            newline_count, offsets
+        );
+    }
+
+    /// Test tokenization of CRLF content with multiple lines.
+    /// This verifies that source_offset correctly accumulates across lines.
+    #[test]
+    fn test_build_base_tokens_crlf_multiple_lines() {
+        // Content: "abc\r\ndef\r\nghi\r\n" (15 bytes)
+        // Line 1: a=0, b=1, c=2, \r=3, \n=4
+        // Line 2: d=5, e=6, f=7, \r=8, \n=9
+        // Line 3: g=10, h=11, i=12, \r=13, \n=14
+        let content = b"abc\r\ndef\r\nghi\r\n";
+        let mut buffer = Buffer::from_bytes(content.to_vec());
+        buffer.set_line_ending(LineEnding::CRLF);
+
+        let tokens = SplitRenderer::build_base_tokens_for_hook(
+            &mut buffer,
+            0,
+            80,
+            10,
+            false,
+            LineEnding::CRLF,
+        );
+
+        let offsets = extract_token_offsets(&tokens);
+
+        // Expected tokens:
+        // Text("abc") at 0, Newline at 3
+        // Text("def") at 5, Newline at 8
+        // Text("ghi") at 10, Newline at 13
+
+        // Verify line 1 tokens
+        assert!(
+            offsets
+                .iter()
+                .any(|(kind, off)| kind == "Text(abc)" && *off == Some(0)),
+            "Line 1: Expected Text(abc) at 0, got: {:?}",
+            offsets
+        );
+        assert!(
+            offsets
+                .iter()
+                .any(|(kind, off)| kind == "Newline" && *off == Some(3)),
+            "Line 1: Expected Newline at 3, got: {:?}",
+            offsets
+        );
+
+        // Verify line 2 tokens - THIS IS WHERE OFFSET DRIFT WOULD APPEAR
+        assert!(
+            offsets
+                .iter()
+                .any(|(kind, off)| kind == "Text(def)" && *off == Some(5)),
+            "Line 2: Expected Text(def) at 5, got: {:?}",
+            offsets
+        );
+        assert!(
+            offsets
+                .iter()
+                .any(|(kind, off)| kind == "Newline" && *off == Some(8)),
+            "Line 2: Expected Newline at 8, got: {:?}",
+            offsets
+        );
+
+        // Verify line 3 tokens - DRIFT ACCUMULATES HERE
+        assert!(
+            offsets
+                .iter()
+                .any(|(kind, off)| kind == "Text(ghi)" && *off == Some(10)),
+            "Line 3: Expected Text(ghi) at 10, got: {:?}",
+            offsets
+        );
+        assert!(
+            offsets
+                .iter()
+                .any(|(kind, off)| kind == "Newline" && *off == Some(13)),
+            "Line 3: Expected Newline at 13, got: {:?}",
+            offsets
+        );
+
+        // Verify exactly 3 Newline tokens
+        let newline_count = offsets.iter().filter(|(k, _)| k == "Newline").count();
+        assert_eq!(newline_count, 3, "Should have 3 Newline tokens");
+    }
+
+    /// Test tokenization of LF content to compare with CRLF.
+    /// LF mode should NOT skip anything - each character gets its own offset.
+    #[test]
+    fn test_build_base_tokens_lf_mode_for_comparison() {
+        // Content: "abc\ndef\n" (8 bytes)
+        // Line 1: a=0, b=1, c=2, \n=3
+        // Line 2: d=4, e=5, f=6, \n=7
+        let content = b"abc\ndef\n";
+        let mut buffer = Buffer::from_bytes(content.to_vec());
+        buffer.set_line_ending(LineEnding::LF);
+
+        let tokens = SplitRenderer::build_base_tokens_for_hook(
+            &mut buffer,
+            0,
+            80,
+            10,
+            false,
+            LineEnding::LF,
+        );
+
+        let offsets = extract_token_offsets(&tokens);
+
+        // Verify LF offsets
+        assert!(
+            offsets
+                .iter()
+                .any(|(kind, off)| kind == "Text(abc)" && *off == Some(0)),
+            "LF Line 1: Expected Text(abc) at 0"
+        );
+        assert!(
+            offsets
+                .iter()
+                .any(|(kind, off)| kind == "Newline" && *off == Some(3)),
+            "LF Line 1: Expected Newline at 3"
+        );
+        assert!(
+            offsets
+                .iter()
+                .any(|(kind, off)| kind == "Text(def)" && *off == Some(4)),
+            "LF Line 2: Expected Text(def) at 4"
+        );
+        assert!(
+            offsets
+                .iter()
+                .any(|(kind, off)| kind == "Newline" && *off == Some(7)),
+            "LF Line 2: Expected Newline at 7"
+        );
+    }
+
+    /// Test that CRLF in LF-mode file shows \r as control character.
+    /// This verifies that \r is rendered as <0D> in LF files.
+    #[test]
+    fn test_build_base_tokens_crlf_in_lf_mode_shows_control_char() {
+        // Content: "abc\r\n" but buffer is in LF mode
+        let content = b"abc\r\n";
+        let mut buffer = Buffer::from_bytes(content.to_vec());
+        buffer.set_line_ending(LineEnding::LF); // Force LF mode
+
+        let tokens = SplitRenderer::build_base_tokens_for_hook(
+            &mut buffer,
+            0,
+            80,
+            10,
+            false,
+            LineEnding::LF,
+        );
+
+        let offsets = extract_token_offsets(&tokens);
+
+        // In LF mode, \r should be rendered as BinaryByte(0x0d)
+        assert!(
+            offsets.iter().any(|(kind, _)| kind == "Byte(0x0d)"),
+            "LF mode should render \\r as control char <0D>, got: {:?}",
+            offsets
+        );
+    }
+
+    /// Test tokenization starting from middle of file (top_byte != 0).
+    /// Verifies that source_offset is correct even when not starting from byte 0.
+    #[test]
+    fn test_build_base_tokens_crlf_from_middle() {
+        // Content: "abc\r\ndef\r\nghi\r\n" (15 bytes)
+        // Start from byte 5 (beginning of "def")
+        let content = b"abc\r\ndef\r\nghi\r\n";
+        let mut buffer = Buffer::from_bytes(content.to_vec());
+        buffer.set_line_ending(LineEnding::CRLF);
+
+        let tokens = SplitRenderer::build_base_tokens_for_hook(
+            &mut buffer,
+            5, // Start from line 2
+            80,
+            10,
+            false,
+            LineEnding::CRLF,
+        );
+
+        let offsets = extract_token_offsets(&tokens);
+
+        // Should have:
+        // Text("def") at 5, Newline at 8
+        // Text("ghi") at 10, Newline at 13
+        assert!(
+            offsets
+                .iter()
+                .any(|(kind, off)| kind == "Text(def)" && *off == Some(5)),
+            "Starting from byte 5: Expected Text(def) at 5, got: {:?}",
+            offsets
+        );
+        assert!(
+            offsets
+                .iter()
+                .any(|(kind, off)| kind == "Text(ghi)" && *off == Some(10)),
+            "Starting from byte 5: Expected Text(ghi) at 10, got: {:?}",
+            offsets
+        );
+    }
+
+    /// End-to-end test: verify full pipeline from CRLF buffer to ViewLine to highlighting lookup
+    /// This test simulates the complete flow that would trigger the offset drift bug.
+    #[test]
+    fn test_crlf_highlight_span_lookup() {
+        use crate::view::ui::view_pipeline::ViewLineIterator;
+
+        // Simulate Java-like CRLF content:
+        // "int x;\r\nint y;\r\n"
+        // Bytes: i=0, n=1, t=2, ' '=3, x=4, ;=5, \r=6, \n=7,
+        //        i=8, n=9, t=10, ' '=11, y=12, ;=13, \r=14, \n=15
+        let content = b"int x;\r\nint y;\r\n";
+        let mut buffer = Buffer::from_bytes(content.to_vec());
+        buffer.set_line_ending(LineEnding::CRLF);
+
+        // Step 1: Generate tokens
+        let tokens = SplitRenderer::build_base_tokens_for_hook(
+            &mut buffer,
+            0,
+            80,
+            10,
+            false,
+            LineEnding::CRLF,
+        );
+
+        // Verify tokens have correct offsets
+        let offsets = extract_token_offsets(&tokens);
+        eprintln!("Tokens: {:?}", offsets);
+
+        // Step 2: Convert tokens to ViewLines
+        let view_lines: Vec<_> = ViewLineIterator::new(&tokens, false, false, 4).collect();
+        assert_eq!(view_lines.len(), 2, "Should have 2 view lines");
+
+        // Step 3: Verify char_source_bytes mapping for each line
+        // Line 1: "int x;\n" displayed, maps to bytes 0-6
+        eprintln!(
+            "Line 1 char_source_bytes: {:?}",
+            view_lines[0].char_source_bytes
+        );
+        assert_eq!(
+            view_lines[0].char_source_bytes.len(),
+            7,
+            "Line 1 should have 7 chars: 'i','n','t',' ','x',';','\\n'"
+        );
+        // Check specific mappings
+        assert_eq!(
+            view_lines[0].char_source_bytes[0],
+            Some(0),
+            "Line 1 'i' -> byte 0"
+        );
+        assert_eq!(
+            view_lines[0].char_source_bytes[4],
+            Some(4),
+            "Line 1 'x' -> byte 4"
+        );
+        assert_eq!(
+            view_lines[0].char_source_bytes[5],
+            Some(5),
+            "Line 1 ';' -> byte 5"
+        );
+        assert_eq!(
+            view_lines[0].char_source_bytes[6],
+            Some(6),
+            "Line 1 newline -> byte 6 (\\r pos)"
+        );
+
+        // Line 2: "int y;\n" displayed, maps to bytes 8-14
+        eprintln!(
+            "Line 2 char_source_bytes: {:?}",
+            view_lines[1].char_source_bytes
+        );
+        assert_eq!(
+            view_lines[1].char_source_bytes.len(),
+            7,
+            "Line 2 should have 7 chars: 'i','n','t',' ','y',';','\\n'"
+        );
+        // Check specific mappings - THIS IS WHERE DRIFT WOULD SHOW
+        assert_eq!(
+            view_lines[1].char_source_bytes[0],
+            Some(8),
+            "Line 2 'i' -> byte 8"
+        );
+        assert_eq!(
+            view_lines[1].char_source_bytes[4],
+            Some(12),
+            "Line 2 'y' -> byte 12"
+        );
+        assert_eq!(
+            view_lines[1].char_source_bytes[5],
+            Some(13),
+            "Line 2 ';' -> byte 13"
+        );
+        assert_eq!(
+            view_lines[1].char_source_bytes[6],
+            Some(14),
+            "Line 2 newline -> byte 14 (\\r pos)"
+        );
+
+        // Step 4: Simulate highlight span lookup
+        // If TreeSitter highlights "int" as keyword (bytes 0-3 for line 1, bytes 8-11 for line 2),
+        // the lookup should find these correctly.
+        let simulated_highlight_spans = vec![
+            // "int" on line 1: bytes 0-3
+            (0usize..3usize, "keyword"),
+            // "int" on line 2: bytes 8-11
+            (8usize..11usize, "keyword"),
+        ];
+
+        // Verify that looking up byte positions from char_source_bytes finds the right spans
+        for (line_idx, view_line) in view_lines.iter().enumerate() {
+            for (char_idx, byte_pos) in view_line.char_source_bytes.iter().enumerate() {
+                if let Some(bp) = byte_pos {
+                    let in_span = simulated_highlight_spans
+                        .iter()
+                        .find(|(range, _)| range.contains(bp))
+                        .map(|(_, name)| *name);
+
+                    // First 3 chars of each line should be in keyword span
+                    let expected_in_keyword = char_idx < 3;
+                    let actually_in_keyword = in_span == Some("keyword");
+
+                    if expected_in_keyword != actually_in_keyword {
+                        panic!(
+                            "CRLF offset drift detected! Line {} char {} (byte {}): expected keyword={}, got keyword={}",
+                            line_idx + 1, char_idx, bp, expected_in_keyword, actually_in_keyword
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

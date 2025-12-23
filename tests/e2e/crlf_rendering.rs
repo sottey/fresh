@@ -290,3 +290,343 @@ fn test_lf_new_line_insertion() {
         "File should maintain LF format throughout"
     );
 }
+
+/// Test backspace at beginning of line in CRLF buffer
+/// Should delete the entire \r\n sequence, joining lines
+#[test]
+fn test_crlf_backspace_at_line_start() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("crlf_backspace.txt");
+
+    // Create a test file with CRLF line endings
+    let content = "Line 1\r\nLine 2\r\n";
+    std::fs::write(&file_path, content).unwrap();
+
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    harness.open_file(&file_path).unwrap();
+
+    // Move to beginning of second line
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.send_key(KeyCode::Home, KeyModifiers::NONE).unwrap();
+
+    // Press backspace - should delete \r\n and join lines
+    harness
+        .send_key(KeyCode::Backspace, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Lines should be joined
+    harness.assert_screen_contains("Line 1Line 2");
+
+    // Save and verify
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    let saved_content = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        saved_content, "Line 1Line 2\r\n",
+        "Backspace should have joined the lines"
+    );
+}
+
+/// Test delete at end of line in CRLF buffer
+/// Should delete the entire \r\n sequence, joining lines
+#[test]
+fn test_crlf_delete_at_line_end() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("crlf_delete.txt");
+
+    // Create a test file with CRLF line endings
+    let content = "Line 1\r\nLine 2\r\n";
+    std::fs::write(&file_path, content).unwrap();
+
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    harness.open_file(&file_path).unwrap();
+
+    // Move to end of first line
+    harness.send_key(KeyCode::End, KeyModifiers::NONE).unwrap();
+
+    // Press delete - should delete \r\n and join lines
+    harness
+        .send_key(KeyCode::Delete, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Lines should be joined
+    harness.assert_screen_contains("Line 1Line 2");
+
+    // Save and verify
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    let saved_content = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(
+        saved_content, "Line 1Line 2\r\n",
+        "Delete should have joined the lines"
+    );
+}
+
+/// Test cut and paste in CRLF buffer
+/// Cut text should preserve CRLF when pasted
+#[test]
+fn test_crlf_cut_paste() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("crlf_cut_paste.txt");
+
+    // Create a test file with CRLF line endings
+    let content = "Line 1\r\nLine 2\r\nLine 3\r\n";
+    std::fs::write(&file_path, content).unwrap();
+
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    harness.open_file(&file_path).unwrap();
+
+    // Select "Line 2\r\n" - go to start of line 2, select to start of line 3
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.send_key(KeyCode::Home, KeyModifiers::NONE).unwrap();
+    harness
+        .send_key(KeyCode::Down, KeyModifiers::SHIFT)
+        .unwrap();
+
+    // Cut (Ctrl+X)
+    harness
+        .send_key(KeyCode::Char('x'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Should now have Line 1 and Line 3
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains("Line 2"),
+        "Line 2 should be cut from display"
+    );
+
+    // Go to end of file and paste
+    harness
+        .send_key(KeyCode::End, KeyModifiers::CONTROL)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Char('v'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Should now see Line 2 at end
+    harness.assert_screen_contains("Line 2");
+
+    // Save and verify CRLF preserved
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    let saved_content = std::fs::read_to_string(&file_path).unwrap();
+    // The pasted line should have CRLF
+    assert!(
+        saved_content.contains("Line 2\r\n"),
+        "Pasted line should preserve CRLF ending"
+    );
+}
+
+/// Test that CR characters in LF files are shown as <0D>
+/// In Unix/LF files, \r is unusual and should be visible - even in \r\n sequences
+#[test]
+fn test_cr_shown_in_lf_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("lf_with_cr.txt");
+
+    // Create a test file with LF line endings but containing CR characters
+    // The file has more LF than CRLF, so it should be detected as LF
+    // Even the \r\n sequence should show \r as <0D> because this is a Unix file
+    let content = "Line1\nHello\rWorld\nLine3\r\nLine4\n";
+    std::fs::write(&file_path, content).unwrap();
+
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+
+    let screen = harness.screen_to_string();
+
+    // Both standalone \r and \r in \r\n should be shown as <0D> in LF files
+    // because any \r is unusual in a Unix file
+    assert!(
+        screen.contains("<0D>"),
+        "CR characters in LF file should be shown as <0D>, screen: {}",
+        screen
+    );
+
+    // The text should still be visible
+    harness.assert_screen_contains("Line1");
+    harness.assert_screen_contains("Hello");
+    harness.assert_screen_contains("World");
+    harness.assert_screen_contains("Line3");
+    harness.assert_screen_contains("Line4");
+}
+
+/// Test cursor visibility after setting line ending to CRLF
+/// Creates content, switches to CRLF, duplicates via copy/paste, then verifies
+/// cursor visibility at all positions (start/end of each line, navigation)
+#[test]
+fn test_crlf_cursor_visibility() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("Test.java");
+
+    // Create a Java file with syntax highlighting
+    let java_content = r#"public class Test {
+    public static void main(String[] args) {
+        System.out.println("Hello");
+        int x = 42;
+    }
+}"#;
+    std::fs::write(&file_path, java_content).unwrap();
+
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+
+    // Step 2: Set line ending to CRLF via command palette
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("set line ending").unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    // Select CRLF (Windows) - it's the second option
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Verify the prompt closed (we're back to editing)
+    // Status message may be truncated, so just verify we're not in prompt mode
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains("Line ending:"),
+        "Should have closed the line ending prompt"
+    );
+
+    // Step 3: Select all, copy, go to end, paste twice to grow the file
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::CONTROL)
+        .unwrap(); // Select all
+    harness
+        .send_key(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        .unwrap(); // Copy
+    harness
+        .send_key(KeyCode::End, KeyModifiers::CONTROL)
+        .unwrap(); // Go to end
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap(); // New line
+    harness
+        .send_key(KeyCode::Char('v'), KeyModifiers::CONTROL)
+        .unwrap(); // Paste 1
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap(); // New line
+    harness
+        .send_key(KeyCode::Char('v'), KeyModifiers::CONTROL)
+        .unwrap(); // Paste 2
+    harness.render().unwrap();
+
+    // Count lines in buffer (should be 6 original + 6 paste1 + 6 paste2 = 18+ lines)
+    let content = harness.get_buffer_content().unwrap();
+    let line_count = content.lines().count();
+    assert!(
+        line_count >= 18,
+        "Should have at least 18 lines after pasting, got {}",
+        line_count
+    );
+
+    // Helper to check cursor is visible on screen
+    let check_cursor_visible = |harness: &mut EditorTestHarness, location: &str| {
+        harness.render().unwrap();
+        let (cursor_x, cursor_y) = harness.screen_cursor_position();
+        let (content_start, content_end) = harness.content_area_rows();
+
+        assert!(
+            cursor_y as usize >= content_start && cursor_y as usize <= content_end,
+            "Cursor at {} should be in content area: y={} not in range [{}, {}]",
+            location,
+            cursor_y,
+            content_start,
+            content_end
+        );
+        assert!(
+            cursor_x < 80,
+            "Cursor at {} should be within screen width: x={} >= 80",
+            location,
+            cursor_x
+        );
+    };
+
+    // Step 4: Go to start of buffer
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::CONTROL)
+        .unwrap();
+    check_cursor_visible(&mut harness, "start of buffer");
+    assert_eq!(harness.cursor_position(), 0, "Should be at byte 0");
+
+    // Step 5: Iterate through ALL lines, checking visibility at start and end of each
+    for line_num in 0..line_count {
+        // Check cursor visible at start of line
+        harness.send_key(KeyCode::Home, KeyModifiers::NONE).unwrap();
+        check_cursor_visible(&mut harness, &format!("line {} start", line_num));
+
+        // Check cursor visible at end of line
+        harness.send_key(KeyCode::End, KeyModifiers::NONE).unwrap();
+        check_cursor_visible(&mut harness, &format!("line {} end", line_num));
+
+        // Type a marker character and verify it appears
+        harness.type_text("*").unwrap();
+        harness.render().unwrap();
+
+        // Move to next line
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    }
+
+    // Step 6: Navigate back up through all lines
+    harness
+        .send_key(KeyCode::End, KeyModifiers::CONTROL)
+        .unwrap();
+    check_cursor_visible(&mut harness, "end of buffer");
+
+    for line_num in (0..line_count).rev() {
+        harness.send_key(KeyCode::Up, KeyModifiers::NONE).unwrap();
+        check_cursor_visible(&mut harness, &format!("line {} (going up)", line_num));
+    }
+
+    // Step 7: Verify we can type at start of buffer
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::CONTROL)
+        .unwrap();
+    harness.type_text("// START>>").unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("// START>>");
+
+    // Final verification: original content structure preserved (with markers)
+    let final_content = harness.get_buffer_content().unwrap();
+    assert!(
+        final_content.contains("public class Test"),
+        "Should contain class declaration"
+    );
+    assert!(
+        final_content.contains("public static void main"),
+        "Should contain main method"
+    );
+    assert!(
+        final_content.contains("System.out.println"),
+        "Should contain println"
+    );
+    assert!(
+        final_content.contains("int x = 42"),
+        "Should contain variable declaration"
+    );
+}

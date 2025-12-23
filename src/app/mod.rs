@@ -4,11 +4,20 @@ pub mod file_open;
 mod file_open_input;
 mod help;
 mod input;
+mod input_dispatch;
+mod lsp_actions;
+mod menu_actions;
+mod mouse_input;
 mod plugin_commands;
+mod popup_actions;
+mod prompt_actions;
 mod render;
 pub mod session;
 mod terminal;
+mod terminal_input;
 pub mod types;
+mod undo_actions;
+mod view_actions;
 
 use std::path::Component;
 
@@ -48,7 +57,8 @@ use self::types::{
     Bookmark, CachedLayout, EventLineInfo, InteractiveReplaceState, LspMessageEntry,
     LspProgressInfo, MacroRecordingState, MouseState, SearchState, DEFAULT_BACKGROUND_FILE,
 };
-use crate::config::{Config, DirectoryContext};
+use crate::config::Config;
+use crate::config_io::DirectoryContext;
 use crate::input::actions::action_to_events as convert_action_to_events;
 use crate::input::buffer_mode::ModeRegistry;
 use crate::input::command_registry::CommandRegistry;
@@ -61,12 +71,13 @@ use crate::input::position_history::PositionHistory;
 use crate::model::event::{CursorId, Event, EventLog, SplitDirection, SplitId};
 use crate::services::async_bridge::{AsyncBridge, AsyncMessage};
 use crate::services::fs::{FsBackend, FsManager, LocalFsBackend};
-use crate::services::lsp::client::LspServerConfig;
 use crate::services::lsp::manager::{detect_language, LspManager, LspSpawnResult};
 use crate::services::plugins::api::{BufferSavedDiff, PluginCommand};
 use crate::services::plugins::PluginManager;
 use crate::services::recovery::{RecoveryConfig, RecoveryService};
+use crate::services::time_source::{RealTimeSource, SharedTimeSource};
 use crate::state::EditorState;
+use crate::types::LspServerConfig;
 use crate::view::file_tree::{FileTree, FileTreeView};
 use crate::view::prompt::{Prompt, PromptType};
 use crate::view::split::{SplitManager, SplitViewState};
@@ -285,7 +296,7 @@ pub struct Editor {
     mouse_state: MouseState,
 
     /// Cached layout areas from last render (for mouse hit testing)
-    cached_layout: CachedLayout,
+    pub(crate) cached_layout: CachedLayout,
 
     /// Command registry for dynamic commands
     command_registry: Arc<RwLock<CommandRegistry>>,
@@ -377,16 +388,19 @@ pub struct Editor {
     /// Whether auto-revert mode is enabled (automatically reload files when changed on disk)
     auto_revert_enabled: bool,
 
-    /// File watcher for auto-revert functionality
-    file_watcher: Option<notify::RecommendedWatcher>,
+    /// Last time we polled for file changes (for auto-revert)
+    last_auto_revert_poll: std::time::Instant,
 
-    /// Directories currently being watched (to avoid duplicate watches)
-    /// We watch directories instead of files to handle atomic saves (temp+rename)
-    watched_dirs: HashSet<PathBuf>,
+    /// Last time we polled for directory changes (for file tree refresh)
+    last_file_tree_poll: std::time::Instant,
 
-    /// Last known modification times for watched files (for conflict detection)
+    /// Last known modification times for open files (for auto-revert)
     /// Maps file path to last known modification time
     file_mod_times: HashMap<PathBuf, std::time::SystemTime>,
+
+    /// Last known modification times for expanded directories (for file tree refresh)
+    /// Maps directory path to last known modification time
+    dir_mod_times: HashMap<PathBuf, std::time::SystemTime>,
 
     /// Tracks rapid file change events for debouncing
     /// Maps file path to (last event time, event count)
@@ -400,6 +414,9 @@ pub struct Editor {
 
     /// Recovery service for auto-save and crash recovery
     recovery_service: RecoveryService,
+
+    /// Time source for testable time operations
+    time_source: SharedTimeSource,
 
     /// Last auto-save time for rate limiting
     last_auto_save: std::time::Instant,
@@ -447,7 +464,10 @@ pub struct Editor {
     previous_click_position: Option<(u16, u16)>,
 
     /// Settings UI state (when settings modal is open)
-    settings_state: Option<crate::view::settings::SettingsState>,
+    pub(crate) settings_state: Option<crate::view::settings::SettingsState>,
+
+    /// Terminal color capability (true color, 256, or 16 colors)
+    color_capability: crate::view::color_support::ColorCapability,
 }
 
 impl Editor {
@@ -458,8 +478,17 @@ impl Editor {
         width: u16,
         height: u16,
         dir_context: DirectoryContext,
+        color_capability: crate::view::color_support::ColorCapability,
     ) -> io::Result<Self> {
-        Self::with_working_dir(config, width, height, None, dir_context, true)
+        Self::with_working_dir(
+            config,
+            width,
+            height,
+            None,
+            dir_context,
+            true,
+            color_capability,
+        )
     }
 
     /// Create a new editor with an explicit working directory
@@ -471,6 +500,7 @@ impl Editor {
         working_dir: Option<PathBuf>,
         dir_context: DirectoryContext,
         plugins_enabled: bool,
+        color_capability: crate::view::color_support::ColorCapability,
     ) -> io::Result<Self> {
         Self::with_options(
             config,
@@ -480,27 +510,35 @@ impl Editor {
             None,
             plugins_enabled,
             dir_context,
+            None,
+            color_capability,
+            crate::primitives::grammar_registry::GrammarRegistry::for_editor(),
         )
     }
 
-    /// Create a new editor with a custom filesystem backend (for testing)
-    /// This allows injecting slow or mock backends to test editor behavior
-    pub fn with_fs_backend_for_test(
+    /// Create a new editor for testing with optional custom backends
+    /// Uses empty grammar registry for fast initialization
+    pub fn for_test(
         config: Config,
         width: u16,
         height: u16,
         working_dir: Option<PathBuf>,
-        fs_backend: Arc<dyn FsBackend>,
         dir_context: DirectoryContext,
+        color_capability: crate::view::color_support::ColorCapability,
+        fs_backend: Option<Arc<dyn FsBackend>>,
+        time_source: Option<SharedTimeSource>,
     ) -> io::Result<Self> {
         Self::with_options(
             config,
             width,
             height,
             working_dir,
-            Some(fs_backend),
+            fs_backend,
             true,
             dir_context,
+            time_source,
+            color_capability,
+            crate::primitives::grammar_registry::GrammarRegistry::empty(),
         )
     }
 
@@ -515,7 +553,12 @@ impl Editor {
         fs_backend: Option<Arc<dyn FsBackend>>,
         enable_plugins: bool,
         dir_context: DirectoryContext,
+        time_source: Option<SharedTimeSource>,
+        color_capability: crate::view::color_support::ColorCapability,
+        grammar_registry: Arc<crate::primitives::grammar_registry::GrammarRegistry>,
     ) -> io::Result<Self> {
+        // Use provided time_source or default to RealTimeSource
+        let time_source = time_source.unwrap_or_else(RealTimeSource::shared);
         tracing::info!("Editor::new called with width={}, height={}", width, height);
 
         // Use provided working_dir or capture from environment
@@ -529,11 +572,8 @@ impl Editor {
         // Load theme from config
         let theme = crate::view::theme::Theme::from_name(&config.theme);
 
-        // Load grammar registry for TextMate syntax highlighting
-        let grammar_registry =
-            Arc::new(crate::primitives::grammar_registry::GrammarRegistry::load());
         tracing::info!(
-            "Loaded grammar registry with {} syntaxes",
+            "Grammar registry has {} syntaxes",
             grammar_registry.available_syntaxes().len()
         );
 
@@ -790,9 +830,10 @@ impl Editor {
             pending_lsp_confirmation: None,
             pending_close_buffer: None,
             auto_revert_enabled: true,
-            file_watcher: None,
-            watched_dirs: HashSet::new(),
+            last_auto_revert_poll: time_source.now(),
+            last_file_tree_poll: time_source.now(),
             file_mod_times: HashMap::new(),
+            dir_mod_times: HashMap::new(),
             file_rapid_change_counts: HashMap::new(),
             file_open_state: None,
             file_browser_layout: None,
@@ -804,7 +845,8 @@ impl Editor {
                 };
                 RecoveryService::with_config_and_dir(recovery_config, dir_context.recovery_dir())
             },
-            last_auto_save: std::time::Instant::now(),
+            time_source: time_source.clone(),
+            last_auto_save: time_source.now(),
             active_custom_contexts: HashSet::new(),
             warning_log: None,
             update_checker,
@@ -818,6 +860,7 @@ impl Editor {
             previous_click_time: None,
             previous_click_position: None,
             settings_state: None,
+            color_capability,
         })
     }
 
@@ -834,6 +877,11 @@ impl Editor {
     /// Get a reference to the config
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Get a reference to the time source
+    pub fn time_source(&self) -> &SharedTimeSource {
+        &self.time_source
     }
 
     /// Emit a control event
@@ -1282,6 +1330,21 @@ impl Editor {
             tracing::info!("Detected binary file: {}", path.display());
         }
 
+        // Set show_whitespace_tabs, use_tabs, and tab_size based on language config
+        // with fallback to global editor config for tab_size
+        if let Some(language) = detect_language(path, &self.config.languages) {
+            if let Some(lang_config) = self.config.languages.get(&language) {
+                state.show_whitespace_tabs = lang_config.show_whitespace_tabs;
+                state.use_tabs = lang_config.use_tabs;
+                // Use language-specific tab_size if set, otherwise fall back to global
+                state.tab_size = lang_config.tab_size.unwrap_or(self.config.editor.tab_size);
+            } else {
+                state.tab_size = self.config.editor.tab_size;
+            }
+        } else {
+            state.tab_size = self.config.editor.tab_size;
+        }
+
         self.buffers.insert(buffer_id, state);
         self.event_logs.insert(buffer_id, EventLog::new());
 
@@ -1673,6 +1736,8 @@ impl Editor {
 
     /// Save the settings from the modal to config
     pub fn save_settings(&mut self) {
+        let old_theme = self.config.theme.clone();
+
         let new_config = {
             if let Some(ref state) = self.settings_state {
                 if !state.has_changes() {
@@ -1692,6 +1757,15 @@ impl Editor {
 
         // Apply the new config
         self.config = new_config;
+
+        // Apply runtime changes
+        if old_theme != self.config.theme {
+            self.theme = crate::view::theme::Theme::from_name(&self.config.theme);
+            tracing::info!("Theme changed to '{}'", self.config.theme.0);
+        }
+
+        // Update keybindings
+        self.keybindings = KeybindingResolver::new(&self.config);
 
         // Save to disk
         if let Err(e) = std::fs::create_dir_all(&self.dir_context.config_dir) {
@@ -1732,6 +1806,46 @@ impl Editor {
     /// Activate/toggle the currently selected setting
     pub fn settings_activate_current(&mut self) {
         use crate::view::settings::items::SettingControl;
+        use crate::view::settings::FocusPanel;
+
+        // Check if we're in the Footer panel - handle button activation
+        let focus_panel = self
+            .settings_state
+            .as_ref()
+            .map(|s| s.focus_panel)
+            .unwrap_or(FocusPanel::Categories);
+
+        if focus_panel == FocusPanel::Footer {
+            let button_index = self
+                .settings_state
+                .as_ref()
+                .map(|s| s.footer_button_index)
+                .unwrap_or(1);
+            match button_index {
+                0 => {
+                    // Reset button
+                    if let Some(ref mut state) = self.settings_state {
+                        state.reset_current_to_default();
+                    }
+                }
+                1 => {
+                    // Save button - save and close
+                    self.close_settings(true);
+                }
+                2 => {
+                    // Cancel button
+                    self.close_settings(false);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // When Categories panel is focused, Enter does nothing to settings controls
+        // (keys should not leak to the right panel)
+        if focus_panel == FocusPanel::Categories {
+            return;
+        }
 
         // Get the current item's control type to determine action
         let control_type = {
@@ -1743,6 +1857,8 @@ impl Editor {
                     SettingControl::Text(_) => "text",
                     SettingControl::TextList(_) => "textlist",
                     SettingControl::Map(_) => "map",
+                    SettingControl::ObjectArray(_) => "objectarray",
+                    SettingControl::Json(_) => "json",
                     SettingControl::Complex { .. } => "complex",
                 })
             } else {
@@ -1779,19 +1895,24 @@ impl Editor {
                 }
             }
             Some("map") => {
-                // For Map controls: add new entry if on add-new row, or toggle expand if on entry
+                // For Map controls: check if map has a value schema (supports entry dialogs)
                 if let Some(ref mut state) = self.settings_state {
                     if let Some(item) = state.current_item_mut() {
                         if let SettingControl::Map(ref mut map_state) = item.control {
                             if map_state.focused_entry.is_none() {
-                                // On add-new row: add the entry
-                                map_state.add_entry_from_input();
-                            } else if let Some(idx) = map_state.focused_entry {
-                                // On entry row: toggle expanded
-                                if map_state.expanded.contains(&idx) {
-                                    map_state.expanded.retain(|&i| i != idx);
-                                } else {
-                                    map_state.expanded.push(idx);
+                                // On add-new row: start editing to add new entry
+                                state.start_editing();
+                            } else if map_state.value_schema.is_some() {
+                                // Map has schema: open entry dialog
+                                state.open_entry_dialog();
+                            } else {
+                                // For other maps: toggle expanded
+                                if let Some(idx) = map_state.focused_entry {
+                                    if map_state.expanded.contains(&idx) {
+                                        map_state.expanded.retain(|&i| i != idx);
+                                    } else {
+                                        map_state.expanded.push(idx);
+                                    }
                                 }
                             }
                         }
@@ -1818,6 +1939,27 @@ impl Editor {
     /// Increment the current setting value (for Number and Dropdown controls)
     pub fn settings_increment_current(&mut self) {
         use crate::view::settings::items::SettingControl;
+        use crate::view::settings::FocusPanel;
+
+        // Check if we're in the Footer panel - navigate buttons instead
+        let focus_panel = self
+            .settings_state
+            .as_ref()
+            .map(|s| s.focus_panel)
+            .unwrap_or(FocusPanel::Categories);
+
+        if focus_panel == FocusPanel::Footer {
+            if let Some(ref mut state) = self.settings_state {
+                // Navigate to next footer button (wrapping around)
+                state.footer_button_index = (state.footer_button_index + 1) % 3;
+            }
+            return;
+        }
+
+        // When Categories panel is focused, Left/Right don't affect settings controls
+        if focus_panel == FocusPanel::Categories {
+            return;
+        }
 
         let control_type = {
             if let Some(ref state) = self.settings_state {
@@ -1859,6 +2001,31 @@ impl Editor {
     /// Decrement the current setting value (for Number and Dropdown controls)
     pub fn settings_decrement_current(&mut self) {
         use crate::view::settings::items::SettingControl;
+        use crate::view::settings::FocusPanel;
+
+        // Check if we're in the Footer panel - navigate buttons instead
+        let focus_panel = self
+            .settings_state
+            .as_ref()
+            .map(|s| s.focus_panel)
+            .unwrap_or(FocusPanel::Categories);
+
+        if focus_panel == FocusPanel::Footer {
+            if let Some(ref mut state) = self.settings_state {
+                // Navigate to previous footer button (wrapping around)
+                state.footer_button_index = if state.footer_button_index == 0 {
+                    2
+                } else {
+                    state.footer_button_index - 1
+                };
+            }
+            return;
+        }
+
+        // When Categories panel is focused, Left/Right don't affect settings controls
+        if focus_panel == FocusPanel::Categories {
+            return;
+        }
 
         let control_type = {
             if let Some(ref state) = self.settings_state {
@@ -1925,6 +2092,12 @@ impl Editor {
 
     /// Internal helper to close a buffer (shared by close_buffer and force_close_buffer)
     fn close_buffer_internal(&mut self, id: BufferId) -> io::Result<()> {
+        // If closing a terminal buffer while in terminal mode, exit terminal mode
+        if self.terminal_mode && self.is_terminal_buffer(id) {
+            self.terminal_mode = false;
+            self.key_context = crate::input::keybindings::KeyContext::Normal;
+        }
+
         // If it's the last buffer, create a new empty buffer and focus file explorer
         let is_last_buffer = self.buffers.len() == 1;
         let replacement_buffer = if is_last_buffer {
@@ -2563,13 +2736,12 @@ impl Editor {
             .map(|(pos, _, x, y)| (pos, x, y))
     }
 
-    /// Check if a hover popup is currently visible (for testing)
-    pub fn has_hover_popup(&self) -> bool {
+    /// Check if a transient popup (hover/signature help) is currently visible
+    pub fn has_transient_popup(&self) -> bool {
         self.active_state()
             .popups
             .top()
-            .and_then(|p| p.title.as_ref())
-            .is_some_and(|title| title == "Hover")
+            .is_some_and(|p| p.transient)
     }
 
     /// Force check the mouse hover timer (for testing)
@@ -2604,6 +2776,60 @@ impl Editor {
                 self.set_status_message("Line numbers shown".to_string());
             }
         }
+    }
+
+    /// Toggle debug highlight mode for the active buffer
+    /// When enabled, shows byte positions and highlight span info for debugging
+    pub fn toggle_debug_highlights(&mut self) {
+        if let Some(state) = self.buffers.get_mut(&self.active_buffer()) {
+            state.debug_highlight_mode = !state.debug_highlight_mode;
+            if state.debug_highlight_mode {
+                self.set_status_message(
+                    "Debug highlight mode ON - showing byte ranges".to_string(),
+                );
+            } else {
+                self.set_status_message("Debug highlight mode OFF".to_string());
+            }
+        }
+    }
+
+    /// Reset buffer settings (tab_size, use_tabs, show_whitespace_tabs) to config defaults
+    pub fn reset_buffer_settings(&mut self) {
+        let buffer_id = self.active_buffer();
+
+        // Get the file path to determine language-specific settings
+        let file_path = self
+            .buffer_metadata
+            .get(&buffer_id)
+            .and_then(|m| m.file_path().cloned());
+
+        // Determine settings from config (with language fallback)
+        let (tab_size, use_tabs, show_whitespace_tabs) = if let Some(path) = &file_path {
+            if let Some(language) = detect_language(path, &self.config.languages) {
+                if let Some(lang_config) = self.config.languages.get(&language) {
+                    (
+                        lang_config.tab_size.unwrap_or(self.config.editor.tab_size),
+                        lang_config.use_tabs,
+                        lang_config.show_whitespace_tabs,
+                    )
+                } else {
+                    (self.config.editor.tab_size, false, true)
+                }
+            } else {
+                (self.config.editor.tab_size, false, true)
+            }
+        } else {
+            (self.config.editor.tab_size, false, true)
+        };
+
+        // Apply settings to buffer
+        if let Some(state) = self.buffers.get_mut(&buffer_id) {
+            state.tab_size = tab_size;
+            state.use_tabs = use_tabs;
+            state.show_whitespace_tabs = show_whitespace_tabs;
+        }
+
+        self.set_status_message("Buffer settings reset to config defaults".to_string());
     }
 
     /// Toggle mouse capture on/off
@@ -2677,54 +2903,37 @@ impl Editor {
             return;
         }
 
-        // Get metadata for the active buffer
-        let metadata = match self.buffer_metadata.get(&self.active_buffer()) {
-            Some(m) => m,
-            None => return,
-        };
-
-        let uri = match metadata.file_uri() {
-            Some(uri) => uri.clone(),
-            None => return,
-        };
-
-        let path = match metadata.file_path() {
-            Some(p) => p.clone(),
-            None => return,
-        };
-
-        let language = match detect_language(&path, &self.config.languages) {
-            Some(lang) => lang,
-            None => return,
-        };
+        let buffer_id = self.active_buffer();
 
         // Get line count from buffer state
-        let line_count = if let Some(state) = self.buffers.get(&self.active_buffer()) {
+        let line_count = if let Some(state) = self.buffers.get(&buffer_id) {
             state.buffer.line_count().unwrap_or(1000)
         } else {
             return;
         };
         let last_line = line_count.saturating_sub(1) as u32;
+        let request_id = self.next_lsp_request_id;
 
-        // Get LSP client for this language
-        if let Some(lsp) = &mut self.lsp {
-            if let Some(client) = lsp.get_or_spawn(&language) {
-                let request_id = self.next_lsp_request_id;
-                self.next_lsp_request_id += 1;
-                self.pending_inlay_hints_request = Some(request_id);
-
-                if let Err(e) = client.inlay_hints(request_id, uri.clone(), 0, 0, last_line, 10000)
-                {
-                    tracing::debug!("Failed to request inlay hints: {}", e);
-                    self.pending_inlay_hints_request = None;
-                } else {
+        // Use helper to ensure didOpen is sent before the request
+        let sent = self
+            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
+                let result = handle.inlay_hints(request_id, uri.clone(), 0, 0, last_line, 10000);
+                if result.is_ok() {
                     tracing::info!(
                         "Requested inlay hints for {} (request_id={})",
                         uri.as_str(),
                         request_id
                     );
+                } else if let Err(e) = &result {
+                    tracing::debug!("Failed to request inlay hints: {}", e);
                 }
-            }
+                result.is_ok()
+            })
+            .unwrap_or(false);
+
+        if sent {
+            self.next_lsp_request_id += 1;
+            self.pending_inlay_hints_request = Some(request_id);
         }
     }
 
@@ -2776,27 +2985,37 @@ impl Editor {
 
     /// Reload configuration from the config file
     ///
-    /// This reloads the config from disk and emits a config_changed event
-    /// so plugins can update their state accordingly.
+    /// This reloads the config from disk, applies runtime changes (theme, keybindings),
+    /// and emits a config_changed event so plugins can update their state accordingly.
+    /// Checks local config (working directory) first, then system config paths.
     pub fn reload_config(&mut self) {
-        let config_path = self.dir_context.config_path();
-        match Config::load_from_file(&config_path) {
-            Ok(new_config) => {
-                self.config = new_config;
-                // Emit event so plugins know config changed
-                self.emit_event(
-                    "config_changed",
-                    serde_json::json!({
-                        "path": config_path.to_string_lossy(),
-                    }),
-                );
-                tracing::info!("Configuration reloaded from {}", config_path.display());
-            }
-            Err(e) => {
-                tracing::warn!("Failed to reload config: {}", e);
-                self.set_status_message(format!("Failed to reload config: {}", e));
+        let old_theme = self.config.theme.clone();
+        self.config = Config::load_for_working_dir(&self.working_dir);
+
+        // Apply theme change if needed
+        if old_theme != self.config.theme {
+            self.theme = crate::view::theme::Theme::from_name(&self.config.theme);
+            tracing::info!("Theme changed to '{}'", self.config.theme.0);
+        }
+
+        // Always reload keybindings (complex types don't implement PartialEq)
+        self.keybindings = KeybindingResolver::new(&self.config);
+
+        // Update LSP configs
+        if let Some(ref mut lsp) = self.lsp {
+            for (language, lsp_config) in &self.config.lsp {
+                lsp.set_language_config(language.clone(), lsp_config.clone());
             }
         }
+
+        // Emit event so plugins know config changed
+        let config_path = Config::find_config_path(&self.working_dir);
+        self.emit_event(
+            "config_changed",
+            serde_json::json!({
+                "path": config_path.map(|p| p.to_string_lossy().into_owned()),
+            }),
+        );
     }
 
     /// Calculate the effective width available for tabs.
@@ -2826,6 +3045,9 @@ impl Editor {
         if self.active_buffer() == buffer_id {
             return; // No change
         }
+
+        // Dismiss transient popups and clear hover state when switching buffers
+        self.on_editor_focus_lost();
 
         // Cancel search/replace prompts when switching buffers
         // (they are buffer-specific and don't make sense across buffers)
@@ -3222,6 +3444,7 @@ impl Editor {
 
         let active_split = self.split_manager.active_split();
         let buffer_id = self.active_buffer();
+        let tab_size = self.config.editor.tab_size;
 
         // Get view_transform tokens from SplitViewState (if any)
         let view_transform_tokens = self
@@ -3237,7 +3460,8 @@ impl Editor {
         if let Some(view_state) = view_state {
             if let Some(tokens) = view_transform_tokens {
                 // Use view-aware scrolling with the transform's tokens
-                let view_lines: Vec<_> = ViewLineIterator::new(&tokens).collect();
+                let view_lines: Vec<_> =
+                    ViewLineIterator::new(&tokens, false, false, tab_size).collect();
                 view_state
                     .viewport
                     .scroll_view_lines(&view_lines, line_offset);
@@ -3411,6 +3635,172 @@ impl Editor {
         }
     }
 
+    /// Copy selection with a specific theme's formatting
+    ///
+    /// If theme_name is empty, opens a prompt to select a theme.
+    /// Otherwise, copies the selected text as HTML with inline CSS styles.
+    pub fn copy_selection_with_theme(&mut self, theme_name: &str) {
+        // Check if there's a selection first
+        let has_selection = {
+            let state = self.active_state();
+            state
+                .cursors
+                .iter()
+                .any(|(_, cursor)| cursor.selection_range().is_some())
+        };
+
+        if !has_selection {
+            self.status_message = Some("No selection to copy".to_string());
+            return;
+        }
+
+        // Empty theme = open theme picker prompt
+        if theme_name.is_empty() {
+            self.start_copy_with_formatting_prompt();
+            return;
+        }
+        use crate::services::styled_html::render_styled_html;
+
+        // Load the requested theme
+        let theme = crate::view::theme::Theme::from_name(theme_name);
+
+        // Collect ranges and their byte offsets
+        let ranges: Vec<_> = {
+            let state = self.active_state();
+            state
+                .cursors
+                .iter()
+                .filter_map(|(_, cursor)| cursor.selection_range())
+                .collect()
+        };
+
+        if ranges.is_empty() {
+            self.status_message = Some("No selection to copy".to_string());
+            return;
+        }
+
+        // Get the overall range for highlighting
+        let min_offset = ranges.iter().map(|r| r.start).min().unwrap_or(0);
+        let max_offset = ranges.iter().map(|r| r.end).max().unwrap_or(0);
+
+        // Collect text and highlight spans from state
+        let (text, highlight_spans) = {
+            let state = self.active_state_mut();
+
+            // Collect text from all ranges
+            let mut text = String::new();
+            for range in &ranges {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                let range_text = state.get_text_range(range.start, range.end);
+                text.push_str(&range_text);
+            }
+
+            if text.is_empty() {
+                (text, Vec::new())
+            } else {
+                // Get highlight spans for the selected region
+                let highlight_spans = state.highlighter.highlight_viewport(
+                    &state.buffer,
+                    min_offset,
+                    max_offset,
+                    &theme,
+                    0, // No context needed since we're copying exact selection
+                );
+                (text, highlight_spans)
+            }
+        };
+
+        if text.is_empty() {
+            self.status_message = Some("No text to copy".to_string());
+            return;
+        }
+
+        // Adjust highlight spans to be relative to the copied text
+        let adjusted_spans: Vec<_> = if ranges.len() == 1 {
+            let base_offset = ranges[0].start;
+            highlight_spans
+                .into_iter()
+                .filter_map(|span| {
+                    if span.range.end <= base_offset || span.range.start >= ranges[0].end {
+                        return None;
+                    }
+                    let start = span.range.start.saturating_sub(base_offset);
+                    let end = (span.range.end - base_offset).min(text.len());
+                    if start < end {
+                        Some(crate::primitives::highlighter::HighlightSpan {
+                            range: start..end,
+                            color: span.color,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Render the styled text to HTML
+        let html = render_styled_html(&text, &adjusted_spans, &theme);
+
+        // Copy the HTML to clipboard (with plain text fallback)
+        if self.clipboard.copy_html(&html, &text) {
+            self.status_message = Some(format!("Copied with '{}' theme", theme_name));
+        } else {
+            self.clipboard.copy(text);
+            self.status_message = Some("Copied as plain text".to_string());
+        }
+    }
+
+    /// Start the theme selection prompt for copy with formatting
+    fn start_copy_with_formatting_prompt(&mut self) {
+        use crate::view::prompt::PromptType;
+
+        let available_themes = crate::view::theme::Theme::available_themes();
+        let current_theme_name = &self.theme.name;
+
+        // Find the index of the current theme
+        let current_index = available_themes
+            .iter()
+            .position(|name| name == current_theme_name)
+            .unwrap_or(0);
+
+        let suggestions: Vec<crate::input::commands::Suggestion> = available_themes
+            .iter()
+            .map(|theme_name| {
+                let is_current = theme_name == current_theme_name;
+                crate::input::commands::Suggestion {
+                    text: theme_name.to_string(),
+                    description: if is_current {
+                        Some("(current)".to_string())
+                    } else {
+                        None
+                    },
+                    value: Some(theme_name.to_string()),
+                    disabled: false,
+                    keybinding: None,
+                    source: None,
+                }
+            })
+            .collect();
+
+        self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
+            "Copy with theme: ".to_string(),
+            PromptType::CopyWithFormattingTheme,
+            suggestions,
+        ));
+
+        if let Some(prompt) = self.prompt.as_mut() {
+            if !prompt.suggestions.is_empty() {
+                prompt.selected_suggestion = Some(current_index);
+                prompt.input = current_theme_name.to_string();
+                prompt.cursor_pos = prompt.input.len();
+            }
+        }
+    }
+
     /// Cut the current selection to clipboard
     pub fn cut_selection(&mut self) {
         self.copy_selection();
@@ -3452,28 +3842,143 @@ impl Editor {
         }
     }
 
-    /// Paste the clipboard content
+    /// Paste the clipboard content at all cursor positions
+    ///
+    /// Handles:
+    /// - Single cursor paste
+    /// - Multi-cursor paste (pastes at each cursor)
+    /// - Selection replacement (deletes selection before inserting)
+    /// - Atomic undo (single undo step for entire operation)
     pub fn paste(&mut self) {
         // Get content from clipboard (tries system first, falls back to internal)
-        let paste_text = match self.clipboard.paste() {
+        let text = match self.clipboard.paste() {
             Some(text) => text,
             None => return,
         };
 
-        let state = self.active_state();
-        let cursor_id = state.cursors.primary_id();
-        let position = state.cursors.primary().position;
+        // Use paste_text which handles line ending normalization
+        self.paste_text(text);
+    }
 
-        let event = Event::Insert {
-            position,
-            text: paste_text,
-            cursor_id,
+    /// Paste text directly into the editor
+    ///
+    /// Handles:
+    /// - Line ending normalization (CRLF/CR → buffer's format)
+    /// - Single cursor paste
+    /// - Multi-cursor paste (pastes at each cursor)
+    /// - Selection replacement (deletes selection before inserting)
+    /// - Atomic undo (single undo step for entire operation)
+    /// - Routing to prompt if one is open
+    pub fn paste_text(&mut self, paste_text: String) {
+        if paste_text.is_empty() {
+            return;
+        }
+
+        // Normalize line endings: first convert all to LF, then to buffer's format
+        // This handles Windows clipboard (CRLF), old Mac (CR), and Unix (LF)
+        let normalized = paste_text.replace("\r\n", "\n").replace('\r', "\n");
+
+        // If a prompt is open, paste into the prompt (prompts use LF internally)
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.insert_str(&normalized);
+            self.update_prompt_suggestions();
+            self.status_message = Some("Pasted".to_string());
+            return;
+        }
+
+        // Convert to buffer's line ending format
+        let buffer_line_ending = self.active_state().buffer.line_ending();
+        let paste_text = match buffer_line_ending {
+            crate::model::buffer::LineEnding::LF => normalized,
+            crate::model::buffer::LineEnding::CRLF => normalized.replace('\n', "\r\n"),
+            crate::model::buffer::LineEnding::CR => normalized.replace('\n', "\r"),
         };
 
-        self.active_event_log_mut().append(event.clone());
-        self.apply_event_to_active_buffer(&event);
+        let mut events = Vec::new();
+
+        // Collect cursor info sorted in reverse order by position
+        let state = self.active_state();
+        let mut cursor_data: Vec<_> = state
+            .cursors
+            .iter()
+            .map(|(cursor_id, cursor)| {
+                let selection = cursor.selection_range();
+                let insert_position = selection
+                    .as_ref()
+                    .map(|r| r.start)
+                    .unwrap_or(cursor.position);
+                (cursor_id, selection, insert_position)
+            })
+            .collect();
+        cursor_data.sort_by_key(|(_, _, pos)| std::cmp::Reverse(*pos));
+
+        // Get deleted text for each selection
+        let cursor_data_with_text: Vec<_> = {
+            let state = self.active_state_mut();
+            cursor_data
+                .into_iter()
+                .map(|(cursor_id, selection, insert_position)| {
+                    let deleted_text = selection
+                        .as_ref()
+                        .map(|r| state.get_text_range(r.start, r.end));
+                    (cursor_id, selection, insert_position, deleted_text)
+                })
+                .collect()
+        };
+
+        // Build events for each cursor
+        for (cursor_id, selection, insert_position, deleted_text) in cursor_data_with_text {
+            if let (Some(range), Some(text)) = (selection, deleted_text) {
+                events.push(Event::Delete {
+                    range,
+                    deleted_text: text,
+                    cursor_id,
+                });
+            }
+            events.push(Event::Insert {
+                position: insert_position,
+                text: paste_text.clone(),
+                cursor_id,
+            });
+        }
+
+        // Apply events with atomic undo
+        if events.len() > 1 {
+            let batch = Event::Batch {
+                events: events.clone(),
+                description: "Paste".to_string(),
+            };
+            self.active_event_log_mut().append(batch.clone());
+            self.apply_event_to_active_buffer(&batch);
+        } else if let Some(event) = events.into_iter().next() {
+            self.active_event_log_mut().append(event.clone());
+            self.apply_event_to_active_buffer(&event);
+        }
 
         self.status_message = Some("Pasted".to_string());
+    }
+
+    /// Set clipboard content for testing purposes
+    /// This sets the internal clipboard and enables internal-only mode to avoid
+    /// system clipboard interference between parallel tests
+    #[doc(hidden)]
+    pub fn set_clipboard_for_test(&mut self, text: String) {
+        self.clipboard.set_internal(text);
+        self.clipboard.set_internal_only(true);
+    }
+
+    /// Paste from internal clipboard only (for testing)
+    /// This bypasses the system clipboard to avoid interference from CI environments
+    #[doc(hidden)]
+    pub fn paste_for_test(&mut self) {
+        // Get content from internal clipboard only (ignores system clipboard)
+        let paste_text = match self.clipboard.paste_internal() {
+            Some(text) => text,
+            None => return,
+        };
+
+        // Use the same paste logic as the regular paste method
+        self.paste_text(paste_text);
     }
 
     /// Add a cursor at the next occurrence of the selected text
@@ -3699,88 +4204,145 @@ impl Editor {
         self.auto_revert_enabled = !self.auto_revert_enabled;
 
         if self.auto_revert_enabled {
-            // Start file watcher if not already running
-            self.start_file_watcher();
             self.status_message = Some("Auto-revert enabled".to_string());
         } else {
-            // Stop file watcher
-            self.file_watcher = None;
-            self.watched_dirs.clear();
             self.status_message = Some("Auto-revert disabled".to_string());
         }
     }
 
-    /// Start the file watcher for auto-revert functionality
-    fn start_file_watcher(&mut self) {
-        use notify::{RecursiveMode, Watcher};
+    /// Poll for file changes (called from main loop)
+    ///
+    /// Checks modification times of open files to detect external changes.
+    /// Returns true if any file was changed (requires re-render).
+    pub fn poll_file_changes(&mut self) -> bool {
+        // Skip if auto-revert is disabled
+        if !self.auto_revert_enabled {
+            return false;
+        }
 
-        // Get the sender for async messages
-        let sender = match &self.async_bridge {
-            Some(bridge) => bridge.sender(),
-            None => {
-                tracing::warn!("Cannot start file watcher: no async bridge available");
-                return;
-            }
-        };
+        // Check poll interval
+        let poll_interval =
+            std::time::Duration::from_millis(self.config.editor.auto_revert_poll_interval_ms);
+        let elapsed = self.time_source.elapsed_since(self.last_auto_revert_poll);
+        tracing::trace!(
+            "poll_file_changes: elapsed={:?}, poll_interval={:?}",
+            elapsed,
+            poll_interval
+        );
+        if elapsed < poll_interval {
+            return false;
+        }
+        self.last_auto_revert_poll = self.time_source.now();
 
-        // Create a new watcher
-        // We watch directories (not files) to handle atomic saves where editors
-        // write to a temp file and rename it, which changes the file's inode
-        let watcher_result =
-            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-                match res {
-                    Ok(event) => {
-                        // Handle modify, create, and rename events
-                        // Rename is important for atomic saves (temp file + rename)
-                        let dominated = matches!(
-                            event.kind,
-                            notify::EventKind::Modify(_)
-                                | notify::EventKind::Create(_)
-                                | notify::EventKind::Remove(_)
-                        );
-                        if dominated {
-                            for path in event.paths {
-                                if let Err(e) = sender.send(AsyncMessage::FileChanged {
-                                    path: path.display().to_string(),
-                                }) {
-                                    tracing::error!(
-                                        "Failed to send file change notification: {}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("File watcher error: {}", e);
-                    }
-                }
-            });
+        // Collect paths of open files that need checking
+        let files_to_check: Vec<PathBuf> = self
+            .buffers
+            .values()
+            .filter_map(|state| state.buffer.file_path().map(PathBuf::from))
+            .collect();
 
-        match watcher_result {
-            Ok(mut watcher) => {
-                // Watch parent directories of all currently open files
-                for state in self.buffers.values() {
-                    if let Some(path) = state.buffer.file_path() {
-                        if let Some(parent) = path.parent() {
-                            if !self.watched_dirs.contains(parent) {
-                                if let Err(e) = watcher.watch(parent, RecursiveMode::NonRecursive) {
-                                    tracing::warn!("Failed to watch directory {:?}: {}", parent, e);
-                                } else {
-                                    self.watched_dirs.insert(parent.to_path_buf());
-                                }
-                            }
-                        }
+        let mut any_changed = false;
+
+        for path in files_to_check {
+            // Get current mtime
+            let current_mtime = match std::fs::metadata(&path) {
+                Ok(meta) => match meta.modified() {
+                    Ok(mtime) => mtime,
+                    Err(_) => continue,
+                },
+                Err(_) => continue, // File might have been deleted
+            };
+
+            // Check if mtime has changed
+            if let Some(&stored_mtime) = self.file_mod_times.get(&path) {
+                if current_mtime != stored_mtime {
+                    // Handle the file change (this includes debouncing)
+                    // Note: file_mod_times is updated by handle_file_changed after successful revert,
+                    // not here, to avoid the race where the revert check sees the already-updated mtime
+                    let path_str = path.display().to_string();
+                    if self.handle_async_file_changed(path_str) {
+                        any_changed = true;
                     }
                 }
-                self.file_watcher = Some(watcher);
-                tracing::info!("File watcher started");
-            }
-            Err(e) => {
-                tracing::error!("Failed to create file watcher: {}", e);
-                self.status_message = Some(format!("Failed to start file watcher: {}", e));
+            } else {
+                // First time seeing this file, record its mtime
+                self.file_mod_times.insert(path, current_mtime);
             }
         }
+
+        any_changed
+    }
+
+    /// Poll for file tree changes (called from main loop)
+    ///
+    /// Checks modification times of expanded directories to detect new/deleted files.
+    /// Returns true if any directory was refreshed (requires re-render).
+    pub fn poll_file_tree_changes(&mut self) -> bool {
+        // Check poll interval
+        let poll_interval =
+            std::time::Duration::from_millis(self.config.editor.file_tree_poll_interval_ms);
+        if self.time_source.elapsed_since(self.last_file_tree_poll) < poll_interval {
+            return false;
+        }
+        self.last_file_tree_poll = self.time_source.now();
+
+        // Get file explorer reference
+        let Some(explorer) = &self.file_explorer else {
+            return false;
+        };
+
+        // Collect expanded directories (node_id, path)
+        use crate::view::file_tree::NodeId;
+        let expanded_dirs: Vec<(NodeId, PathBuf)> = explorer
+            .tree()
+            .all_nodes()
+            .filter(|node| node.is_dir() && node.is_expanded())
+            .map(|node| (node.id, node.entry.path.clone()))
+            .collect();
+
+        // Check mtimes and collect directories that need refresh
+        let mut dirs_to_refresh: Vec<NodeId> = Vec::new();
+
+        for (node_id, path) in expanded_dirs {
+            // Get current mtime
+            let current_mtime = match std::fs::metadata(&path) {
+                Ok(meta) => match meta.modified() {
+                    Ok(mtime) => mtime,
+                    Err(_) => continue,
+                },
+                Err(_) => continue, // Directory might have been deleted
+            };
+
+            // Check if mtime has changed
+            if let Some(&stored_mtime) = self.dir_mod_times.get(&path) {
+                if current_mtime != stored_mtime {
+                    // Update stored mtime
+                    self.dir_mod_times.insert(path.clone(), current_mtime);
+                    dirs_to_refresh.push(node_id);
+                    tracing::debug!("Directory changed: {:?}", path);
+                }
+            } else {
+                // First time seeing this directory, record its mtime
+                self.dir_mod_times.insert(path, current_mtime);
+            }
+        }
+
+        // Refresh changed directories
+        if dirs_to_refresh.is_empty() {
+            return false;
+        }
+
+        // Refresh each changed directory
+        if let (Some(runtime), Some(explorer)) = (&self.tokio_runtime, &mut self.file_explorer) {
+            for node_id in dirs_to_refresh {
+                let tree = explorer.tree_mut();
+                if let Err(e) = runtime.block_on(tree.refresh_node(node_id)) {
+                    tracing::warn!("Failed to refresh directory: {}", e);
+                }
+            }
+        }
+
+        true
     }
 
     /// Notify LSP server about a newly opened file
@@ -3870,6 +4432,9 @@ impl Editor {
                     }
                     tracing::info!("Successfully sent didOpen to LSP");
 
+                    // Mark this buffer as opened with this server instance
+                    metadata.lsp_opened_with.insert(client.id());
+
                     // Request pull diagnostics
                     let request_id = self.next_lsp_request_id;
                     self.next_lsp_request_id += 1;
@@ -3924,68 +4489,92 @@ impl Editor {
         }
     }
 
-    /// Add a file to the file watcher (called when opening files)
-    /// We watch the parent directory instead of the file itself to handle
-    /// atomic saves (temp file + rename) which change the file's inode
+    /// Record a file's modification time (called when opening files)
+    /// This is used by the polling-based auto-revert to detect external changes
     fn watch_file(&mut self, path: &Path) {
-        use notify::{RecursiveMode, Watcher};
-
-        // Record current modification time
+        // Record current modification time for polling
         if let Ok(metadata) = std::fs::metadata(path) {
             if let Ok(mtime) = metadata.modified() {
                 self.file_mod_times.insert(path.to_path_buf(), mtime);
-            }
-        }
-
-        // Add parent directory to watcher if auto-revert is enabled
-        if self.auto_revert_enabled {
-            // Start file watcher if not already running
-            if self.file_watcher.is_none() {
-                self.start_file_watcher();
-            }
-            // Watch the parent directory if not already watched
-            if let Some(parent) = path.parent() {
-                if !self.watched_dirs.contains(parent) {
-                    if let Some(watcher) = &mut self.file_watcher {
-                        if let Err(e) = watcher.watch(parent, RecursiveMode::NonRecursive) {
-                            tracing::warn!("Failed to watch directory {:?}: {}", parent, e);
-                        } else {
-                            self.watched_dirs.insert(parent.to_path_buf());
-                        }
-                    }
-                }
             }
         }
     }
 
     /// Notify LSP that a file's contents changed (e.g., after revert)
     fn notify_lsp_file_changed(&mut self, path: &Path) {
-        if let Some(lsp) = &mut self.lsp {
-            if let Ok(uri) = url::Url::from_file_path(path) {
-                if let Ok(lsp_uri) = uri.as_str().parse::<lsp_types::Uri>() {
-                    // Detect language for this file
-                    if let Some(language) = detect_language(path, &self.config.languages) {
-                        // Get the new content
-                        let content = self
-                            .buffers
-                            .values()
-                            .find(|s| s.buffer.file_path() == Some(path))
-                            .and_then(|state| state.buffer.to_string());
+        let Ok(uri) = url::Url::from_file_path(path) else {
+            return;
+        };
+        let Ok(lsp_uri) = uri.as_str().parse::<lsp_types::Uri>() else {
+            return;
+        };
+        let Some(language) = detect_language(path, &self.config.languages) else {
+            return;
+        };
 
-                        // Use full document sync - send the entire new content
-                        if let Some(content) = content {
-                            if let Some(client) = lsp.get_or_spawn(&language) {
-                                let content_change = TextDocumentContentChangeEvent {
-                                    range: None, // None means full document replacement
-                                    range_length: None,
-                                    text: content,
-                                };
-                                if let Err(e) = client.did_change(lsp_uri, vec![content_change]) {
-                                    tracing::warn!("Failed to notify LSP of file change: {}", e);
-                                }
-                            }
-                        }
+        // Find the buffer ID for this path
+        let Some((buffer_id, content)) = self
+            .buffers
+            .iter()
+            .find(|(_, s)| s.buffer.file_path() == Some(path))
+            .and_then(|(id, state)| state.buffer.to_string().map(|t| (*id, t)))
+        else {
+            return;
+        };
+
+        // Get handle ID
+        let handle_id = {
+            let Some(lsp) = self.lsp.as_mut() else {
+                return;
+            };
+            let Some(handle) = lsp.get_or_spawn(&language) else {
+                return;
+            };
+            handle.id()
+        };
+
+        // Check if didOpen needs to be sent first
+        let needs_open = {
+            let Some(metadata) = self.buffer_metadata.get(&buffer_id) else {
+                return;
+            };
+            !metadata.lsp_opened_with.contains(&handle_id)
+        };
+
+        if needs_open {
+            // Send didOpen first
+            if let Some(lsp) = self.lsp.as_mut() {
+                if let Some(handle) = lsp.get_or_spawn(&language) {
+                    if let Err(e) =
+                        handle.did_open(lsp_uri.clone(), content.clone(), language.clone())
+                    {
+                        tracing::warn!("Failed to send didOpen before didChange: {}", e);
+                        return;
                     }
+                    tracing::debug!(
+                        "Sent didOpen for {} to LSP handle {} before file change notification",
+                        lsp_uri.as_str(),
+                        handle_id
+                    );
+                }
+            }
+
+            // Mark as opened
+            if let Some(metadata) = self.buffer_metadata.get_mut(&buffer_id) {
+                metadata.lsp_opened_with.insert(handle_id);
+            }
+        }
+
+        // Use full document sync - send the entire new content
+        if let Some(lsp) = &mut self.lsp {
+            if let Some(client) = lsp.get_or_spawn(&language) {
+                let content_change = TextDocumentContentChangeEvent {
+                    range: None, // None means full document replacement
+                    range_length: None,
+                    text: content,
+                };
+                if let Err(e) = client.did_change(lsp_uri, vec![content_change]) {
+                    tracing::warn!("Failed to notify LSP of file change: {}", e);
                 }
             }
         }
@@ -4130,6 +4719,11 @@ impl Editor {
     /// Get the active theme
     pub fn theme(&self) -> &crate::view::theme::Theme {
         &self.theme
+    }
+
+    /// Check if the settings dialog is open and visible
+    pub fn is_settings_open(&self) -> bool {
+        self.settings_state.as_ref().is_some_and(|s| s.visible)
     }
 
     /// Request the editor to quit
@@ -4298,7 +4892,7 @@ impl Editor {
         // Check if enough time has passed since last auto-save
         let interval =
             std::time::Duration::from_secs(self.config.editor.auto_save_interval_secs as u64);
-        if self.last_auto_save.elapsed() < interval {
+        if self.time_source.elapsed_since(self.last_auto_save) < interval {
             return Ok(0);
         }
 
@@ -4330,7 +4924,7 @@ impl Editor {
         // Early exit if nothing to save
         if buffer_info.is_empty() {
             // Still update the timer to avoid checking buffers too frequently
-            self.last_auto_save = std::time::Instant::now();
+            self.last_auto_save = self.time_source.now();
             return Ok(0);
         }
 
@@ -4417,7 +5011,7 @@ impl Editor {
             }
         }
 
-        self.last_auto_save = std::time::Instant::now();
+        self.last_auto_save = self.time_source.now();
         Ok(saved_count)
     }
 
@@ -4528,6 +5122,9 @@ impl Editor {
         prompt_type: PromptType,
         suggestions: Vec<Suggestion>,
     ) {
+        // Dismiss transient popups and clear hover state when opening a prompt
+        self.on_editor_focus_lost();
+
         // Clear search highlights when starting a new search prompt
         // This ensures old highlights from previous searches don't persist
         match prompt_type {
@@ -4561,6 +5158,9 @@ impl Editor {
         prompt_type: PromptType,
         initial_text: String,
     ) {
+        // Dismiss transient popups and clear hover state when opening a prompt
+        self.on_editor_focus_lost();
+
         self.prompt = Some(Prompt::with_initial_text(
             message,
             prompt_type,
@@ -4916,6 +5516,12 @@ impl Editor {
             PromptType::Search | PromptType::ReplaceSearch | PromptType::QueryReplaceSearch => {
                 // Update incremental search highlights as user types
                 self.update_search_highlights(&input);
+                // Reset history navigation when user types - allows Up to navigate history
+                self.search_history.reset_navigation();
+            }
+            PromptType::Replace { .. } | PromptType::QueryReplace { .. } => {
+                // Reset history navigation when user types - allows Up to navigate history
+                self.replace_history.reset_navigation();
             }
             PromptType::OpenFile | PromptType::SwitchProject => {
                 // For OpenFile/SwitchProject, update the file browser filter (native implementation)
@@ -5258,8 +5864,12 @@ impl Editor {
             let _ = checker.poll_result();
         }
 
+        // Poll for file changes (auto-revert) and file tree changes
+        let file_changes = self.poll_file_changes();
+        let tree_changes = self.poll_file_tree_changes();
+
         // Trigger render if any async messages, plugin commands were processed, or plugin requested render
-        needs_render || processed_any_commands || plugin_render
+        needs_render || processed_any_commands || plugin_render || file_changes || tree_changes
     }
 
     /// Update LSP status bar string from active progress operations
@@ -5444,13 +6054,7 @@ impl Editor {
 
             // Update user config (raw file contents, not merged with defaults)
             // This allows plugins to distinguish between user-set and default values
-            for config_path in Config::default_config_paths() {
-                if let Ok(contents) = std::fs::read_to_string(config_path) {
-                    snapshot.user_config = serde_json::from_str(&contents)
-                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                    break;
-                }
-            }
+            snapshot.user_config = Config::read_user_config_raw(&self.working_dir);
         }
     }
 
@@ -6179,6 +6783,7 @@ impl Editor {
         };
         let popup_data = PopupData {
             title: Some("Completion".to_string()),
+            transient: false,
             content: PopupContentData::List {
                 items: popup_items
                     .into_iter()
@@ -6322,6 +6927,76 @@ impl Editor {
         }
     }
 
+    /// Execute a closure with LSP handle, ensuring didOpen was sent first.
+    ///
+    /// This helper centralizes the logic for:
+    /// 1. Getting buffer metadata, URI, and language
+    /// 2. Getting or spawning the LSP handle
+    /// 3. Ensuring didOpen was sent to this server instance (lazy - only gets text if needed)
+    /// 4. Calling the provided closure with the handle
+    ///
+    /// Returns None if any step fails (no file, no language, LSP disabled, etc.)
+    fn with_lsp_for_buffer<F, R>(&mut self, buffer_id: BufferId, f: F) -> Option<R>
+    where
+        F: FnOnce(&crate::services::lsp::async_handler::LspHandle, &lsp_types::Uri, &str) -> R,
+    {
+        // Get metadata (immutable borrow first to extract what we need)
+        let (uri, _path, language) = {
+            let metadata = self.buffer_metadata.get(&buffer_id)?;
+            if !metadata.lsp_enabled {
+                return None;
+            }
+            let uri = metadata.file_uri()?.clone();
+            let path = metadata.file_path()?.to_path_buf();
+            let language = detect_language(&path, &self.config.languages)?;
+            (uri, path, language)
+        };
+
+        // Get handle ID (spawning if needed)
+        let handle_id = {
+            let lsp = self.lsp.as_mut()?;
+            let handle = lsp.get_or_spawn(&language)?;
+            handle.id()
+        };
+
+        // Check if didOpen is needed
+        let needs_open = {
+            let metadata = self.buffer_metadata.get(&buffer_id)?;
+            !metadata.lsp_opened_with.contains(&handle_id)
+        };
+
+        if needs_open {
+            // Only now get the text (can be expensive for large buffers)
+            let text = self.buffers.get(&buffer_id)?.buffer.to_string()?;
+
+            // Send didOpen
+            {
+                let lsp = self.lsp.as_mut()?;
+                let handle = lsp.get_or_spawn(&language)?;
+                if let Err(e) = handle.did_open(uri.clone(), text, language.clone()) {
+                    tracing::warn!("Failed to send didOpen: {}", e);
+                    return None;
+                }
+            }
+
+            // Mark as opened with this server instance
+            let metadata = self.buffer_metadata.get_mut(&buffer_id)?;
+            metadata.lsp_opened_with.insert(handle_id);
+
+            tracing::debug!(
+                "Sent didOpen for {} to LSP handle {} (language: {})",
+                uri.as_str(),
+                handle_id,
+                language
+            );
+        }
+
+        // Call the closure with the handle
+        let lsp = self.lsp.as_mut()?;
+        let handle = lsp.get_or_spawn(&language)?;
+        Some(f(handle, &uri, &language))
+    }
+
     /// Request LSP completion at current cursor position
     fn request_completion(&mut self) -> io::Result<()> {
         // Get the current buffer and cursor position
@@ -6330,41 +7005,30 @@ impl Editor {
 
         // Convert byte position to LSP position (line, UTF-16 code units)
         let (line, character) = state.buffer.position_to_lsp_position(cursor_pos);
+        let buffer_id = self.active_buffer();
+        let request_id = self.next_lsp_request_id;
 
-        // Get the current file URI and path
-        let metadata = self.buffer_metadata.get(&self.active_buffer());
-        let (uri, file_path) = if let Some(meta) = metadata {
-            (meta.file_uri(), meta.file_path())
-        } else {
-            (None, None)
-        };
-
-        if let (Some(uri), Some(path)) = (uri, file_path) {
-            // Detect language from file extension
-            if let Some(language) = detect_language(path, &self.config.languages) {
-                // Get LSP handle
-                if let Some(lsp) = self.lsp.as_mut() {
-                    if let Some(handle) = lsp.get_or_spawn(&language) {
-                        let request_id = self.next_lsp_request_id;
-                        self.next_lsp_request_id += 1;
-                        self.pending_completion_request = Some(request_id);
-                        self.lsp_status = "LSP: completion...".to_string();
-
-                        let _ = handle.completion(
-                            request_id,
-                            uri.clone(),
-                            line as u32,
-                            character as u32,
-                        );
-                        tracing::info!(
-                            "Requested completion at {}:{}:{}",
-                            uri.as_str(),
-                            line,
-                            character
-                        );
-                    }
+        // Use helper to ensure didOpen is sent before the request
+        let sent = self
+            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
+                let result =
+                    handle.completion(request_id, uri.clone(), line as u32, character as u32);
+                if result.is_ok() {
+                    tracing::info!(
+                        "Requested completion at {}:{}:{}",
+                        uri.as_str(),
+                        line,
+                        character
+                    );
                 }
-            }
+                result.is_ok()
+            })
+            .unwrap_or(false);
+
+        if sent {
+            self.next_lsp_request_id += 1;
+            self.pending_completion_request = Some(request_id);
+            self.lsp_status = "LSP: completion...".to_string();
         }
 
         Ok(())
@@ -6378,40 +7042,29 @@ impl Editor {
 
         // Convert byte position to LSP position (line, UTF-16 code units)
         let (line, character) = state.buffer.position_to_lsp_position(cursor_pos);
+        let buffer_id = self.active_buffer();
+        let request_id = self.next_lsp_request_id;
 
-        // Get the current file URI and path
-        let metadata = self.buffer_metadata.get(&self.active_buffer());
-        let (uri, file_path) = if let Some(meta) = metadata {
-            (meta.file_uri(), meta.file_path())
-        } else {
-            (None, None)
-        };
-
-        if let (Some(uri), Some(path)) = (uri, file_path) {
-            // Detect language from file extension
-            if let Some(language) = detect_language(path, &self.config.languages) {
-                // Get LSP handle
-                if let Some(lsp) = self.lsp.as_mut() {
-                    if let Some(handle) = lsp.get_or_spawn(&language) {
-                        let request_id = self.next_lsp_request_id;
-                        self.next_lsp_request_id += 1;
-                        self.pending_goto_definition_request = Some(request_id);
-
-                        let _ = handle.goto_definition(
-                            request_id,
-                            uri.clone(),
-                            line as u32,
-                            character as u32,
-                        );
-                        tracing::info!(
-                            "Requested go-to-definition at {}:{}:{}",
-                            uri.as_str(),
-                            line,
-                            character
-                        );
-                    }
+        // Use helper to ensure didOpen is sent before the request
+        let sent = self
+            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
+                let result =
+                    handle.goto_definition(request_id, uri.clone(), line as u32, character as u32);
+                if result.is_ok() {
+                    tracing::info!(
+                        "Requested go-to-definition at {}:{}:{}",
+                        uri.as_str(),
+                        line,
+                        character
+                    );
                 }
-            }
+                result.is_ok()
+            })
+            .unwrap_or(false);
+
+        if sent {
+            self.next_lsp_request_id += 1;
+            self.pending_goto_definition_request = Some(request_id);
         }
 
         Ok(())
@@ -6437,37 +7090,30 @@ impl Editor {
             );
         }
 
-        // Get the current file URI and path
-        let metadata = self.buffer_metadata.get(&self.active_buffer());
-        let (uri, file_path) = if let Some(meta) = metadata {
-            (meta.file_uri(), meta.file_path())
-        } else {
-            (None, None)
-        };
+        let buffer_id = self.active_buffer();
+        let request_id = self.next_lsp_request_id;
 
-        if let (Some(uri), Some(path)) = (uri, file_path) {
-            // Detect language from file extension
-            if let Some(language) = detect_language(path, &self.config.languages) {
-                // Get LSP handle
-                if let Some(lsp) = self.lsp.as_mut() {
-                    if let Some(handle) = lsp.get_or_spawn(&language) {
-                        let request_id = self.next_lsp_request_id;
-                        self.next_lsp_request_id += 1;
-                        self.pending_hover_request = Some(request_id);
-                        self.lsp_status = "LSP: hover...".to_string();
-
-                        let _ =
-                            handle.hover(request_id, uri.clone(), line as u32, character as u32);
-                        tracing::info!(
-                            "Requested hover at {}:{}:{} (byte_pos={})",
-                            uri.as_str(),
-                            line,
-                            character,
-                            cursor_pos
-                        );
-                    }
+        // Use helper to ensure didOpen is sent before the request
+        let sent = self
+            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
+                let result = handle.hover(request_id, uri.clone(), line as u32, character as u32);
+                if result.is_ok() {
+                    tracing::info!(
+                        "Requested hover at {}:{}:{} (byte_pos={})",
+                        uri.as_str(),
+                        line,
+                        character,
+                        cursor_pos
+                    );
                 }
-            }
+                result.is_ok()
+            })
+            .unwrap_or(false);
+
+        if sent {
+            self.next_lsp_request_id += 1;
+            self.pending_hover_request = Some(request_id);
+            self.lsp_status = "LSP: hover...".to_string();
         }
 
         Ok(())
@@ -6493,37 +7139,30 @@ impl Editor {
             );
         }
 
-        // Get the current file URI and path
-        let metadata = self.buffer_metadata.get(&self.active_buffer());
-        let (uri, file_path) = if let Some(meta) = metadata {
-            (meta.file_uri(), meta.file_path())
-        } else {
-            (None, None)
-        };
+        let buffer_id = self.active_buffer();
+        let request_id = self.next_lsp_request_id;
 
-        if let (Some(uri), Some(path)) = (uri, file_path) {
-            // Detect language from file extension
-            if let Some(language) = detect_language(path, &self.config.languages) {
-                // Get LSP handle
-                if let Some(lsp) = self.lsp.as_mut() {
-                    if let Some(handle) = lsp.get_or_spawn(&language) {
-                        let request_id = self.next_lsp_request_id;
-                        self.next_lsp_request_id += 1;
-                        self.pending_hover_request = Some(request_id);
-                        self.lsp_status = "LSP: hover...".to_string();
-
-                        let _ =
-                            handle.hover(request_id, uri.clone(), line as u32, character as u32);
-                        tracing::debug!(
-                            "Mouse hover requested at {}:{}:{} (byte_pos={})",
-                            uri.as_str(),
-                            line,
-                            character,
-                            byte_pos
-                        );
-                    }
+        // Use helper to ensure didOpen is sent before the request
+        let sent = self
+            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
+                let result = handle.hover(request_id, uri.clone(), line as u32, character as u32);
+                if result.is_ok() {
+                    tracing::debug!(
+                        "Mouse hover requested at {}:{}:{} (byte_pos={})",
+                        uri.as_str(),
+                        line,
+                        character,
+                        byte_pos
+                    );
                 }
-            }
+                result.is_ok()
+            })
+            .unwrap_or(false);
+
+        if sent {
+            self.next_lsp_request_id += 1;
+            self.pending_hover_request = Some(request_id);
+            self.lsp_status = "LSP: hover...".to_string();
         }
 
         Ok(())
@@ -6613,6 +7252,7 @@ impl Editor {
 
         // Configure popup properties
         popup.title = Some("Hover".to_string());
+        popup.transient = true;
         // Use mouse position if this was a mouse-triggered hover, otherwise use cursor position
         popup.position = if let Some((x, y)) = self.mouse_hover_screen_position.take() {
             // Position below the mouse, offset by 1 row
@@ -6757,43 +7397,32 @@ impl Editor {
 
         // Convert byte position to LSP position (line, UTF-16 code units)
         let (line, character) = state.buffer.position_to_lsp_position(cursor_pos);
+        let buffer_id = self.active_buffer();
+        let request_id = self.next_lsp_request_id;
 
-        // Get the current file URI and path
-        let metadata = self.buffer_metadata.get(&self.active_buffer());
-        let (uri, file_path) = if let Some(meta) = metadata {
-            (meta.file_uri(), meta.file_path())
-        } else {
-            (None, None)
-        };
-
-        if let (Some(uri), Some(path)) = (uri, file_path) {
-            // Detect language from file extension
-            if let Some(language) = detect_language(path, &self.config.languages) {
-                // Get LSP handle
-                if let Some(lsp) = self.lsp.as_mut() {
-                    if let Some(handle) = lsp.get_or_spawn(&language) {
-                        let request_id = self.next_lsp_request_id;
-                        self.next_lsp_request_id += 1;
-                        self.pending_references_request = Some(request_id);
-                        self.pending_references_symbol = symbol;
-                        self.lsp_status = "LSP: finding references...".to_string();
-
-                        let _ = handle.references(
-                            request_id,
-                            uri.clone(),
-                            line as u32,
-                            character as u32,
-                        );
-                        tracing::info!(
-                            "Requested find references at {}:{}:{} (byte_pos={})",
-                            uri.as_str(),
-                            line,
-                            character,
-                            cursor_pos
-                        );
-                    }
+        // Use helper to ensure didOpen is sent before the request
+        let sent = self
+            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
+                let result =
+                    handle.references(request_id, uri.clone(), line as u32, character as u32);
+                if result.is_ok() {
+                    tracing::info!(
+                        "Requested find references at {}:{}:{} (byte_pos={})",
+                        uri.as_str(),
+                        line,
+                        character,
+                        cursor_pos
+                    );
                 }
-            }
+                result.is_ok()
+            })
+            .unwrap_or(false);
+
+        if sent {
+            self.next_lsp_request_id += 1;
+            self.pending_references_request = Some(request_id);
+            self.pending_references_symbol = symbol;
+            self.lsp_status = "LSP: finding references...".to_string();
         }
 
         Ok(())
@@ -6807,42 +7436,31 @@ impl Editor {
 
         // Convert byte position to LSP position (line, UTF-16 code units)
         let (line, character) = state.buffer.position_to_lsp_position(cursor_pos);
+        let buffer_id = self.active_buffer();
+        let request_id = self.next_lsp_request_id;
 
-        // Get the current file URI and path
-        let metadata = self.buffer_metadata.get(&self.active_buffer());
-        let (uri, file_path) = if let Some(meta) = metadata {
-            (meta.file_uri(), meta.file_path())
-        } else {
-            (None, None)
-        };
-
-        if let (Some(uri), Some(path)) = (uri, file_path) {
-            // Detect language from file extension
-            if let Some(language) = detect_language(path, &self.config.languages) {
-                // Get LSP handle
-                if let Some(lsp) = self.lsp.as_mut() {
-                    if let Some(handle) = lsp.get_or_spawn(&language) {
-                        let request_id = self.next_lsp_request_id;
-                        self.next_lsp_request_id += 1;
-                        self.pending_signature_help_request = Some(request_id);
-                        self.lsp_status = "LSP: signature help...".to_string();
-
-                        let _ = handle.signature_help(
-                            request_id,
-                            uri.clone(),
-                            line as u32,
-                            character as u32,
-                        );
-                        tracing::info!(
-                            "Requested signature help at {}:{}:{} (byte_pos={})",
-                            uri.as_str(),
-                            line,
-                            character,
-                            cursor_pos
-                        );
-                    }
+        // Use helper to ensure didOpen is sent before the request
+        let sent = self
+            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
+                let result =
+                    handle.signature_help(request_id, uri.clone(), line as u32, character as u32);
+                if result.is_ok() {
+                    tracing::info!(
+                        "Requested signature help at {}:{}:{} (byte_pos={})",
+                        uri.as_str(),
+                        line,
+                        character,
+                        cursor_pos
+                    );
                 }
-            }
+                result.is_ok()
+            })
+            .unwrap_or(false);
+
+        if sent {
+            self.next_lsp_request_id += 1;
+            self.pending_signature_help_request = Some(request_id);
+            self.lsp_status = "LSP: signature help...".to_string();
         }
 
         Ok(())
@@ -6909,7 +7527,7 @@ impl Editor {
                 };
 
                 if !param_label.is_empty() {
-                    lines.push(format!("▶ {}", param_label));
+                    lines.push(format!("> {}", param_label));
                 }
 
                 // Add parameter documentation if available
@@ -6947,6 +7565,7 @@ impl Editor {
 
         let mut popup = Popup::text(lines, &self.theme);
         popup.title = Some("Signature Help".to_string());
+        popup.transient = true;
         popup.position = PopupPosition::BelowCursor;
         popup.width = 60;
         popup.max_height = 10;
@@ -6984,48 +7603,41 @@ impl Editor {
 
         // Get diagnostics at cursor position for context
         // TODO: Implement diagnostic retrieval when needed
-        let diagnostics = Vec::new();
+        let diagnostics: Vec<lsp_types::Diagnostic> = Vec::new();
+        let buffer_id = self.active_buffer();
+        let request_id = self.next_lsp_request_id;
 
-        // Get the current file URI and path
-        let metadata = self.buffer_metadata.get(&self.active_buffer());
-        let (uri, file_path) = if let Some(meta) = metadata {
-            (meta.file_uri(), meta.file_path())
-        } else {
-            (None, None)
-        };
-
-        if let (Some(uri), Some(path)) = (uri, file_path) {
-            // Detect language from file extension
-            if let Some(language) = detect_language(path, &self.config.languages) {
-                // Get LSP handle
-                if let Some(lsp) = self.lsp.as_mut() {
-                    if let Some(handle) = lsp.get_or_spawn(&language) {
-                        let request_id = self.next_lsp_request_id;
-                        self.next_lsp_request_id += 1;
-                        self.pending_code_actions_request = Some(request_id);
-                        self.lsp_status = "LSP: code actions...".to_string();
-
-                        let _ = handle.code_actions(
-                            request_id,
-                            uri.clone(),
-                            start_line,
-                            start_char,
-                            end_line,
-                            end_char,
-                            diagnostics,
-                        );
-                        tracing::info!(
-                            "Requested code actions at {}:{}:{}-{}:{} (byte_pos={})",
-                            uri.as_str(),
-                            start_line,
-                            start_char,
-                            end_line,
-                            end_char,
-                            cursor_pos
-                        );
-                    }
+        // Use helper to ensure didOpen is sent before the request
+        let sent = self
+            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
+                let result = handle.code_actions(
+                    request_id,
+                    uri.clone(),
+                    start_line,
+                    start_char,
+                    end_line,
+                    end_char,
+                    diagnostics,
+                );
+                if result.is_ok() {
+                    tracing::info!(
+                        "Requested code actions at {}:{}:{}-{}:{} (byte_pos={})",
+                        uri.as_str(),
+                        start_line,
+                        start_char,
+                        end_line,
+                        end_char,
+                        cursor_pos
+                    );
                 }
-            }
+                result.is_ok()
+            })
+            .unwrap_or(false);
+
+        if sent {
+            self.next_lsp_request_id += 1;
+            self.pending_code_actions_request = Some(request_id);
+            self.lsp_status = "LSP: code actions...".to_string();
         }
 
         Ok(())
@@ -7530,6 +8142,68 @@ impl Editor {
             uri.as_str()
         );
 
+        // Get handle ID first
+        let handle_id = {
+            let Some(lsp) = self.lsp.as_mut() else {
+                tracing::debug!("send_lsp_changes_for_buffer: no LSP manager available");
+                return;
+            };
+            let Some(handle) = lsp.get_or_spawn(&language) else {
+                tracing::warn!(
+                    "send_lsp_changes_for_buffer: failed to get or spawn LSP client for {}",
+                    language
+                );
+                return;
+            };
+            handle.id()
+        };
+
+        // Check if didOpen needs to be sent first
+        let needs_open = {
+            let Some(metadata) = self.buffer_metadata.get(&buffer_id) else {
+                return;
+            };
+            !metadata.lsp_opened_with.contains(&handle_id)
+        };
+
+        if needs_open {
+            // Get text for didOpen
+            let text = match self
+                .buffers
+                .get(&buffer_id)
+                .and_then(|s| s.buffer.to_string())
+            {
+                Some(t) => t,
+                None => {
+                    tracing::debug!(
+                        "send_lsp_changes_for_buffer: buffer text not available for didOpen"
+                    );
+                    return;
+                }
+            };
+
+            // Send didOpen first
+            if let Some(lsp) = self.lsp.as_mut() {
+                if let Some(handle) = lsp.get_or_spawn(&language) {
+                    if let Err(e) = handle.did_open(uri.clone(), text, language.clone()) {
+                        tracing::warn!("Failed to send didOpen before didChange: {}", e);
+                        return;
+                    }
+                    tracing::debug!(
+                        "Sent didOpen for {} to LSP handle {} before didChange",
+                        uri.as_str(),
+                        handle_id
+                    );
+                }
+            }
+
+            // Mark as opened
+            if let Some(metadata) = self.buffer_metadata.get_mut(&buffer_id) {
+                metadata.lsp_opened_with.insert(handle_id);
+            }
+        }
+
+        // Now send didChange
         if let Some(lsp) = &mut self.lsp {
             if let Some(client) = lsp.get_or_spawn(&language) {
                 if let Err(e) = client.did_change(uri, changes) {
@@ -7537,14 +8211,7 @@ impl Editor {
                 } else {
                     tracing::trace!("Successfully sent batched didChange to LSP");
                 }
-            } else {
-                tracing::warn!(
-                    "send_lsp_changes_for_buffer: failed to get or spawn LSP client for {}",
-                    language
-                );
             }
-        } else {
-            tracing::debug!("send_lsp_changes_for_buffer: no LSP manager available");
         }
     }
 
@@ -7632,43 +8299,41 @@ impl Editor {
         // LSP uses UTF-16 code units for character offsets, not byte offsets
         let state = self.active_state();
         let (line, character) = state.buffer.position_to_lsp_position(rename_pos);
+        let buffer_id = self.active_buffer();
+        let request_id = self.next_lsp_request_id;
 
-        // Get the current file URI and path
-        let metadata = self.buffer_metadata.get(&self.active_buffer());
-        let (uri, file_path) = if let Some(meta) = metadata {
-            (meta.file_uri(), meta.file_path())
-        } else {
-            (None, None)
-        };
-
-        if let (Some(uri), Some(path)) = (uri, file_path) {
-            // Detect language from file extension
-            if let Some(language) = detect_language(path, &self.config.languages) {
-                // Get LSP handle
-                if let Some(lsp) = self.lsp.as_mut() {
-                    if let Some(handle) = lsp.get_or_spawn(&language) {
-                        let request_id = self.next_lsp_request_id;
-                        self.next_lsp_request_id += 1;
-                        self.lsp_status = "LSP: rename...".to_string();
-
-                        let _ = handle.rename(
-                            request_id,
-                            uri.clone(),
-                            line as u32,
-                            character as u32,
-                            new_name.clone(),
-                        );
-                        tracing::info!(
-                            "Requested rename at {}:{}:{} to '{}'",
-                            uri.as_str(),
-                            line,
-                            character,
-                            new_name
-                        );
-                    }
+        // Use helper to ensure didOpen is sent before the request
+        let sent = self
+            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
+                let result = handle.rename(
+                    request_id,
+                    uri.clone(),
+                    line as u32,
+                    character as u32,
+                    new_name.clone(),
+                );
+                if result.is_ok() {
+                    tracing::info!(
+                        "Requested rename at {}:{}:{} to '{}'",
+                        uri.as_str(),
+                        line,
+                        character,
+                        new_name
+                    );
                 }
-            }
-        } else {
+                result.is_ok()
+            })
+            .unwrap_or(false);
+
+        if sent {
+            self.next_lsp_request_id += 1;
+            self.lsp_status = "LSP: rename...".to_string();
+        } else if self
+            .buffer_metadata
+            .get(&buffer_id)
+            .and_then(|m| m.file_path())
+            .is_none()
+        {
             self.status_message = Some("Cannot rename in unsaved buffer".to_string());
         }
     }
@@ -7755,7 +8420,14 @@ mod tests {
     fn test_editor_new() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         assert_eq!(editor.buffers.len(), 1);
         assert!(!editor.should_quit());
@@ -7765,7 +8437,14 @@ mod tests {
     fn test_new_buffer() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         let id = editor.new_buffer();
         assert_eq!(editor.buffers.len(), 2);
@@ -7777,7 +8456,14 @@ mod tests {
     fn test_clipboard() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Manually set clipboard (using internal to avoid system clipboard in tests)
         editor.clipboard.set_internal("test".to_string());
@@ -7793,7 +8479,14 @@ mod tests {
     fn test_action_to_events_insert_char() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         let events = editor.action_to_events(Action::InsertChar('a'));
         assert!(events.is_some());
@@ -7814,7 +8507,14 @@ mod tests {
     fn test_action_to_events_move_right() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Insert some text first
         let state = editor.active_state_mut();
@@ -7848,7 +8548,14 @@ mod tests {
     fn test_action_to_events_move_up_down() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Insert multi-line text
         let state = editor.active_state_mut();
@@ -7887,7 +8594,14 @@ mod tests {
     fn test_action_to_events_insert_newline() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         let events = editor.action_to_events(Action::InsertNewline);
         assert!(events.is_some());
@@ -7907,7 +8621,14 @@ mod tests {
     fn test_action_to_events_unimplemented() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // These actions should return None (not yet implemented)
         assert!(editor.action_to_events(Action::Save).is_none());
@@ -7919,7 +8640,14 @@ mod tests {
     fn test_action_to_events_delete_backward() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Insert some text first
         let state = editor.active_state_mut();
@@ -7952,7 +8680,14 @@ mod tests {
     fn test_action_to_events_delete_forward() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Insert some text first
         let state = editor.active_state_mut();
@@ -7996,7 +8731,14 @@ mod tests {
     fn test_action_to_events_select_right() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Insert some text first
         let state = editor.active_state_mut();
@@ -8040,7 +8782,14 @@ mod tests {
     fn test_action_to_events_select_all() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Insert some text first
         let state = editor.active_state_mut();
@@ -8073,7 +8822,14 @@ mod tests {
     fn test_action_to_events_document_nav() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Insert multi-line text
         let state = editor.active_state_mut();
@@ -8112,7 +8868,14 @@ mod tests {
 
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Insert some text first to have positions to place cursors
         {
@@ -8178,7 +8941,14 @@ mod tests {
     fn test_action_to_events_scroll() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Test ScrollUp
         let events = editor.action_to_events(Action::ScrollUp);
@@ -8209,7 +8979,14 @@ mod tests {
     fn test_action_to_events_none() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // None action should return None
         let events = editor.action_to_events(Action::None);
@@ -8387,7 +9164,14 @@ mod tests {
     fn test_goto_matching_bracket_forward() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Insert text with brackets
         let state = editor.active_state_mut();
@@ -8424,7 +9208,14 @@ mod tests {
     fn test_goto_matching_bracket_backward() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Insert text with brackets
         let state = editor.active_state_mut();
@@ -8456,7 +9247,14 @@ mod tests {
     fn test_goto_matching_bracket_nested() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Insert text with nested brackets
         let state = editor.active_state_mut();
@@ -8488,7 +9286,14 @@ mod tests {
     fn test_search_case_sensitive() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Insert text
         let state = editor.active_state_mut();
@@ -8529,7 +9334,14 @@ mod tests {
     fn test_search_whole_word() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Insert text
         let state = editor.active_state_mut();
@@ -8569,7 +9381,14 @@ mod tests {
     fn test_bookmarks() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Insert text
         let state = editor.active_state_mut();
@@ -8757,7 +9576,14 @@ mod tests {
 
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Set buffer content: "fn foo(val: i32) {\n    val + 1\n}\n"
         // Line 0: positions 0-19 (includes newline)
@@ -8897,7 +9723,14 @@ mod tests {
 
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Set buffer content: "fn foo(val: i32) {\n    val + 1\n}\n"
         // Line 0: positions 0-19 (includes newline)
@@ -8992,7 +9825,14 @@ mod tests {
 
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
 
         // Initial content: "fn foo(val: i32) {\n    val + 1\n}\n"
         let initial = "fn foo(val: i32) {\n    val + 1\n}\n";
@@ -9161,7 +10001,14 @@ mod tests {
     fn test_ensure_active_tab_visible_static_offset() {
         let config = Config::default();
         let (dir_context, _temp) = test_dir_context();
-        let mut editor = Editor::new(config, 80, 24, dir_context).unwrap();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+        )
+        .unwrap();
         let split_id = editor.split_manager.active_split();
 
         // Create three buffers with long names to force scrolling.

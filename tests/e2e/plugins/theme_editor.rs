@@ -657,10 +657,19 @@ fn test_color_prompt_shows_suggestions() {
         harness
             .send_key(KeyCode::Enter, KeyModifiers::NONE)
             .unwrap();
-        harness.render().unwrap();
 
-        let screen = harness.screen_to_string();
-        if screen.contains("#RRGGBB") || screen.contains("(#RRGGBB or named)") {
+        // Wait for either prompt to appear or a short timeout
+        let found = harness
+            .wait_for_async(
+                |h| {
+                    let screen = h.screen_to_string();
+                    screen.contains("#RRGGBB") || screen.contains("(#RRGGBB or named)")
+                },
+                500,
+            )
+            .unwrap();
+
+        if found {
             prompt_opened = true;
             break;
         }
@@ -1078,13 +1087,13 @@ fn test_cursor_x_position_preserved_after_section_toggle() {
         let screen = harness.screen_to_string();
         let (cx, cy) = harness.screen_cursor_position();
         eprintln!("After down {}: cursor at ({}, {})", i, cx, cy);
-        if screen.contains("▶ UI Elements") {
+        if screen.contains("> UI Elements") {
             // Check if we're actually on that line
             let lines: Vec<&str> = screen.lines().collect();
             if cy < lines.len() as u16 {
                 let cursor_line = lines[cy as usize];
                 eprintln!("Cursor line: {}", cursor_line);
-                if cursor_line.contains("▶ UI Elements") {
+                if cursor_line.contains("> UI Elements") {
                     found_ui_elements = true;
                     break;
                 }
@@ -1120,10 +1129,10 @@ fn test_cursor_x_position_preserved_after_section_toggle() {
     eprintln!("Cursor position: ({}, {})", cursor_x_after, cursor_y_after);
     eprintln!("Screen:\n{}", screen_after);
 
-    // Verify we actually toggled (▶ should become ▼)
+    // Verify we actually toggled (> should become ▼)
     assert!(
-        screen_before.contains("▶ UI Elements"),
-        "Before toggle should show collapsed UI Elements (▶). Screen:\n{}",
+        screen_before.contains("> UI Elements"),
+        "Before toggle should show collapsed UI Elements (>). Screen:\n{}",
         screen_before
     );
     assert!(

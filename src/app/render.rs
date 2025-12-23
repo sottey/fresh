@@ -179,6 +179,7 @@ impl Editor {
                     // This allows plugins to transform the view (e.g., soft breaks for markdown)
                     let visible_count = split_area.height as usize;
                     let is_binary = state.buffer.is_binary();
+                    let line_ending = state.buffer.line_ending();
                     let base_tokens =
                         crate::view::ui::split_rendering::SplitRenderer::build_base_tokens_for_hook(
                             &mut state.buffer,
@@ -186,6 +187,7 @@ impl Editor {
                             self.config.editor.estimated_line_length,
                             visible_count,
                             is_binary,
+                            line_ending,
                         );
                     let viewport_start = viewport_top_byte;
                     let viewport_end = base_tokens
@@ -659,6 +661,16 @@ impl Editor {
             .set(context_keys::HAS_SELECTION, has_selection);
 
         // Render settings modal (before menu bar so menus can overlay)
+        // Check visibility first to avoid borrow conflict with dimming
+        let settings_visible = self
+            .settings_state
+            .as_ref()
+            .map(|s| s.visible)
+            .unwrap_or(false);
+        if settings_visible {
+            // Dim the editor content behind the settings modal
+            crate::view::dimming::apply_dimming(frame, size);
+        }
         if let Some(ref mut settings_state) = self.settings_state {
             if settings_state.visible {
                 settings_state.update_focus_states();
@@ -718,6 +730,12 @@ impl Editor {
                 self.apply_keyboard_capture_dimming(frame, terminal_area);
             }
         }
+
+        // Convert all colors for terminal capability (256/16 color fallback)
+        crate::view::color_support::convert_buffer_colors(
+            frame.buffer_mut(),
+            self.color_capability,
+        );
     }
 
     /// Apply dimming effect to UI elements outside the focused terminal area
@@ -727,68 +745,8 @@ impl Editor {
         frame: &mut Frame,
         terminal_area: ratatui::layout::Rect,
     ) {
-        use ratatui::style::Color;
-
         let size = frame.area();
-        let buf = frame.buffer_mut();
-
-        // Helper to dim a color by reducing its brightness
-        let dim_color = |color: Color| -> Color {
-            match color {
-                Color::Rgb(r, g, b) => {
-                    // Reduce brightness by 60%
-                    Color::Rgb(r / 3, g / 3, b / 3)
-                }
-                Color::Indexed(idx) => {
-                    // For indexed colors, just use dark gray
-                    if idx == 0 {
-                        Color::Rgb(10, 10, 10)
-                    } else {
-                        Color::Rgb(40, 40, 40)
-                    }
-                }
-                Color::Black => Color::Rgb(10, 10, 10),
-                Color::White => Color::Rgb(85, 85, 85),
-                Color::Red => Color::Rgb(60, 20, 20),
-                Color::Green => Color::Rgb(20, 60, 20),
-                Color::Yellow => Color::Rgb(60, 60, 20),
-                Color::Blue => Color::Rgb(20, 20, 60),
-                Color::Magenta => Color::Rgb(60, 20, 60),
-                Color::Cyan => Color::Rgb(20, 60, 60),
-                Color::Gray => Color::Rgb(40, 40, 40),
-                Color::DarkGray => Color::Rgb(20, 20, 20),
-                Color::LightRed => Color::Rgb(80, 30, 30),
-                Color::LightGreen => Color::Rgb(30, 80, 30),
-                Color::LightYellow => Color::Rgb(80, 80, 30),
-                Color::LightBlue => Color::Rgb(30, 30, 80),
-                Color::LightMagenta => Color::Rgb(80, 30, 80),
-                Color::LightCyan => Color::Rgb(30, 80, 80),
-                Color::Reset => Color::Rgb(30, 30, 30),
-            }
-        };
-
-        // Dim all cells outside the active terminal's content area
-        // This includes: menu bar, status bar, other splits, file explorer, tabs
-        for y in 0..size.height {
-            for x in 0..size.width {
-                // Skip cells inside the terminal content area (preserve terminal display)
-                if x >= terminal_area.x
-                    && x < terminal_area.x + terminal_area.width
-                    && y >= terminal_area.y
-                    && y < terminal_area.y + terminal_area.height
-                {
-                    continue;
-                }
-
-                if let Some(cell) = buf.cell_mut((x, y)) {
-                    let style = cell.style();
-                    let new_fg = style.fg.map(dim_color).unwrap_or(Color::Rgb(40, 40, 40));
-                    let new_bg = style.bg.map(dim_color).unwrap_or(Color::Rgb(15, 15, 15));
-                    cell.set_fg(new_fg);
-                    cell.set_bg(new_bg);
-                }
-            }
-        }
+        crate::view::dimming::apply_dimming_excluding(frame, size, Some(terminal_area));
     }
 
     /// Render hover highlights for interactive elements (separators, scrollbars)
@@ -975,20 +933,43 @@ impl Editor {
         self.hover_symbol_range = None;
     }
 
-    /// Dismiss transient popups (Hover, Signature Help) if present
+    /// Dismiss transient popups if present
     /// These popups should be dismissed on scroll or other user actions
     pub(super) fn dismiss_transient_popups(&mut self) {
         let is_transient_popup = self
             .active_state()
             .popups
             .top()
-            .and_then(|p| p.title.as_ref())
-            .is_some_and(|title| title == "Hover" || title == "Signature Help");
+            .is_some_and(|p| p.transient);
 
         if is_transient_popup {
             self.hide_popup();
-            tracing::debug!("Dismissed transient popup on scroll");
+            tracing::debug!("Dismissed transient popup");
         }
+    }
+
+    /// Called when the editor buffer loses focus (e.g., switching buffers,
+    /// opening prompts/menus, focusing file explorer, etc.)
+    ///
+    /// This is the central handler for focus loss that:
+    /// - Dismisses transient popups (Hover, Signature Help)
+    /// - Clears LSP hover state and pending requests
+    /// - Removes hover symbol highlighting
+    pub(super) fn on_editor_focus_lost(&mut self) {
+        // Dismiss transient popups via EditorState
+        self.active_state_mut().on_focus_lost();
+
+        // Clear hover state
+        self.mouse_state.lsp_hover_state = None;
+        self.mouse_state.lsp_hover_request_sent = false;
+        self.pending_hover_request = None;
+
+        // Clear hover symbol highlight if present
+        if let Some(handle) = self.hover_symbol_overlay.take() {
+            let remove_overlay_event = crate::model::event::Event::RemoveOverlay { handle };
+            self.apply_event_to_active_buffer(&remove_overlay_event);
+        }
+        self.hover_symbol_range = None;
     }
 
     /// Clear all popups
@@ -1025,6 +1006,7 @@ impl Editor {
 
         let popup = PopupData {
             title: Some(format!("Start LSP Server: {}?", server_info)),
+            transient: false,
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
@@ -3098,6 +3080,7 @@ impl Editor {
             lsp_disabled_reason: Some("Virtual macro buffer".to_string()),
             read_only: false, // Allow editing for saving
             binary: false,
+            lsp_opened_with: std::collections::HashSet::new(),
         };
         self.buffer_metadata.insert(buffer_id, metadata);
 
@@ -3169,6 +3152,7 @@ impl Editor {
             lsp_disabled_reason: Some("Virtual macro list buffer".to_string()),
             read_only: true,
             binary: false,
+            lsp_opened_with: std::collections::HashSet::new(),
         };
         self.buffer_metadata.insert(buffer_id, metadata);
 

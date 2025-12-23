@@ -15,18 +15,21 @@
 pub mod file_browser;
 pub mod file_explorer;
 pub mod menu;
+pub mod menu_input;
 pub mod scroll_panel;
 pub mod scrollbar;
 pub mod split_rendering;
 pub mod status_bar;
 pub mod suggestions;
 pub mod tabs;
+pub mod text_edit;
 pub mod view_pipeline;
 
 // Re-export main types for convenience
 pub use file_browser::{FileBrowserLayout, FileBrowserRenderer};
 pub use file_explorer::FileExplorerRenderer;
 pub use menu::{context_keys, MenuContext, MenuRenderer, MenuState};
+pub use menu_input::MenuInputHandler;
 pub use scroll_panel::{
     FocusRegion, RenderInfo, ScrollItem, ScrollState, ScrollablePanel, ScrollablePanelLayout,
 };
@@ -35,3 +38,4 @@ pub use split_rendering::SplitRenderer;
 pub use status_bar::{truncate_path, StatusBarRenderer, TruncatedPath};
 pub use suggestions::SuggestionsRenderer;
 pub use tabs::TabsRenderer;
+pub use text_edit::TextEdit;

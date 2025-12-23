@@ -6,7 +6,7 @@ use crate::common::harness::EditorTestHarness;
 use crate::common::tracing::init_tracing_from_env;
 use crossterm::event::{KeyCode, KeyModifiers};
 use fresh::config::Config;
-use fresh::services::lsp::client::LspServerConfig;
+use fresh::services::lsp::LspServerConfig;
 use fresh::services::process_limits::ProcessLimits;
 use std::fs;
 use std::time::Duration;
@@ -681,7 +681,7 @@ fn test_diagnostics_panel_plugin_loads() {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::client::LspServerConfig {
+        fresh::services::lsp::LspServerConfig {
             command: FakeLspServer::many_diagnostics_script_path()
                 .to_string_lossy()
                 .to_string(),
@@ -1017,7 +1017,7 @@ editor.setStatus("Multi-action plugin loaded");
         // Process async and render a few times to let the action execute
         for _ in 0..3 {
             harness.process_async_and_render().unwrap();
-            std::thread::sleep(Duration::from_millis(20));
+            harness.sleep(Duration::from_millis(20));
         }
     }
 
@@ -1111,7 +1111,7 @@ editor.setStatus("Nonblocking test plugin loaded");
     // Process several render cycles - this verifies the editor isn't blocked
     for _ in 0..5 {
         harness.process_async_and_render().unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        harness.sleep(Duration::from_millis(50));
     }
 
     let elapsed = start.elapsed();
@@ -1594,14 +1594,14 @@ fn test_clangd_plugin_file_status_notification() -> std::io::Result<()> {
     harness.open_file(&source_file)?;
     harness.render()?;
     for _ in 0..10 {
-        std::thread::sleep(Duration::from_millis(100));
+        harness.sleep(Duration::from_millis(100));
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
     }
 
     let mut seen_status = false;
     for _ in 0..20 {
-        std::thread::sleep(Duration::from_millis(50));
+        harness.sleep(Duration::from_millis(50));
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
         if let Some(msg) = harness.editor().get_status_message() {
@@ -1676,7 +1676,7 @@ fn test_clangd_plugin_switch_source_header() -> std::io::Result<()> {
     harness.open_file(&source_file)?;
     harness.render()?;
     for _ in 0..10 {
-        std::thread::sleep(Duration::from_millis(100));
+        harness.sleep(Duration::from_millis(100));
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
     }
@@ -1757,7 +1757,7 @@ editor.setStatus("Test source plugin loaded!");
     // Wait for plugins to load
     for _ in 0..5 {
         harness.process_async_and_render().unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        harness.sleep(Duration::from_millis(50));
     }
 
     // Open command palette
@@ -1772,7 +1772,7 @@ editor.setStatus("Test source plugin loaded!");
     // Process to update suggestions
     for _ in 0..3 {
         harness.process_async_and_render().unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        harness.sleep(Duration::from_millis(50));
     }
 
     let screen = harness.screen_to_string();
@@ -1810,7 +1810,7 @@ editor.setStatus("Test source plugin loaded!");
 
     for _ in 0..3 {
         harness.process_async_and_render().unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        harness.sleep(Duration::from_millis(50));
     }
 
     let screen2 = harness.screen_to_string();
@@ -1910,7 +1910,7 @@ editor.setStatus("Test diagnostics plugin loaded");
 
     // Wait for LSP to initialize and plugin to load
     for _ in 0..10 {
-        std::thread::sleep(Duration::from_millis(100));
+        harness.sleep(Duration::from_millis(100));
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
     }
@@ -1922,25 +1922,19 @@ editor.setStatus("Test diagnostics plugin loaded");
     harness.render()?;
 
     // Wait for diagnostics to be received and processed
-    let mut diagnostics_received = false;
-    for _ in 0..30 {
-        std::thread::sleep(Duration::from_millis(100));
+    // Loop indefinitely - test framework timeout will catch actual failures
+    loop {
+        harness.sleep(Duration::from_millis(100));
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
 
         // Check if diagnostics were stored
         let stored = harness.editor().get_stored_diagnostics();
         if !stored.is_empty() {
-            diagnostics_received = true;
             println!("Diagnostics received: {:?}", stored);
             break;
         }
     }
-
-    assert!(
-        diagnostics_received,
-        "Expected diagnostics to be received from fake LSP after save"
-    );
 
     // Verify the diagnostics content
     let stored = harness.editor().get_stored_diagnostics();

@@ -1,7 +1,7 @@
 //! Action to event conversion - translates high-level actions into buffer events
 
 use crate::input::keybindings::Action;
-use crate::model::buffer::Buffer;
+use crate::model::buffer::{Buffer, LineEnding};
 use crate::model::cursor::{Position2D, SelectionMode};
 use crate::model::event::{CursorId, Event};
 use crate::primitives::display_width::{byte_offset_at_visual_column, str_width};
@@ -63,6 +63,46 @@ fn calculate_visual_column(
     } else {
         (byte_column, byte_column) // Fallback
     }
+}
+
+/// Pattern for matching line ending characters (\r and \n)
+const LINE_ENDING_CHARS: &[char] = &['\r', '\n'];
+
+/// Get the length of line content excluding line ending characters (\r and \n).
+/// Handles CRLF, LF, and CR line endings.
+fn content_len_without_line_ending(content: &str) -> usize {
+    content.trim_end_matches(LINE_ENDING_CHARS).len()
+}
+
+/// Adjust position after moving left in CRLF mode.
+/// If we land on \n that's preceded by \r, skip back to the \r.
+/// This ensures the cursor never sits between \r and \n.
+fn adjust_position_for_crlf_left(buffer: &Buffer, pos: usize) -> usize {
+    if buffer.line_ending() != LineEnding::CRLF || pos == 0 {
+        return pos;
+    }
+
+    let byte_at_pos = buffer.slice_bytes(pos..pos + 1);
+    if byte_at_pos.first() == Some(&b'\n') {
+        let prev_byte = buffer.slice_bytes(pos.saturating_sub(1)..pos);
+        if prev_byte.first() == Some(&b'\r') {
+            return pos - 1; // Skip back to \r
+        }
+    }
+    pos
+}
+
+/// Calculate next position when moving right, treating CRLF as a single unit.
+/// If cursor is on \r followed by \n, skip over both.
+fn next_position_for_crlf(buffer: &Buffer, pos: usize, max_pos: usize) -> usize {
+    if buffer.line_ending() == LineEnding::CRLF {
+        let cur_byte = buffer.slice_bytes(pos..pos + 1);
+        let next_byte = buffer.slice_bytes(pos + 1..pos + 2);
+        if cur_byte.first() == Some(&b'\r') && next_byte.first() == Some(&b'\n') {
+            return (pos + 2).min(max_pos); // Skip both \r and \n
+        }
+    }
+    buffer.next_char_boundary(pos).min(max_pos)
 }
 
 /// Convert deletion ranges to Delete events
@@ -195,6 +235,353 @@ pub fn clear_block_selection_if_active(state: &mut EditorState) {
     });
 }
 
+/// Get the matching close character for auto-pairing.
+fn get_auto_close_char(ch: char, auto_indent: bool) -> Option<char> {
+    if !auto_indent {
+        return None;
+    }
+    match ch {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '"' => Some('"'),
+        '\'' => Some('\''),
+        '`' => Some('`'),
+        _ => None,
+    }
+}
+
+/// Calculate the correct indent for a closing delimiter using tree-sitter.
+fn calculate_closing_delimiter_indent(
+    state: &mut EditorState,
+    insert_position: usize,
+    ch: char,
+    tab_size: usize,
+) -> usize {
+    if let Some(language) = state.highlighter.language() {
+        state
+            .indent_calculator
+            .borrow_mut()
+            .calculate_dedent_for_delimiter(&state.buffer, insert_position, ch, language, tab_size)
+            .unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// Convert a visual indent width to actual indent characters.
+/// When `use_tabs` is true, uses tab characters; otherwise uses spaces.
+/// The `indent_width` is the visual width in columns, and `tab_size` is
+/// how many columns a tab character represents.
+fn indent_to_string(indent_width: usize, use_tabs: bool, tab_size: usize) -> String {
+    if use_tabs && tab_size > 0 {
+        let num_tabs = indent_width / tab_size;
+        let remaining_spaces = indent_width % tab_size;
+        let mut result = "\t".repeat(num_tabs);
+        if remaining_spaces > 0 {
+            result.push_str(&" ".repeat(remaining_spaces));
+        }
+        result
+    } else {
+        " ".repeat(indent_width)
+    }
+}
+
+/// Handle skip-over with dedent: when typing a closing delimiter that exists after cursor,
+/// and the line has incorrect indentation, fix the indent and skip over.
+/// Returns true if handled (caller should continue to next cursor).
+fn handle_skip_over_with_dedent(
+    state: &mut EditorState,
+    events: &mut Vec<Event>,
+    cursor_id: CursorId,
+    ch: char,
+    insert_position: usize,
+    line_start: usize,
+    tab_size: usize,
+) -> bool {
+    let correct_indent = calculate_closing_delimiter_indent(state, insert_position, ch, tab_size);
+    let current_indent = insert_position - line_start;
+
+    if current_indent != correct_indent {
+        // Delete incorrect spacing
+        let deleted_text = state.get_text_range(line_start, insert_position);
+        events.push(Event::Delete {
+            range: line_start..insert_position,
+            deleted_text,
+            cursor_id,
+        });
+
+        // Insert correct spacing
+        if correct_indent > 0 {
+            events.push(Event::Insert {
+                position: line_start,
+                text: " ".repeat(correct_indent),
+                cursor_id,
+            });
+        }
+
+        // Move cursor to after the closing delimiter
+        events.push(Event::MoveCursor {
+            cursor_id,
+            old_position: line_start + correct_indent,
+            new_position: line_start + correct_indent + 1,
+            old_anchor: None,
+            new_anchor: None,
+            old_sticky_column: 0,
+            new_sticky_column: 0,
+        });
+        return true;
+    }
+    false
+}
+
+/// Handle simple skip-over: move cursor past existing closing bracket/quote.
+fn handle_skip_over(events: &mut Vec<Event>, cursor_id: CursorId, insert_position: usize) {
+    events.push(Event::MoveCursor {
+        cursor_id,
+        old_position: insert_position,
+        new_position: insert_position + 1,
+        old_anchor: None,
+        new_anchor: None,
+        old_sticky_column: 0,
+        new_sticky_column: 0,
+    });
+}
+
+/// Handle auto-dedent: when typing a closing delimiter on a line with only spaces,
+/// fix the indentation and insert the delimiter.
+fn handle_auto_dedent(
+    state: &mut EditorState,
+    events: &mut Vec<Event>,
+    cursor_id: CursorId,
+    ch: char,
+    insert_position: usize,
+    line_start: usize,
+    tab_size: usize,
+) {
+    let correct_indent = calculate_closing_delimiter_indent(state, insert_position, ch, tab_size);
+
+    // Delete the incorrect spacing
+    let spaces_to_delete = insert_position - line_start;
+    if spaces_to_delete > 0 {
+        let deleted_text = state.get_text_range(line_start, insert_position);
+        events.push(Event::Delete {
+            range: line_start..insert_position,
+            deleted_text,
+            cursor_id,
+        });
+    }
+
+    // Insert correct spacing + the closing delimiter
+    let mut text = " ".repeat(correct_indent);
+    text.push(ch);
+    events.push(Event::Insert {
+        position: line_start,
+        text,
+        cursor_id,
+    });
+}
+
+/// Check if auto-close should happen based on character after cursor.
+fn should_auto_close(char_after: Option<u8>) -> bool {
+    let is_alphanumeric_after = char_after
+        .map(|b| b.is_ascii_alphanumeric() || b == b'_')
+        .unwrap_or(false);
+    !is_alphanumeric_after
+}
+
+/// Handle auto-close: insert both opening and closing bracket/quote.
+fn handle_auto_close(
+    events: &mut Vec<Event>,
+    cursor_id: CursorId,
+    ch: char,
+    close_char: char,
+    insert_position: usize,
+) {
+    // Insert opening + closing character
+    let text = format!("{}{}", ch, close_char);
+    events.push(Event::Insert {
+        position: insert_position,
+        text,
+        cursor_id,
+    });
+    // Move cursor between the brackets
+    events.push(Event::MoveCursor {
+        cursor_id,
+        old_position: insert_position + 2,
+        new_position: insert_position + 1,
+        old_anchor: None,
+        new_anchor: None,
+        old_sticky_column: 0,
+        new_sticky_column: 0,
+    });
+}
+
+/// Cursor context data collected before processing insertions.
+struct InsertCursorData {
+    cursor_id: CursorId,
+    selection: Option<Range<usize>>,
+    insert_position: usize,
+    line_start: usize,
+    only_spaces: bool,
+    char_after: Option<u8>,
+    deleted_text: Option<String>,
+}
+
+/// Collect cursor data needed for character insertion.
+fn collect_insert_cursor_data(state: &mut EditorState) -> Vec<InsertCursorData> {
+    // Collect cursors and sort by the effective insert position (reverse order)
+    let mut cursor_vec: Vec<_> = state.cursors.iter().collect();
+    cursor_vec.sort_by_key(|(_, c)| {
+        let insert_pos = c.selection_range().map(|r| r.start).unwrap_or(c.position);
+        std::cmp::Reverse(insert_pos)
+    });
+
+    // Collect cursor IDs and positions
+    let cursor_info: Vec<_> = cursor_vec
+        .iter()
+        .map(|(cursor_id, cursor)| {
+            let selection = cursor.selection_range();
+            let insert_position = selection
+                .as_ref()
+                .map(|r| r.start)
+                .unwrap_or(cursor.position);
+            (*cursor_id, selection, insert_position)
+        })
+        .collect();
+
+    drop(cursor_vec);
+
+    // Collect all cursor data with buffer access
+    cursor_info
+        .into_iter()
+        .map(|(cursor_id, selection, insert_position)| {
+            // Calculate line start for auto-dedent
+            let mut line_start = insert_position;
+            while line_start > 0 {
+                let prev = line_start - 1;
+                if state.buffer.slice_bytes(prev..prev + 1).first() == Some(&b'\n') {
+                    break;
+                }
+                line_start = prev;
+            }
+
+            let line_before_cursor = state.buffer.slice_bytes(line_start..insert_position);
+            let only_spaces = line_before_cursor.iter().all(|&b| b == b' ' || b == b'\t');
+
+            let check_pos = selection.as_ref().map(|r| r.end).unwrap_or(insert_position);
+            let char_after = if check_pos < state.buffer.len() {
+                state
+                    .buffer
+                    .slice_bytes(check_pos..check_pos + 1)
+                    .first()
+                    .copied()
+            } else {
+                None
+            };
+
+            let deleted_text = selection
+                .as_ref()
+                .map(|r| state.get_text_range(r.start, r.end));
+
+            InsertCursorData {
+                cursor_id,
+                selection,
+                insert_position,
+                line_start,
+                only_spaces,
+                char_after,
+                deleted_text,
+            }
+        })
+        .collect()
+}
+
+/// Handle InsertChar action - insert character at each cursor position.
+fn insert_char_events(
+    state: &mut EditorState,
+    events: &mut Vec<Event>,
+    ch: char,
+    tab_size: usize,
+    auto_indent: bool,
+) {
+    let is_closing_delimiter = matches!(ch, '}' | ')' | ']');
+    let auto_close_char = get_auto_close_char(ch, auto_indent);
+    let cursor_data = collect_insert_cursor_data(state);
+
+    for data in cursor_data {
+        // Delete selection if present
+        if let (Some(range), Some(text)) = (data.selection, data.deleted_text) {
+            events.push(Event::Delete {
+                range,
+                deleted_text: text,
+                cursor_id: data.cursor_id,
+            });
+        }
+
+        // Try skip-over logic for closing brackets/quotes
+        if auto_indent && matches!(ch, ')' | ']' | '}' | '"' | '\'' | '`') {
+            if let Some(next_byte) = data.char_after {
+                if next_byte == ch as u8 {
+                    // Try skip-over with dedent for closing delimiters
+                    if is_closing_delimiter
+                        && data.only_spaces
+                        && data.insert_position > data.line_start
+                    {
+                        if handle_skip_over_with_dedent(
+                            state,
+                            events,
+                            data.cursor_id,
+                            ch,
+                            data.insert_position,
+                            data.line_start,
+                            tab_size,
+                        ) {
+                            continue;
+                        }
+                    }
+                    // Simple skip-over
+                    handle_skip_over(events, data.cursor_id, data.insert_position);
+                    continue;
+                }
+            }
+        }
+
+        // Try auto-dedent for closing delimiters
+        if is_closing_delimiter
+            && auto_indent
+            && data.only_spaces
+            && data.insert_position > data.line_start
+        {
+            handle_auto_dedent(
+                state,
+                events,
+                data.cursor_id,
+                ch,
+                data.insert_position,
+                data.line_start,
+                tab_size,
+            );
+            continue;
+        }
+
+        // Try auto-close
+        if let Some(close_char) = auto_close_char {
+            if should_auto_close(data.char_after) {
+                handle_auto_close(events, data.cursor_id, ch, close_char, data.insert_position);
+                continue;
+            }
+        }
+
+        // Normal character insertion
+        events.push(Event::Insert {
+            position: data.insert_position,
+            text: ch.to_string(),
+            cursor_id: data.cursor_id,
+        });
+    }
+}
+
 /// Calculate the maximum valid cursor position in the buffer.
 /// This is the end of the last line (excluding trailing newline).
 /// For empty buffers, returns 0.
@@ -230,298 +617,7 @@ pub fn action_to_events(
     match action {
         // Character input - insert at each cursor
         Action::InsertChar(ch) => {
-            // Collect cursors and sort by the effective insert position (reverse order)
-            // The insert position is selection.start (for selections) or cursor.position
-            // This ensures insertions at later positions happen first,
-            // avoiding position shifts that would affect earlier insertions
-            let mut cursor_vec: Vec<_> = state.cursors.iter().collect();
-            cursor_vec.sort_by_key(|(_, c)| {
-                let insert_pos = c.selection_range().map(|r| r.start).unwrap_or(c.position);
-                std::cmp::Reverse(insert_pos)
-            });
-
-            // Check if this is a closing delimiter that should trigger auto-dedent
-            let is_closing_delimiter = matches!(ch, '}' | ')' | ']');
-
-            // Check if this is an opening bracket that should auto-close
-            let auto_close_char = if auto_indent {
-                match ch {
-                    '(' => Some(')'),
-                    '[' => Some(']'),
-                    '{' => Some('}'),
-                    '"' => Some('"'),
-                    '\'' => Some('\''),
-                    '`' => Some('`'),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            // First, collect just the cursor IDs and positions (without borrowing state)
-            let cursor_info: Vec<_> = cursor_vec
-                .iter()
-                .map(|(cursor_id, cursor)| {
-                    let selection = cursor.selection_range();
-                    let insert_position = selection
-                        .as_ref()
-                        .map(|r| r.start)
-                        .unwrap_or(cursor.position);
-                    (*cursor_id, selection, insert_position)
-                })
-                .collect();
-
-            // Now drop the borrow on cursors and collect the rest of the data
-            drop(cursor_vec);
-
-            // Collect all cursor data with buffer access
-            let cursor_data: Vec<_> = cursor_info
-                .into_iter()
-                .map(|(cursor_id, selection, insert_position)| {
-                    // Calculate line start for auto-dedent
-                    let mut line_start = insert_position;
-                    while line_start > 0 {
-                        let prev = line_start - 1;
-                        if state.buffer.slice_bytes(prev..prev + 1).first() == Some(&b'\n') {
-                            break;
-                        }
-                        line_start = prev;
-                    }
-
-                    let line_before_cursor = state.buffer.slice_bytes(line_start..insert_position);
-                    let only_spaces = line_before_cursor.iter().all(|&b| b == b' ' || b == b'\t');
-
-                    // Check character after cursor for smart quote insertion
-                    // For selections, check char after the selection end
-                    let check_pos = selection.as_ref().map(|r| r.end).unwrap_or(insert_position);
-                    let char_after = if check_pos < state.buffer.len() {
-                        state
-                            .buffer
-                            .slice_bytes(check_pos..check_pos + 1)
-                            .first()
-                            .copied()
-                    } else {
-                        None
-                    };
-
-                    // Get deleted text for selection (if any)
-                    let deleted_text = selection
-                        .as_ref()
-                        .map(|r| state.get_text_range(r.start, r.end));
-
-                    (
-                        cursor_id,
-                        selection,
-                        insert_position,
-                        line_start,
-                        only_spaces,
-                        char_after,
-                        deleted_text,
-                    )
-                })
-                .collect();
-
-            // Process each cursor: delete selection (if any), then insert
-            // By processing in reverse position order, later positions are handled first
-            // so they don't affect earlier positions
-            for (
-                cursor_id,
-                selection,
-                insert_position,
-                line_start,
-                only_spaces,
-                char_after,
-                deleted_text,
-            ) in cursor_data
-            {
-                // First, delete the selection if there is one
-                if let (Some(range), Some(text)) = (selection, deleted_text) {
-                    events.push(Event::Delete {
-                        range,
-                        deleted_text: text,
-                        cursor_id,
-                    });
-                }
-
-                // Then handle insertion
-                // Skip-over logic for closing brackets/quotes
-                // When the user types a closing bracket and the cursor is right before that bracket,
-                // just move the cursor forward instead of inserting a duplicate
-                // BUT: if line has only spaces before cursor, perform dedent first (for auto-paired braces)
-                if auto_indent && matches!(ch, ')' | ']' | '}' | '"' | '\'' | '`') {
-                    if let Some(next_byte) = char_after {
-                        if next_byte == ch as u8 {
-                            // Check if we need to dedent before skipping over
-                            // This handles the case where auto-pair inserted the closing delimiter
-                            // and we pressed Enter to get indent, then typed the closing delimiter
-                            if is_closing_delimiter && only_spaces && insert_position > line_start {
-                                // Calculate correct indent
-                                let correct_indent =
-                                    if let Some(language) = state.highlighter.language() {
-                                        state
-                                            .indent_calculator
-                                            .borrow_mut()
-                                            .calculate_dedent_for_delimiter(
-                                                &state.buffer,
-                                                insert_position,
-                                                ch,
-                                                language,
-                                                tab_size,
-                                            )
-                                            .unwrap_or(0)
-                                    } else {
-                                        0
-                                    };
-
-                                let current_indent = insert_position - line_start;
-                                if current_indent != correct_indent {
-                                    // Delete incorrect spacing
-                                    let deleted_text =
-                                        state.get_text_range(line_start, insert_position);
-                                    events.push(Event::Delete {
-                                        range: line_start..insert_position,
-                                        deleted_text,
-                                        cursor_id,
-                                    });
-
-                                    // Insert correct spacing
-                                    if correct_indent > 0 {
-                                        events.push(Event::Insert {
-                                            position: line_start,
-                                            text: " ".repeat(correct_indent),
-                                            cursor_id,
-                                        });
-                                    }
-
-                                    // Move cursor to after the closing delimiter
-                                    // After the delete and insert, the delimiter is at line_start + correct_indent
-                                    // We want to skip over it
-                                    events.push(Event::MoveCursor {
-                                        cursor_id,
-                                        old_position: line_start + correct_indent,
-                                        new_position: line_start + correct_indent + 1,
-                                        old_anchor: None,
-                                        new_anchor: None,
-                                        old_sticky_column: 0,
-                                        new_sticky_column: 0,
-                                    });
-                                    continue;
-                                }
-                            }
-
-                            // Just move cursor forward, don't insert (no dedent needed)
-                            events.push(Event::MoveCursor {
-                                cursor_id,
-                                old_position: insert_position,
-                                new_position: insert_position + 1,
-                                old_anchor: None,
-                                new_anchor: None,
-                                old_sticky_column: 0,
-                                new_sticky_column: 0,
-                            });
-                            continue;
-                        }
-                    }
-                }
-
-                // Auto-dedent logic for closing delimiters (when there's no existing delimiter to skip over)
-                if is_closing_delimiter
-                    && auto_indent
-                    && only_spaces
-                    && insert_position > line_start
-                {
-                    // Calculate correct indent for the closing delimiter using tree-sitter
-                    let correct_indent = if let Some(language) = state.highlighter.language() {
-                        state
-                            .indent_calculator
-                            .borrow_mut()
-                            .calculate_dedent_for_delimiter(
-                                &state.buffer,
-                                insert_position,
-                                ch,
-                                language,
-                                tab_size,
-                            )
-                            .unwrap_or(0)
-                    } else {
-                        0
-                    };
-
-                    // Delete the incorrect spacing
-                    let spaces_to_delete = insert_position - line_start;
-                    if spaces_to_delete > 0 {
-                        let deleted_text = state.get_text_range(line_start, insert_position);
-                        events.push(Event::Delete {
-                            range: line_start..insert_position,
-                            deleted_text,
-                            cursor_id,
-                        });
-                    }
-
-                    // Insert correct spacing + the closing delimiter
-                    let mut text = " ".repeat(correct_indent);
-                    text.push(ch);
-                    events.push(Event::Insert {
-                        position: line_start,
-                        text,
-                        cursor_id,
-                    });
-                    continue;
-                }
-
-                // Auto-close bracket logic
-                if let Some(close_char) = auto_close_char {
-                    // For quotes, only auto-close if:
-                    // - Not typing after an alphanumeric character (could be closing a string)
-                    // - The character after cursor is not alphanumeric (would be in middle of word)
-                    let should_auto_close = if matches!(ch, '"' | '\'' | '`') {
-                        // Don't auto-close if we're likely closing a string or in middle of word
-                        let is_alphanumeric_after = char_after
-                            .map(|b| b.is_ascii_alphanumeric() || b == b'_')
-                            .unwrap_or(false);
-                        !is_alphanumeric_after
-                    } else {
-                        // For brackets, always auto-close unless char after is alphanumeric
-                        let is_alphanumeric_after = char_after
-                            .map(|b| b.is_ascii_alphanumeric() || b == b'_')
-                            .unwrap_or(false);
-                        !is_alphanumeric_after
-                    };
-
-                    if should_auto_close {
-                        // Insert opening + closing character
-                        let text = format!("{}{}", ch, close_char);
-                        events.push(Event::Insert {
-                            position: insert_position,
-                            text,
-                            cursor_id,
-                        });
-                        // Move cursor back between the brackets (cursor will be after the insert,
-                        // so we need to move it back by 1 to be between opening and closing)
-                        // This is handled by the cursor position update after insert
-                        // The insert event will position cursor after the inserted text,
-                        // but we want it between, so we add a MoveCursor event
-                        let new_cursor_pos = insert_position + 1; // After opening bracket
-                        events.push(Event::MoveCursor {
-                            cursor_id,
-                            old_position: insert_position + 2, // After both chars
-                            new_position: new_cursor_pos,
-                            old_anchor: None,
-                            new_anchor: None,
-                            old_sticky_column: 0,
-                            new_sticky_column: 0,
-                        });
-                        continue;
-                    }
-                }
-
-                // Normal character insertion
-                events.push(Event::Insert {
-                    position: insert_position,
-                    text: ch.to_string(),
-                    cursor_id,
-                });
-            }
+            insert_char_events(state, &mut events, ch, tab_size, auto_indent);
         }
 
         Action::InsertNewline => {
@@ -561,29 +657,31 @@ pub fn action_to_events(
             }
 
             // Now process insertions
+            let line_ending = state.buffer.line_ending().as_str();
             for (cursor_id, indent_position) in indent_positions {
                 // Calculate indent for new line
-                let mut text = "\n".to_string();
+                let mut text = line_ending.to_string();
 
                 if auto_indent {
+                    let use_tabs = state.use_tabs;
                     if let Some(language) = state.highlighter.language() {
                         // Use tree-sitter-based indent when we have a highlighter
-                        if let Some(indent_spaces) = state
+                        if let Some(indent_width) = state
                             .indent_calculator
                             .borrow_mut()
                             .calculate_indent(&state.buffer, indent_position, language, tab_size)
                         {
-                            text.push_str(&" ".repeat(indent_spaces));
+                            text.push_str(&indent_to_string(indent_width, use_tabs, tab_size));
                         }
                     } else {
                         // Fallback for files without syntax highlighting (e.g., .txt)
-                        let indent_spaces =
+                        let indent_width =
                             crate::primitives::indent::IndentCalculator::calculate_indent_no_language(
                                 &state.buffer,
                                 indent_position,
                                 tab_size,
                             );
-                        text.push_str(&" ".repeat(indent_spaces));
+                        text.push_str(&indent_to_string(indent_width, use_tabs, tab_size));
                     }
                 }
 
@@ -596,7 +694,12 @@ pub fn action_to_events(
         }
 
         Action::InsertTab => {
-            let tab_str = " ".repeat(tab_size);
+            // Insert a tab character or spaces based on language config
+            let tab_str = if state.use_tabs {
+                "\t".to_string()
+            } else {
+                " ".repeat(tab_size)
+            };
             // Sort cursors by position (reverse order) to avoid position shifts
             let mut cursor_vec: Vec<_> = state.cursors.iter().collect();
             cursor_vec.sort_by_key(|(_, c)| std::cmp::Reverse(c.position));
@@ -630,8 +733,9 @@ pub fn action_to_events(
         // Basic movement - move each cursor
         Action::MoveLeft => {
             for (cursor_id, cursor) in state.cursors.iter() {
-                // Use prev_char_boundary to ensure we land on a valid UTF-8 character boundary
                 let new_pos = state.buffer.prev_char_boundary(cursor.position);
+                let new_pos = adjust_position_for_crlf_left(&state.buffer, new_pos);
+
                 // Preserve anchor if deselect_on_move is false (Emacs mark mode)
                 let new_anchor = if cursor.deselect_on_move {
                     None
@@ -653,11 +757,8 @@ pub fn action_to_events(
         Action::MoveRight => {
             for (cursor_id, cursor) in state.cursors.iter() {
                 let max_pos = max_cursor_position(&state.buffer);
-                // Use next_char_boundary to ensure we land on a valid UTF-8 character boundary
-                let new_pos = state
-                    .buffer
-                    .next_char_boundary(cursor.position)
-                    .min(max_pos);
+                let new_pos = next_position_for_crlf(&state.buffer, cursor.position, max_pos);
+
                 // Preserve anchor if deselect_on_move is false (Emacs mark mode)
                 let new_anchor = if cursor.deselect_on_move {
                     None
@@ -804,9 +905,9 @@ pub fn action_to_events(
                     .buffer
                     .line_iterator(cursor.position, estimated_line_length);
                 if let Some((line_start, line_content)) = iter.next() {
-                    // Calculate end position (exclude newline)
-                    let line_len = line_content.trim_end_matches('\n').len();
-                    let line_end = line_start + line_len;
+                    // In both LF and CRLF mode, cursor lands at the first byte of line ending
+                    // For LF: cursor on \n. For CRLF: cursor on \r (before both \r\n)
+                    let line_end = line_start + content_len_without_line_ending(&line_content);
 
                     // Preserve anchor if deselect_on_move is false (Emacs mark mode)
                     let new_anchor = if cursor.deselect_on_move {
@@ -1009,8 +1110,9 @@ pub fn action_to_events(
         // Selection movement - same as regular movement but keeps anchor
         Action::SelectLeft => {
             for (cursor_id, cursor) in state.cursors.iter() {
-                // Use prev_char_boundary to ensure we land on a valid UTF-8 character boundary
                 let new_pos = state.buffer.prev_char_boundary(cursor.position);
+                let new_pos = adjust_position_for_crlf_left(&state.buffer, new_pos);
+
                 let anchor = cursor.anchor.unwrap_or(cursor.position);
                 events.push(Event::MoveCursor {
                     cursor_id,
@@ -1027,11 +1129,8 @@ pub fn action_to_events(
         Action::SelectRight => {
             for (cursor_id, cursor) in state.cursors.iter() {
                 let max_pos = max_cursor_position(&state.buffer);
-                // Use next_char_boundary to ensure we land on a valid UTF-8 character boundary
-                let new_pos = state
-                    .buffer
-                    .next_char_boundary(cursor.position)
-                    .min(max_pos);
+                let new_pos = next_position_for_crlf(&state.buffer, cursor.position, max_pos);
+
                 let anchor = cursor.anchor.unwrap_or(cursor.position);
                 events.push(Event::MoveCursor {
                     cursor_id,
@@ -1142,9 +1241,9 @@ pub fn action_to_events(
                 let anchor = cursor.anchor.unwrap_or(cursor.position);
 
                 if let Some((line_start, line_content)) = iter.next() {
-                    // Calculate end position (exclude newline)
-                    let line_len = line_content.trim_end_matches('\n').len();
-                    let line_end = line_start + line_len;
+                    // In both LF and CRLF mode, cursor lands at the first byte of line ending
+                    // For LF: cursor on \n. For CRLF: cursor on \r (before both \r\n)
+                    let line_end = line_start + content_len_without_line_ending(&line_content);
 
                     events.push(Event::MoveCursor {
                         cursor_id,
@@ -1359,7 +1458,9 @@ pub fn action_to_events(
                         Some((*cursor_id, range))
                     } else if cursor.position > 0 {
                         // Use prev_char_boundary to properly handle multi-byte UTF-8 characters
+                        // In CRLF files, this also ensures we delete \r\n as a unit
                         let delete_from = state.buffer.prev_char_boundary(cursor.position);
+                        let delete_from = adjust_position_for_crlf_left(&state.buffer, delete_from);
 
                         // Check for auto-pair deletion when auto_indent is enabled
                         // Note: Auto-pairs are ASCII-only, so we can safely check single bytes
@@ -1420,7 +1521,10 @@ pub fn action_to_events(
                         Some((*cursor_id, range))
                     } else if cursor.position < buffer_len {
                         // Use next_char_boundary to properly handle multi-byte UTF-8 characters
-                        let delete_to = state.buffer.next_char_boundary(cursor.position);
+                        // In CRLF files, this also ensures we delete \r\n as a unit
+                        let delete_to =
+                            next_position_for_crlf(&state.buffer, cursor.position, buffer_len);
+
                         Some((*cursor_id, cursor.position..delete_to))
                     } else {
                         None
@@ -1510,8 +1614,7 @@ pub fn action_to_events(
                         .line_iterator(cursor.position, estimated_line_length);
                     let line_start = iter.current_position();
                     iter.next().map(|(_start, content)| {
-                        // Find the end of line (excluding newline)
-                        let line_end = line_start + content.trim_end_matches('\n').len();
+                        let line_end = line_start + content_len_without_line_ending(&content);
                         if cursor.position < line_end {
                             Some((cursor_id, cursor.position..line_end))
                         } else {
@@ -1566,10 +1669,11 @@ pub fn action_to_events(
         Action::OpenLine => {
             // Insert a newline at cursor position but don't move cursor
             // (like pressing Enter but staying on current line)
+            let line_ending = state.buffer.line_ending().as_str();
             for (cursor_id, cursor) in state.cursors.iter() {
                 events.push(Event::Insert {
                     position: cursor.position,
-                    text: "\n".to_string(),
+                    text: line_ending.to_string(),
                     cursor_id,
                 });
             }
@@ -1646,6 +1750,7 @@ pub fn action_to_events(
         | Action::NextSplit
         | Action::PrevSplit
         | Action::Copy
+        | Action::CopyWithTheme(_)
         | Action::Cut
         | Action::Paste
         | Action::AddCursorNextMatch
@@ -1793,7 +1898,13 @@ pub fn action_to_events(
         | Action::SettingsSearch
         | Action::SettingsHelp
         | Action::SettingsIncrement
-        | Action::SettingsDecrement => return None,
+        | Action::SettingsDecrement
+        | Action::SetTabSize
+        | Action::SetLineEnding
+        | Action::ToggleIndentationStyle
+        | Action::ToggleTabIndicators
+        | Action::ToggleDebugHighlights
+        | Action::ResetBufferSettings => return None,
 
         // Block/rectangular selection actions
         Action::BlockSelectLeft => {

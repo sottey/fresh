@@ -4,6 +4,7 @@
 //! - Maintains an internal clipboard for in-editor copy/paste
 //! - Uses crossterm's OSC 52 escape sequences for copying to system clipboard
 //! - Uses arboard crate for reading from system clipboard
+//! - Supports copying HTML-formatted text for rich text editors
 //! - Gracefully falls back to internal clipboard if system clipboard is unavailable
 
 use crossterm::clipboard::CopyToClipboard;
@@ -20,6 +21,8 @@ static SYSTEM_CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
 pub struct Clipboard {
     /// Internal clipboard content (always available)
     internal: String,
+    /// When true, paste() uses internal clipboard only (for testing)
+    internal_only: bool,
 }
 
 impl Clipboard {
@@ -27,7 +30,51 @@ impl Clipboard {
     pub fn new() -> Self {
         Self {
             internal: String::new(),
+            internal_only: false,
         }
+    }
+
+    /// Enable internal-only mode (for testing)
+    /// When enabled, paste() uses internal clipboard only, ignoring system clipboard
+    pub fn set_internal_only(&mut self, enabled: bool) {
+        self.internal_only = enabled;
+    }
+
+    /// Copy HTML-formatted text to the system clipboard
+    ///
+    /// Uses arboard to copy HTML with a plain text fallback.
+    /// This allows pasting styled/colored text into applications that support rich text.
+    /// Returns true if successful, false otherwise.
+    pub fn copy_html(&mut self, html: &str, plain_text: &str) -> bool {
+        self.internal = plain_text.to_string();
+
+        if let Ok(mut guard) = SYSTEM_CLIPBOARD.lock() {
+            // Create clipboard if it doesn't exist yet
+            if guard.is_none() {
+                match arboard::Clipboard::new() {
+                    Ok(cb) => *guard = Some(cb),
+                    Err(e) => {
+                        tracing::debug!("arboard clipboard init failed for HTML: {}", e);
+                        return false;
+                    }
+                }
+            }
+
+            // Try to set HTML on the clipboard
+            if let Some(clipboard) = guard.as_mut() {
+                match clipboard.set_html(html, Some(plain_text)) {
+                    Ok(()) => {
+                        tracing::debug!("HTML copied to clipboard ({} bytes)", html.len());
+                        return true;
+                    }
+                    Err(e) => {
+                        tracing::debug!("arboard HTML copy failed: {}", e);
+                    }
+                }
+            }
+        }
+
+        false
     }
 
     /// Copy text to both internal and system clipboard
@@ -85,8 +132,14 @@ impl Clipboard {
 
     /// Get text from clipboard, preferring system clipboard
     ///
-    /// Tries system clipboard first, falls back to internal clipboard
+    /// Tries system clipboard first, falls back to internal clipboard.
+    /// If internal_only mode is enabled (for testing), skips system clipboard.
     pub fn paste(&mut self) -> Option<String> {
+        // In internal-only mode, skip system clipboard entirely
+        if self.internal_only {
+            return self.paste_internal();
+        }
+
         // Try arboard crate via the static clipboard (reads from system clipboard)
         if let Ok(mut guard) = SYSTEM_CLIPBOARD.lock() {
             // Create clipboard if it doesn't exist yet
@@ -122,6 +175,16 @@ impl Clipboard {
     /// Set the internal clipboard content without updating system clipboard
     pub fn set_internal(&mut self, text: String) {
         self.internal = text;
+    }
+
+    /// Get text from internal clipboard only (ignores system clipboard)
+    /// This is useful for testing where we don't want system clipboard interference
+    pub fn paste_internal(&self) -> Option<String> {
+        if self.internal.is_empty() {
+            None
+        } else {
+            Some(self.internal.clone())
+        }
     }
 
     /// Check if clipboard is empty (checks both internal and system)

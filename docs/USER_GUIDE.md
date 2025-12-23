@@ -142,6 +142,29 @@ For example, to add C# support:
 
 The language name (e.g., `"csharp"`) must match in both sections. Fresh includes built-in language definitions for Rust, JavaScript, TypeScript, and Python, but you can add any language by configuring it in your config file.
 
+#### Configuring Language Detection via Settings UI
+
+You can also configure language detection using the Settings UI instead of editing `config.json` directly:
+
+1. **Open Settings**: Press `Ctrl+,` or use the command palette (`Ctrl+P`) and search for "Settings"
+2. **Navigate to Languages**: Go to the **Languages** section
+3. **Add or Edit a Language**: Click on an existing language to edit it, or add a new one
+4. **Configure Detection**: Set the following fields:
+   - **Extensions**: File extensions that should use this language (e.g., `cs` for C#, `rs` for Rust)
+   - **Filenames**: Specific filenames without extensions (e.g., `Makefile`, `.bashrc`, `.zshrc`)
+   - **Grammar**: The syntax highlighting grammar to use (must match a grammar name from syntect)
+
+##### Example: Adding Shell Script Detection for Dotfiles
+
+To make Fresh recognize `.bashrc`, `.zshrc`, and similar files as shell scripts:
+
+1. Open Settings (`Ctrl+,`)
+2. Go to **Languages** → **bash** (or create a new `bash` entry)
+3. Add filenames: `.bashrc`, `.zshrc`, `.bash_profile`, `.profile`
+4. The grammar should be set to `Bourne Again Shell (bash)` or similar
+
+Fresh checks filenames first, then extensions, allowing dotfiles without traditional extensions to get proper syntax highlighting.
+
 ## Plugins
 
 Fresh's functionality can be extended with plugins written in TypeScript. Fresh comes with a few useful plugins out of the box:
@@ -200,6 +223,128 @@ To prevent LSP servers from consuming too many resources, Fresh can limit their 
 ```
 
 For more information on how to configure resource limits, see the `docs/PROCESS_LIMITS.md` file.
+
+## Keyboard Config
+
+Many OSes, window managers and terminal applications capture keys and filter them out so that applications like Fresh, running in the terminal, don't actually have a chance to handle those keys.
+
+### Linux: XFCE window manager Ctrl + Alt + Up/Down keys - Disabling Workspace Switching Shortcuts
+
+Follow these steps to clear the **Ctrl + Alt + Up** and **Ctrl + Alt + Down** shortcuts so they can be used in other applications (like `fresh`).
+
+---
+
+#### Step-by-Step Instructions
+
+1.  **Open Settings**: Open the XFCE Application Menu and go to **Settings** > **Window Manager**.
+2.  **Navigate to Keyboard**: Click on the **Keyboard** tab.
+3.  **Find Workspace Shortcuts**: Scroll through the list of actions to find:
+    * `Upper workspace`
+    * `Bottom workspace`
+4.  **Clear First Shortcut (Up)**:
+    * Select the row for **Upper workspace** (usually mapped to `Ctrl+Alt+Up`).
+    * Click the **Clear** button (or double-click the row and press **Backspace**).
+5.  **Clear Second Shortcut (Down)**:
+    * Select the row for **Bottom workspace** (usually mapped to `Ctrl+Alt+Down`).
+    * Click the **Clear** button.
+6.  **Close**: Click **Close** to save the changes.
+
+---
+
+#### Configuration Summary
+
+| Action | Default Shortcut | New Setting |
+| :--- | :--- | :--- |
+| **Upper workspace** | `Ctrl + Alt + Up` | *Cleared / None* |
+| **Bottom workspace** | `Ctrl + Alt + Down` | *Cleared / None* |
+
+*Note: If you still experience issues, check **Settings** > **Keyboard** > **Application Shortcuts** to ensure no custom commands are overriding these keys.*
+
+### macOS: Shift + Arrow Key Shortcuts in Terminal.app
+
+Follow these steps to map **Shift + Up** and **Shift + Down** to specific escape sequences in your macOS Terminal.
+
+---
+
+#### Step-by-Step Instructions
+
+1.  **Open Settings**: Launch Terminal and go to **Terminal** > **Settings** (or press `Cmd + ,`).
+2.  **Navigate to Keyboard**: Click the **Profiles** tab, then select the **Keyboard** sub-tab.
+3.  **Add First Shortcut (Cursor Up)**:
+    * Click the **Plus (+)** icon at the bottom left of the list.
+    * **Key**: Select `Cursor Up`.
+    * **Modifier**: Select `Shift`.
+    * **Action**: Select `Send Text`.
+    * **Input**: Type `\033[1;2A`
+    * Click **OK**.
+4.  **Add Second Shortcut (Cursor Down)**:
+    * Click the **Plus (+)** icon again.
+    * **Key**: Select `Cursor Down`.
+    * **Modifier**: Select `Shift`.
+    * **Action**: Select `Send Text`.
+    * **Input**: Type `\033[1;2B`
+    * Click **OK**.
+
+---
+
+#### Configuration Summary
+
+| Shortcut | Key | Modifier | Action | Escape Sequence |
+| :--- | :--- | :--- | :--- | :--- |
+| **Shift + Up** | Cursor Up | Shift | Send Text | `\033[1;2A` |
+| **Shift + Down** | Cursor Down | Shift | Send Text | `\033[1;2B` |
+
+## Troubleshooting
+
+### Terminal Color Support
+
+Fresh automatically detects your terminal's color capability and converts theme colors accordingly. Most modern terminals support 24-bit "truecolor", but some terminals and multiplexers have limited support.
+
+#### Color Modes
+
+- **Truecolor (24-bit)**: Full RGB color support (16 million colors). Used by modern terminals like Kitty, Alacritty, iTerm2, and most others with `COLORTERM=truecolor`.
+- **256 colors**: Extended palette. Used by xterm-256color and similar terminals.
+- **16 colors**: Basic ANSI colors. Used by the Linux console and very old terminals.
+
+#### Terminal Multiplexers
+
+GNU Screen and tmux add a layer between your terminal and Fresh, which can affect color rendering:
+
+- **GNU Screen**: Does not support truecolor. Fresh automatically uses 256 colors when `TERM` starts with `screen`.
+- **tmux**: Supports 256 colors by default. Some configurations support truecolor with `TERM=tmux-direct`.
+
+#### Manual Override
+
+If colors look wrong, you can force a specific color mode with the `FRESH_COLOR_MODE` environment variable:
+
+```bash
+# Force 256-color mode (recommended for GNU Screen)
+FRESH_COLOR_MODE=256 fresh
+
+# Force 16-color mode
+FRESH_COLOR_MODE=16 fresh
+
+# Force truecolor (if auto-detection is wrong)
+FRESH_COLOR_MODE=truecolor fresh
+```
+
+#### Common Issues
+
+| Symptom | Likely Cause | Solution |
+| :--- | :--- | :--- |
+| Colors look completely wrong | Truecolor detected but not supported | Use `FRESH_COLOR_MODE=256` |
+| Weird artifacts/rendering issues | Terminal multiplexer interference | Try `FRESH_COLOR_MODE=256` or check TERM |
+| Very limited/ugly colors | 16-color mode detected | Check your terminal supports 256 colors |
+
+#### Checking Your Terminal
+
+```bash
+# Check TERM variable
+echo $TERM
+
+# Check COLORTERM (if set, indicates truecolor support)
+echo $COLORTERM
+```
 
 ## Advanced Topics
 

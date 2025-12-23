@@ -213,8 +213,8 @@ fn test_mouse_click_toggles_menu() {
     harness.render().unwrap();
     harness.assert_screen_contains("New File");
 
-    // Wait to avoid double-click detection
-    std::thread::sleep(double_click_delay);
+    // Wait to avoid double-click detection (use harness.sleep to advance logical time)
+    harness.sleep(double_click_delay);
 
     // Click on File again to close it
     harness.mouse_click(2, 0).unwrap();
@@ -238,8 +238,8 @@ fn test_mouse_click_empty_area_closes_menu() {
     harness.render().unwrap();
     harness.assert_screen_contains("New File");
 
-    // Wait to avoid double-click detection
-    std::thread::sleep(double_click_delay);
+    // Wait to avoid double-click detection (use harness.sleep to advance logical time)
+    harness.sleep(double_click_delay);
 
     // Click on empty area of menu bar (far right)
     harness.mouse_click(70, 0).unwrap();
@@ -300,8 +300,8 @@ fn test_mouse_click_undo_menu_item() {
     harness.render().unwrap();
     harness.assert_screen_contains("Undo");
 
-    // Wait to avoid double-click detection
-    std::thread::sleep(double_click_delay);
+    // Wait to avoid double-click detection (use harness.sleep to advance logical time)
+    harness.sleep(double_click_delay);
 
     // Click on Undo item (first item in Edit menu, row 2 after border)
     // Edit menu starts at column 7 (after " File " + space)
@@ -341,7 +341,7 @@ fn test_view_menu_file_explorer_checkbox_syncs_on_close() {
 
     // Open file explorer
     harness.editor_mut().toggle_file_explorer();
-    std::thread::sleep(Duration::from_millis(100));
+    harness.sleep(Duration::from_millis(100));
     let _ = harness.editor_mut().process_async_messages();
     harness.render().unwrap();
 
@@ -426,5 +426,191 @@ fn test_view_menu_other_checkboxes_sync() {
         screen.contains("☐ Line Numbers"),
         "Line Numbers checkbox should be unchecked after toggle. Screen:\n{}",
         screen
+    );
+}
+
+/// Test that the "Copy with Formatting" submenu expands with dynamically generated theme options
+#[test]
+fn test_copy_with_formatting_submenu_shows_themes() {
+    let mut harness = EditorTestHarness::new(100, 30).unwrap();
+    harness.render().unwrap();
+
+    // Open Edit menu
+    harness
+        .send_key(KeyCode::Char('e'), KeyModifiers::ALT)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Edit menu should be open with Copy with Formatting visible
+    harness.assert_screen_contains("Undo");
+    harness.assert_screen_contains("Copy with Formatting");
+
+    // Navigate down to "Copy with Formatting" submenu
+    // Edit menu items: Undo(0), Redo(1), [separator], Cut, Copy, Copy with Formatting, ...
+    // Separators AND disabled items are skipped during navigation
+    // Without a selection, Cut and Copy are disabled, so:
+    // Down 1: Undo -> Redo
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    // Down 2: Redo -> Copy with Formatting (skips separator, Cut, Copy - all disabled)
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    // Verify we can see the submenu indicator (">") for Copy with Formatting
+    let screen_before = harness.screen_to_string();
+    assert!(
+        screen_before.contains("Copy with Formatting"),
+        "Copy with Formatting should be visible in menu. Screen:\n{}",
+        screen_before
+    );
+
+    // Open the submenu with Enter key (triggers execute which opens submenu)
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // The submenu should show dynamically generated theme options
+    // These come from Theme::available_themes()
+    let screen = harness.screen_to_string();
+
+    assert!(
+        screen.contains("dark"),
+        "Copy with Formatting submenu should show 'dark' theme. Screen:\n{}",
+        screen
+    );
+    assert!(
+        screen.contains("light"),
+        "Copy with Formatting submenu should show 'light' theme. Screen:\n{}",
+        screen
+    );
+    assert!(
+        screen.contains("high-contrast"),
+        "Copy with Formatting submenu should show 'high-contrast' theme. Screen:\n{}",
+        screen
+    );
+    assert!(
+        screen.contains("nostalgia"),
+        "Copy with Formatting submenu should show 'nostalgia' theme. Screen:\n{}",
+        screen
+    );
+}
+
+/// Test that pressing Enter on a "Copy with Formatting" submenu option activates the copy action
+#[test]
+fn test_copy_with_formatting_submenu_activates_on_enter() {
+    let mut harness = EditorTestHarness::new(100, 30).unwrap();
+    harness.render().unwrap();
+
+    // First, insert some text and select it so the copy action can work
+    harness.type_text("Hello World").unwrap();
+    // Select all text with Ctrl+A
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Verify text is selected (status bar should show selection)
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Hello World"),
+        "Text should be visible in the editor"
+    );
+
+    // Open Edit menu
+    harness
+        .send_key(KeyCode::Char('e'), KeyModifiers::ALT)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Navigate down to "Copy with Formatting" submenu
+    // Edit menu items: Undo(0), Redo(1), [separator], Cut, Copy, Copy with Formatting, ...
+    // Down 1: Undo -> Redo
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    // Down 2: Redo -> Cut (skips separator)
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    // Down 3: Cut -> Copy
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    // Down 4: Copy -> Copy with Formatting
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    // Open the submenu with Enter key
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Verify submenu is open with theme options
+    let screen_with_submenu = harness.screen_to_string();
+    assert!(
+        screen_with_submenu.contains("dark"),
+        "Submenu should show 'dark' theme option. Screen:\n{}",
+        screen_with_submenu
+    );
+
+    // Navigate right into the submenu to select the first theme option
+    harness
+        .send_key(KeyCode::Right, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Press Enter on the first theme option ("dark") to activate copy with formatting
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // After activating the action, the menu should close
+    let screen_after = harness.screen_to_string();
+    assert!(
+        !screen_after.contains("Copy with Formatting"),
+        "Menu should close after activating copy action. Screen:\n{}",
+        screen_after
+    );
+    // The editor content should still be visible
+    assert!(
+        screen_after.contains("Hello World"),
+        "Editor content should still be visible after copy. Screen:\n{}",
+        screen_after
+    );
+}
+
+/// Test that Cut and Copy menu items are disabled when there's no selection
+#[test]
+fn test_cut_copy_disabled_without_selection() {
+    let mut harness = EditorTestHarness::new(100, 30).unwrap();
+    harness.render().unwrap();
+
+    // No text, no selection - Cut and Copy should be disabled
+
+    // Open Edit menu
+    harness
+        .send_key(KeyCode::Char('e'), KeyModifiers::ALT)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Navigate to Cut (after Undo, Redo, separator)
+    // Down 1: Undo -> Redo
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    // Down 2: Redo -> Cut (skips separator)
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    // Verify we're at Cut (menu is open)
+    let screen = harness.screen_to_string();
+    assert!(screen.contains("Cut"), "Cut should be visible");
+
+    // Press Enter on Cut - should NOT execute because no selection
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Menu should still be open because the action didn't execute
+    let screen_after = harness.screen_to_string();
+    assert!(
+        screen_after.contains("Undo") && screen_after.contains("Redo"),
+        "Menu should still be open since Cut is disabled. Screen:\n{}",
+        screen_after
     );
 }
