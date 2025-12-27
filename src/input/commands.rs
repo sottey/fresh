@@ -598,6 +598,18 @@ pub fn get_all_commands() -> Vec<Command> {
             source: CommandSource::Builtin,
         },
         Command {
+            name: "Toggle Menu Bar".to_string(),
+            description: "Show or hide the menu bar".to_string(),
+            action: Action::ToggleMenuBar,
+            contexts: vec![
+                KeyContext::Normal,
+                KeyContext::FileExplorer,
+                KeyContext::Terminal,
+            ],
+            custom_contexts: vec![],
+            source: CommandSource::Builtin,
+        },
+        Command {
             name: "Focus File Explorer".to_string(),
             description: "Move focus to the file explorer".to_string(),
             action: Action::FocusFileExplorer,
@@ -862,14 +874,6 @@ pub fn get_all_commands() -> Vec<Command> {
             source: CommandSource::Builtin,
         },
         Command {
-            name: "Indent Selection".to_string(),
-            description: "Increase indentation of selected lines".to_string(),
-            action: Action::IndentSelection,
-            contexts: vec![KeyContext::Normal],
-            custom_contexts: vec![],
-            source: CommandSource::Builtin,
-        },
-        Command {
             name: "Dedent Selection".to_string(),
             description: "Decrease indentation of selected lines".to_string(),
             action: Action::DedentSelection,
@@ -1068,6 +1072,23 @@ pub fn get_all_commands() -> Vec<Command> {
                 .to_string(),
             action: Action::ToggleKeyboardCapture,
             contexts: vec![KeyContext::Terminal],
+            custom_contexts: vec![],
+            source: CommandSource::Builtin,
+        },
+        // Shell command operations
+        Command {
+            name: "Shell Command".to_string(),
+            description: "Run shell command on buffer/selection, output to new buffer".to_string(),
+            action: Action::ShellCommand,
+            contexts: vec![KeyContext::Normal],
+            custom_contexts: vec![],
+            source: CommandSource::Builtin,
+        },
+        Command {
+            name: "Shell Command (Replace)".to_string(),
+            description: "Run shell command on buffer/selection, replace content".to_string(),
+            action: Action::ShellCommandReplace,
+            contexts: vec![KeyContext::Normal],
             custom_contexts: vec![],
             source: CommandSource::Builtin,
         },

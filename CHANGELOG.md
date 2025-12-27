@@ -1,5 +1,57 @@
 # Release Notes
 
+## 0.1.64
+
+* To prevent accidental deletion of files, removed 'd' / delete key bindings from File Explorer, changed the underlying delete to show a prompt and to move files to trash instead of really deleting.
+
+## 0.1.63
+
+### Features
+
+* **Shell Command Prompt**: Pipe buffer or selection through shell commands (Alt+|).
+
+* **On-Save Actions**: Run formatters/linters on save. Default formatters included for Rust (rustfmt), JavaScript/TypeScript (prettier), Python (ruff), C/C++ (clang-format), Go (gofmt).
+
+* **Stdin Input**: Pipe content via stdin with background streaming (`echo "hello" | fresh -`).
+
+* **Multi-File CLI**: Open multiple files from command line (#389).
+
+* **Tab Indent Selection**: Tab indents selected lines, Shift+Tab dedents (#353).
+
+* **Toggle Menu Bar**: Hide/show menu bar via command palette for extra screen space.
+
+* **Global File Positions**: Cursor/scroll positions stored globally per file, not per project (#423).
+
+* **Relative Line Numbers**: Show relative distances from cursor in gutter for easier vim-style navigation. Enable via `relative_line_numbers` config (#454).
+
+### Bug Fixes
+
+* **On-Save Missing Tools**: Graceful handling when formatter/linter command not found.
+
+* **Settings UI Nested Dialogs**: Fixed nested ObjectArray navigation and save not persisting (e.g., editing on_save inside language config).
+
+* **Live Grep Working Directory**: Fixed search plugins using process cwd instead of project working directory.
+
+* **Open File Path Resolution**: Fixed relative paths resolving incorrectly when editor launched from different directory.
+
+### Performance
+
+* **Live Grep UI**: Fixed UI freezing for seconds during large codebase searches by making plugin event loop non-blocking.
+
+### Internal
+
+* Embedded plugins in binary as fallback for cargo-binstall (#416).
+
+* Removed duplicate theme JSON files (#438).
+
+* Extracted modules from mod.rs (file_operations, split_actions, clipboard, etc.).
+
+* Pinned Rust 1.92 via rust-toolchain.toml (#338).
+
+* Windows build switched from MSVC to GNU target.
+
+---
+
 ## 0.1.59
 
 ### Features

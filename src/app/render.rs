@@ -59,14 +59,14 @@ impl Editor {
         // Status bar is hidden when suggestions popup is shown
         // Search options bar is shown when in search prompt
         let constraints = vec![
-            Constraint::Length(1), // Menu bar
-            Constraint::Min(0),    // Main content area
+            Constraint::Length(if self.menu_bar_visible { 1 } else { 0 }), // Menu bar
+            Constraint::Min(0),                                            // Main content area
             Constraint::Length(if has_suggestions || has_file_browser {
                 0
             } else {
                 1
             }), // Status bar (hidden with popups)
-            Constraint::Length(if show_search_options { 1 } else { 0 }), // Search options bar
+            Constraint::Length(if show_search_options { 1 } else { 0 }),   // Search options bar
             Constraint::Length(1), // Prompt line (always reserved)
         ];
 
@@ -334,6 +334,7 @@ impl Editor {
                 hovered_close_split,
                 hovered_maximize_split,
                 is_maximized,
+                self.config.editor.relative_line_numbers,
             );
 
         // Render terminal content on top of split content for terminal buffers
@@ -658,7 +659,8 @@ impl Editor {
             .set(context_keys::LSP_AVAILABLE, lsp_available)
             .set(context_keys::FILE_EXPLORER_SHOW_HIDDEN, show_hidden)
             .set(context_keys::FILE_EXPLORER_SHOW_GITIGNORED, show_gitignored)
-            .set(context_keys::HAS_SELECTION, has_selection);
+            .set(context_keys::HAS_SELECTION, has_selection)
+            .set(context_keys::MENU_BAR, self.menu_bar_visible);
 
         // Render settings modal (before menu bar so menus can overlay)
         // Check visibility first to avoid borrow conflict with dimming
@@ -684,15 +686,17 @@ impl Editor {
             }
         }
 
-        crate::view::ui::MenuRenderer::render(
-            frame,
-            menu_bar_area,
-            &self.config.menu,
-            &self.menu_state,
-            &self.keybindings,
-            &self.theme,
-            self.mouse_state.hover_target.as_ref(),
-        );
+        if self.menu_bar_visible {
+            crate::view::ui::MenuRenderer::render(
+                frame,
+                menu_bar_area,
+                &self.config.menu,
+                &self.menu_state,
+                &self.keybindings,
+                &self.theme,
+                self.mouse_state.hover_target.as_ref(),
+            );
+        }
 
         // Render software mouse cursor when GPM is active
         // GPM can't draw its cursor on the alternate screen buffer used by TUI apps,
@@ -2383,175 +2387,6 @@ impl Editor {
             self.active_event_log_mut().append(event.clone());
             self.apply_event_to_active_buffer(&event);
         }
-    }
-
-    /// Indent the selection or current line
-    pub(super) fn indent_selection(&mut self) {
-        let tab_size = self.config.editor.tab_size;
-        let estimated_line_length = self.config.editor.estimated_line_length;
-        let indent_str = " ".repeat(tab_size);
-
-        let state = self.active_state_mut();
-        // Collect lines to indent
-        let cursor = state.cursors.primary().clone();
-        let cursor_id = state.cursors.primary_id();
-
-        let (start_pos, end_pos) = if let Some(range) = cursor.selection_range() {
-            (range.start, range.end)
-        } else {
-            // No selection - indent current line
-            let iter = state
-                .buffer
-                .line_iterator(cursor.position, estimated_line_length);
-            let line_start = iter.current_position();
-            (line_start, cursor.position)
-        };
-
-        // Find all line starts in the range
-        let buffer_len = state.buffer.len();
-        let mut line_starts = Vec::new();
-        let mut iter = state.buffer.line_iterator(start_pos, estimated_line_length);
-        let mut current_pos = iter.current_position();
-        line_starts.push(current_pos);
-
-        // Collect all line starts by iterating through lines
-        loop {
-            if let Some((_, content)) = iter.next() {
-                current_pos += content.len();
-                if current_pos > end_pos || current_pos > buffer_len {
-                    break;
-                }
-                let next_iter = state
-                    .buffer
-                    .line_iterator(current_pos, estimated_line_length);
-                let next_start = next_iter.current_position();
-                if next_start != *line_starts.last().unwrap() {
-                    line_starts.push(next_start);
-                }
-                iter = state
-                    .buffer
-                    .line_iterator(current_pos, estimated_line_length);
-            } else {
-                break;
-            }
-        }
-
-        if line_starts.is_empty() {
-            return;
-        }
-
-        // Create insert events for each line start (in reverse order)
-        let mut events = Vec::new();
-        for &line_start in line_starts.iter().rev() {
-            events.push(Event::Insert {
-                position: line_start,
-                text: indent_str.clone(),
-                cursor_id,
-            });
-        }
-
-        let batch = Event::Batch {
-            events,
-            description: "Indent selection".to_string(),
-        };
-
-        self.active_event_log_mut().append(batch.clone());
-        self.apply_event_to_active_buffer(&batch);
-        self.set_status_message(format!("Indented {} line(s)", line_starts.len()));
-    }
-
-    /// Dedent the selection or current line
-    pub(super) fn dedent_selection(&mut self) {
-        let tab_size = self.config.editor.tab_size;
-        let estimated_line_length = self.config.editor.estimated_line_length;
-
-        let state = self.active_state_mut();
-        // Collect lines to dedent
-        let cursor = state.cursors.primary().clone();
-        let cursor_id = state.cursors.primary_id();
-
-        let (start_pos, end_pos) = if let Some(range) = cursor.selection_range() {
-            (range.start, range.end)
-        } else {
-            // No selection - dedent current line
-            let iter = state
-                .buffer
-                .line_iterator(cursor.position, estimated_line_length);
-            let line_start = iter.current_position();
-            (line_start, cursor.position)
-        };
-
-        // Find all line starts in the range (same logic as indent)
-        let buffer_len = state.buffer.len();
-        let mut line_starts = Vec::new();
-        let mut iter = state.buffer.line_iterator(start_pos, estimated_line_length);
-        let mut current_pos = iter.current_position();
-        line_starts.push(current_pos);
-
-        loop {
-            if let Some((_, content)) = iter.next() {
-                current_pos += content.len();
-                if current_pos > end_pos || current_pos > buffer_len {
-                    break;
-                }
-                let next_iter = state
-                    .buffer
-                    .line_iterator(current_pos, estimated_line_length);
-                let next_start = next_iter.current_position();
-                if next_start != *line_starts.last().unwrap() {
-                    line_starts.push(next_start);
-                }
-                iter = state
-                    .buffer
-                    .line_iterator(current_pos, estimated_line_length);
-            } else {
-                break;
-            }
-        }
-
-        if line_starts.is_empty() {
-            return;
-        }
-
-        // Create delete events for leading spaces (in reverse order)
-        let mut events = Vec::new();
-        let mut lines_dedented = 0;
-
-        for &line_start in line_starts.iter().rev() {
-            // Check how many leading spaces the line has
-            let line_bytes = state
-                .buffer
-                .slice_bytes(line_start..buffer_len.min(line_start + tab_size + 1));
-            let spaces_to_remove = line_bytes
-                .iter()
-                .take(tab_size)
-                .take_while(|&&b| b == b' ')
-                .count();
-
-            if spaces_to_remove > 0 {
-                let deleted_text = " ".repeat(spaces_to_remove);
-                events.push(Event::Delete {
-                    range: line_start..line_start + spaces_to_remove,
-                    deleted_text,
-                    cursor_id,
-                });
-                lines_dedented += 1;
-            }
-        }
-
-        if events.is_empty() {
-            self.set_status_message("No indentation to remove".to_string());
-            return;
-        }
-
-        let batch = Event::Batch {
-            events,
-            description: "Dedent selection".to_string(),
-        };
-
-        self.active_event_log_mut().append(batch.clone());
-        self.apply_event_to_active_buffer(&batch);
-        self.set_status_message(format!("Dedented {} line(s)", lines_dedented));
     }
 
     /// Toggle comment on the current line or selection

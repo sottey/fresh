@@ -137,6 +137,14 @@ fn transpile_typescript(source: &str, specifier: &ModuleSpecifier) -> Result<Str
     Ok(transpiled.into_source().text.to_string())
 }
 
+/// A cancellable process with pending output collection
+struct CancellableProcess {
+    /// The child process handle (for killing)
+    child: tokio::process::Child,
+    /// Receiver for the collected output (stdout, stderr)
+    output_rx: tokio::sync::oneshot::Receiver<(String, String)>,
+}
+
 /// Shared state accessible from ops
 struct TsRuntimeState {
     /// Editor state snapshot (read-only access)
@@ -158,6 +166,10 @@ struct TsRuntimeState {
     next_request_id: Rc<RefCell<u64>>,
     /// Background processes: process_id -> Child handle
     background_processes: Rc<RefCell<HashMap<u64, tokio::process::Child>>>,
+    /// Cancellable processes: process_id -> CancellableProcess
+    cancellable_processes: Rc<RefCell<HashMap<u64, CancellableProcess>>>,
+    /// Process PIDs: process_id -> OS PID (for killing processes that are being waited on)
+    process_pids: Rc<RefCell<HashMap<u64, u32>>>,
     /// Next process ID for background processes
     next_process_id: Rc<RefCell<u64>>,
 }
@@ -1162,107 +1174,6 @@ struct SpawnResult {
     exit_code: i32,
 }
 
-/// Run an external command and capture its output
-///
-/// Waits for process to complete before returning. For long-running processes,
-/// consider if this will block your plugin. Output is captured completely;
-/// very large outputs may use significant memory.
-/// @param command - Program name (searched in PATH) or absolute path
-/// @param args - Command arguments (each array element is one argument)
-/// @param cwd - Working directory; null uses editor's cwd
-/// @example
-/// const result = await editor.spawnProcess("git", ["log", "--oneline", "-5"]);
-/// if (result.exit_code !== 0) {
-///   editor.setStatus(`git failed: ${result.stderr}`);
-/// }
-#[op2(async)]
-#[serde]
-async fn op_fresh_spawn_process(
-    #[string] command: String,
-    #[serde] args: Vec<String>,
-    #[string] cwd: Option<String>,
-) -> Result<SpawnResult, JsErrorBox> {
-    use std::process::Stdio;
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    use tokio::process::Command;
-
-    // Check if we're in a tokio runtime context
-    if tokio::runtime::Handle::try_current().is_err() {
-        return Err(JsErrorBox::generic(
-            "spawnProcess requires an async runtime context (tokio)",
-        ));
-    }
-
-    // Build the command
-    let mut cmd = Command::new(&command);
-    cmd.args(&args);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    // Set working directory if provided
-    if let Some(ref dir) = cwd {
-        cmd.current_dir(dir);
-    }
-
-    // Spawn the process
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| JsErrorBox::generic(format!("Failed to spawn process: {}", e)))?;
-
-    // Capture stdout and stderr
-    let stdout_handle = child.stdout.take();
-    let stderr_handle = child.stderr.take();
-
-    // Read stdout
-    let stdout_future = async {
-        if let Some(stdout) = stdout_handle {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            let mut output = String::new();
-
-            while let Ok(Some(line)) = lines.next_line().await {
-                output.push_str(&line);
-                output.push('\n');
-            }
-            output
-        } else {
-            String::new()
-        }
-    };
-
-    // Read stderr
-    let stderr_future = async {
-        if let Some(stderr) = stderr_handle {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            let mut output = String::new();
-
-            while let Ok(Some(line)) = lines.next_line().await {
-                output.push_str(&line);
-                output.push('\n');
-            }
-            output
-        } else {
-            String::new()
-        }
-    };
-
-    // Wait for both outputs concurrently
-    let (stdout, stderr) = tokio::join!(stdout_future, stderr_future);
-
-    // Wait for process to complete
-    let exit_code = match child.wait().await {
-        Ok(status) => status.code().unwrap_or(-1),
-        Err(_) => -1,
-    };
-
-    Ok(SpawnResult {
-        stdout,
-        stderr,
-        exit_code,
-    })
-}
-
 /// Result from spawnBackgroundProcess - just the process ID
 #[derive(serde::Serialize)]
 struct BackgroundProcessResult {
@@ -1337,35 +1248,63 @@ async fn op_fresh_spawn_background_process(
     Ok(BackgroundProcessResult { process_id })
 }
 
-/// Kill a background process by ID
+/// Kill a background or cancellable process by ID
 ///
 /// Sends SIGTERM to gracefully terminate the process.
 /// Returns true if the process was found and killed, false if not found.
 ///
-/// @param process_id - ID returned from spawnBackgroundProcess
+/// @param process_id - ID returned from spawnBackgroundProcess or spawnProcessStart
 /// @returns true if process was killed, false if not found
 #[op2(async)]
 async fn op_fresh_kill_process(
     state: Rc<RefCell<OpState>>,
     #[bigint] process_id: u64,
 ) -> Result<bool, JsErrorBox> {
-    let child_opt = {
+    // Try to find and remove from either background_processes or cancellable_processes
+    let (bg_child, cancellable, os_pid) = {
         let op_state = state.borrow();
         if let Some(runtime_state) = op_state.try_borrow::<Rc<RefCell<TsRuntimeState>>>() {
             let runtime_state = runtime_state.borrow();
-            let child = runtime_state
+            let bg = runtime_state
                 .background_processes
                 .borrow_mut()
                 .remove(&process_id);
-            child
+            let cancellable = runtime_state
+                .cancellable_processes
+                .borrow_mut()
+                .remove(&process_id);
+            // Also get OS PID for fallback kill-by-pid
+            let os_pid = runtime_state.process_pids.borrow_mut().remove(&process_id);
+            (bg, cancellable, os_pid)
         } else {
             return Ok(false);
         }
     };
 
-    if let Some(mut child) = child_opt {
-        // Kill the process
+    // Kill whichever one we found
+    if let Some(mut child) = bg_child {
         let _ = child.kill().await;
+        Ok(true)
+    } else if let Some(mut process) = cancellable {
+        let _ = process.child.kill().await;
+        Ok(true)
+    } else if let Some(pid) = os_pid {
+        // Fallback: kill by OS PID when spawn_process_wait has taken ownership
+        // This happens when await-ing the process while trying to kill it
+        tracing::trace!(process_id, pid, "killing process by OS PID (fallback)");
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        {
+            // On non-Unix, try using taskkill
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .status();
+        }
         Ok(true)
     } else {
         Ok(false)
@@ -1407,6 +1346,233 @@ fn op_fresh_is_process_running(state: &mut OpState, #[bigint] process_id: u64) -
     } else {
         false
     }
+}
+
+/// Start a cancellable process and return its ID immediately
+///
+/// Unlike spawnProcess which waits for completion, this starts output collection
+/// in the background and returns immediately with a process ID.
+/// Use spawnProcessWait(id) to get the result, or killProcess(id) to cancel.
+///
+/// @param command - Program name (searched in PATH) or absolute path
+/// @param args - Command arguments (each array element is one argument)
+/// @param cwd - Working directory; null uses editor's cwd
+/// @returns Process ID for later reference
+#[op2(async)]
+#[bigint]
+async fn op_fresh_spawn_process_start(
+    state: Rc<RefCell<OpState>>,
+    #[string] command: String,
+    #[serde] args: Vec<String>,
+    #[string] cwd: Option<String>,
+) -> Result<u64, JsErrorBox> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    let spawn_start = std::time::Instant::now();
+    tracing::trace!(
+        command = %command,
+        args = ?args,
+        cwd = ?cwd,
+        "spawn_process_start called"
+    );
+
+    // Build the command
+    let mut cmd = Command::new(&command);
+    cmd.args(&args);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    // Set working directory if provided
+    if let Some(ref dir) = cwd {
+        cmd.current_dir(dir);
+    }
+
+    // Spawn the process
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| JsErrorBox::generic(format!("Failed to spawn process: {}", e)))?;
+
+    // Get the OS PID for kill-by-pid (needed because spawn_process_wait takes ownership)
+    let os_pid = child.id();
+
+    tracing::trace!(
+        command = %command,
+        os_pid = ?os_pid,
+        spawn_ms = spawn_start.elapsed().as_micros(),
+        "process spawned"
+    );
+
+    // Take stdout and stderr handles
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    // Create a oneshot channel for the output
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    // Spawn a task to collect output
+    tokio::spawn(async move {
+        let stdout_future = async {
+            if let Some(stdout) = stdout_handle {
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                let mut output = String::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+                output
+            } else {
+                String::new()
+            }
+        };
+
+        let stderr_future = async {
+            if let Some(stderr) = stderr_handle {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                let mut output = String::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+                output
+            } else {
+                String::new()
+            }
+        };
+
+        let (stdout, stderr) = tokio::join!(stdout_future, stderr_future);
+        let _ = tx.send((stdout, stderr));
+    });
+
+    // Store the process and get its ID
+    let process_id = {
+        let op_state = state.borrow();
+        if let Some(runtime_state) = op_state.try_borrow::<Rc<RefCell<TsRuntimeState>>>() {
+            let runtime_state = runtime_state.borrow();
+            let mut id = runtime_state.next_process_id.borrow_mut();
+            let process_id = *id;
+            *id += 1;
+            drop(id);
+
+            runtime_state.cancellable_processes.borrow_mut().insert(
+                process_id,
+                CancellableProcess {
+                    child,
+                    output_rx: rx,
+                },
+            );
+
+            // Store OS PID separately for kill-by-pid
+            // (needed because spawn_process_wait takes ownership of Child)
+            if let Some(pid) = os_pid {
+                runtime_state
+                    .process_pids
+                    .borrow_mut()
+                    .insert(process_id, pid);
+            }
+
+            process_id
+        } else {
+            return Err(JsErrorBox::generic("Runtime state not available"));
+        }
+    };
+
+    Ok(process_id)
+}
+
+/// Wait for a cancellable process to complete and get its result
+///
+/// @param process_id - ID returned from spawnProcessStart
+/// @returns SpawnResult with stdout, stderr, and exit_code
+#[op2(async)]
+#[serde]
+async fn op_fresh_spawn_process_wait(
+    state: Rc<RefCell<OpState>>,
+    #[bigint] process_id: u64,
+) -> Result<SpawnResult, JsErrorBox> {
+    let wait_start = std::time::Instant::now();
+    tracing::trace!(process_id, "spawn_process_wait called");
+
+    // Take the process from the map
+    let process_opt = {
+        let op_state = state.borrow();
+        if let Some(runtime_state) = op_state.try_borrow::<Rc<RefCell<TsRuntimeState>>>() {
+            let runtime_state = runtime_state.borrow();
+            let result = runtime_state
+                .cancellable_processes
+                .borrow_mut()
+                .remove(&process_id);
+            result
+        } else {
+            return Err(JsErrorBox::generic("Runtime state not available"));
+        }
+    };
+
+    let Some(mut process) = process_opt else {
+        tracing::trace!(process_id, "process not found");
+        return Err(JsErrorBox::generic(format!(
+            "Process {} not found (already completed or killed)",
+            process_id
+        )));
+    };
+
+    // Wait for the process to complete
+    tracing::trace!(process_id, "waiting for process...");
+    let exit_code = match process.child.wait().await {
+        Ok(status) => status.code().unwrap_or(-1),
+        Err(_) => -1,
+    };
+    tracing::trace!(
+        process_id,
+        exit_code,
+        wait_ms = wait_start.elapsed().as_millis(),
+        "process exited"
+    );
+
+    // Get the collected output
+    let (stdout, stderr) = process
+        .output_rx
+        .await
+        .unwrap_or_else(|_| (String::new(), String::new()));
+
+    // Clean up process_pids entry (if kill_process hasn't already)
+    {
+        let op_state = state.borrow();
+        if let Some(runtime_state) = op_state.try_borrow::<Rc<RefCell<TsRuntimeState>>>() {
+            let runtime_state = runtime_state.borrow();
+            runtime_state.process_pids.borrow_mut().remove(&process_id);
+        }
+    }
+
+    tracing::trace!(
+        process_id,
+        exit_code,
+        stdout_len = stdout.len(),
+        stderr_len = stderr.len(),
+        total_ms = wait_start.elapsed().as_millis(),
+        "spawn_process_wait completed"
+    );
+
+    Ok(SpawnResult {
+        stdout,
+        stderr,
+        exit_code,
+    })
+}
+
+/// Delay execution for a specified number of milliseconds
+///
+/// Useful for debouncing user input or adding delays between operations.
+/// @param ms - Number of milliseconds to delay
+/// @example
+/// await editor.delay(100);  // Wait 100ms
+#[op2(async)]
+async fn op_fresh_delay(#[bigint] ms: u64) -> Result<(), JsErrorBox> {
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    Ok(())
 }
 
 /// Subscribe to an editor event
@@ -2837,7 +3003,9 @@ extension!(
         op_fresh_open_file_in_split,
         op_fresh_get_cursor_line,
         op_fresh_get_all_cursor_positions,
-        op_fresh_spawn_process,
+        op_fresh_spawn_process_start,
+        op_fresh_spawn_process_wait,
+        op_fresh_delay,
         op_fresh_spawn_background_process,
         op_fresh_kill_process,
         op_fresh_is_process_running,
@@ -2938,6 +3106,8 @@ impl TypeScriptRuntime {
             pending_responses: Arc::clone(&pending_responses),
             next_request_id: Rc::new(RefCell::new(1)),
             background_processes: Rc::new(RefCell::new(HashMap::new())),
+            cancellable_processes: Rc::new(RefCell::new(HashMap::new())),
+            process_pids: Rc::new(RefCell::new(HashMap::new())),
             next_process_id: Rc::new(RefCell::new(1)),
         }));
 
@@ -3165,7 +3335,26 @@ impl TypeScriptRuntime {
 
                     // Async operations
                     spawnProcess(command, args = [], cwd = null) {
-                        return core.ops.op_fresh_spawn_process(command, args, cwd);
+                        const processId = core.ops.op_fresh_spawn_process_start(command, args, cwd);
+                        const resultPromise = processId.then(id => core.ops.op_fresh_spawn_process_wait(id));
+                        return {
+                            get processId() { return processId; },
+                            get result() { return resultPromise; },
+                            kill: async () => {
+                                const id = await processId;
+                                return core.ops.op_fresh_kill_process(id);
+                            },
+                            // Make it thenable for backward compatibility (await spawnProcess(...))
+                            then(onFulfilled, onRejected) {
+                                return resultPromise.then(onFulfilled, onRejected);
+                            },
+                            catch(onRejected) {
+                                return resultPromise.catch(onRejected);
+                            }
+                        };
+                    },
+                    delay(ms) {
+                        return core.ops.op_fresh_delay(ms);
                     },
                     spawnBackgroundProcess(command, args = [], cwd = null) {
                         return core.ops.op_fresh_spawn_background_process(command, args, cwd);
@@ -3470,20 +3659,13 @@ impl TypeScriptRuntime {
                 match self.js_runtime.execute_script("<emit>", script) {
                     Ok(_) => {
                         let call_elapsed = call_start.elapsed();
-
-                        // Run event loop to process any async work (promises)
-                        let event_loop_start = std::time::Instant::now();
-                        self.js_runtime
-                            .run_event_loop(Default::default())
-                            .await
-                            .map_err(|e| anyhow!("Event loop error in emit: {}", e))?;
-                        let event_loop_elapsed = event_loop_start.elapsed();
-
+                        // Don't poll event loop here - the plugin thread's main loop
+                        // will poll it periodically to allow long-running promises
+                        // (like process spawns) to make progress.
                         tracing::trace!(
                             event = event_name,
                             handler = handler_name,
                             call_us = call_elapsed.as_micros(),
-                            event_loop_us = event_loop_elapsed.as_micros(),
                             "emit handler timing"
                         );
                     }
@@ -3525,6 +3707,22 @@ impl TypeScriptRuntime {
             .get(event_name)
             .map(|v| !v.is_empty())
             .unwrap_or(false)
+    }
+
+    /// Poll the event loop once to make progress on pending promises.
+    /// Returns true if there's still pending work, false if all work is done.
+    pub fn poll_event_loop_once(&mut self) -> bool {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(&waker);
+        match self.js_runtime.poll_event_loop(&mut cx, Default::default()) {
+            std::task::Poll::Ready(result) => {
+                if let Err(e) = result {
+                    tracing::warn!("Event loop error: {}", e);
+                }
+                false // No more pending work
+            }
+            std::task::Poll::Pending => true, // More work pending
+        }
     }
 
     /// Send a status message to the editor UI

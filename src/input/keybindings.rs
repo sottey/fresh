@@ -288,6 +288,7 @@ pub enum Action {
     Quit,
     Revert,
     ToggleAutoRevert,
+    FormatBuffer,
 
     // Navigation
     GotoLine,
@@ -297,7 +298,6 @@ pub enum Action {
 
     // Smart editing
     SmartHome,
-    IndentSelection,
     DedentSelection,
     ToggleComment,
 
@@ -410,6 +410,8 @@ pub enum Action {
 
     // File explorer operations
     ToggleFileExplorer,
+    // Menu bar visibility
+    ToggleMenuBar,
     FocusFileExplorer,
     FocusEditor,
     FileExplorerUp,
@@ -501,6 +503,10 @@ pub enum Action {
     ToggleKeyboardCapture, // Toggle keyboard capture mode (all keys go to terminal)
     TerminalPaste,         // Paste clipboard contents into terminal as a single batch
 
+    // Shell command operations
+    ShellCommand,        // Run shell command on buffer/selection, output to new buffer
+    ShellCommandReplace, // Run shell command on buffer/selection, replace content
+
     // No-op
     None,
 }
@@ -590,13 +596,13 @@ impl Action {
             "quit" => Some(Action::Quit),
             "revert" => Some(Action::Revert),
             "toggle_auto_revert" => Some(Action::ToggleAutoRevert),
+            "format_buffer" => Some(Action::FormatBuffer),
             "goto_line" => Some(Action::GotoLine),
             "goto_matching_bracket" => Some(Action::GoToMatchingBracket),
             "jump_to_next_error" => Some(Action::JumpToNextError),
             "jump_to_previous_error" => Some(Action::JumpToPreviousError),
 
             "smart_home" => Some(Action::SmartHome),
-            "indent_selection" => Some(Action::IndentSelection),
             "dedent_selection" => Some(Action::DedentSelection),
             "toggle_comment" => Some(Action::ToggleComment),
 
@@ -722,6 +728,7 @@ impl Action {
             "popup_cancel" => Some(Action::PopupCancel),
 
             "toggle_file_explorer" => Some(Action::ToggleFileExplorer),
+            "toggle_menu_bar" => Some(Action::ToggleMenuBar),
             "focus_file_explorer" => Some(Action::FocusFileExplorer),
             "focus_editor" => Some(Action::FocusEditor),
             "file_explorer_up" => Some(Action::FileExplorerUp),
@@ -799,6 +806,10 @@ impl Action {
             "terminal_escape" => Some(Action::TerminalEscape),
             "toggle_keyboard_capture" => Some(Action::ToggleKeyboardCapture),
             "terminal_paste" => Some(Action::TerminalPaste),
+
+            // Shell command actions
+            "shell_command" => Some(Action::ShellCommand),
+            "shell_command_replace" => Some(Action::ShellCommandReplace),
 
             // Settings actions
             "open_settings" => Some(Action::OpenSettings),
@@ -1054,6 +1065,8 @@ impl KeybindingResolver {
                 | Action::TerminalPaste
                 // File explorer
                 | Action::ToggleFileExplorer
+                // Menu bar
+                | Action::ToggleMenuBar
         )
     }
 
@@ -1416,6 +1429,7 @@ impl KeybindingResolver {
             "backspace" => Some(KeyCode::Backspace),
             "delete" | "del" => Some(KeyCode::Delete),
             "tab" => Some(KeyCode::Tab),
+            "backtab" => Some(KeyCode::BackTab),
             "esc" | "escape" => Some(KeyCode::Esc),
             "space" => Some(KeyCode::Char(' ')),
 
@@ -1572,6 +1586,7 @@ impl KeybindingResolver {
             Action::Quit => "Quit editor".to_string(),
             Action::Revert => "Revert to saved file".to_string(),
             Action::ToggleAutoRevert => "Toggle auto-revert mode".to_string(),
+            Action::FormatBuffer => "Format buffer with configured formatter".to_string(),
             Action::GotoLine => "Go to line number".to_string(),
             Action::GoToMatchingBracket => "Go to matching bracket".to_string(),
             Action::JumpToNextError => "Jump to next error/diagnostic".to_string(),
@@ -1579,7 +1594,6 @@ impl KeybindingResolver {
             Action::SmartHome => {
                 "Smart home (toggle line start / first non-whitespace)".to_string()
             }
-            Action::IndentSelection => "Indent selection".to_string(),
             Action::DedentSelection => "Dedent selection".to_string(),
             Action::ToggleComment => "Toggle comment".to_string(),
             Action::SetBookmark(c) => format!("Set bookmark '{}'", c),
@@ -1658,6 +1672,7 @@ impl KeybindingResolver {
             Action::PopupConfirm => "Popup confirm".to_string(),
             Action::PopupCancel => "Popup cancel".to_string(),
             Action::ToggleFileExplorer => "Toggle file explorer".to_string(),
+            Action::ToggleMenuBar => "Toggle menu bar visibility".to_string(),
             Action::FocusFileExplorer => "Focus file explorer".to_string(),
             Action::FocusEditor => "Focus editor".to_string(),
             Action::FileExplorerUp => "File explorer: navigate up".to_string(),
@@ -1738,6 +1753,8 @@ impl KeybindingResolver {
             Action::SettingsHelp => "Show settings help".to_string(),
             Action::SettingsIncrement => "Increment value".to_string(),
             Action::SettingsDecrement => "Decrement value".to_string(),
+            Action::ShellCommand => "Run shell command on buffer/selection".to_string(),
+            Action::ShellCommandReplace => "Run shell command and replace".to_string(),
             Action::None => "No action".to_string(),
         }
     }
@@ -1856,6 +1873,15 @@ mod tests {
         assert_eq!(
             KeybindingResolver::parse_key("backspace"),
             Some(KeyCode::Backspace)
+        );
+        assert_eq!(KeybindingResolver::parse_key("tab"), Some(KeyCode::Tab));
+        assert_eq!(
+            KeybindingResolver::parse_key("backtab"),
+            Some(KeyCode::BackTab)
+        );
+        assert_eq!(
+            KeybindingResolver::parse_key("BackTab"),
+            Some(KeyCode::BackTab)
         );
         assert_eq!(KeybindingResolver::parse_key("a"), Some(KeyCode::Char('a')));
     }

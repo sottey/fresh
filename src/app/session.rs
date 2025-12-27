@@ -31,10 +31,10 @@ use crate::state::EditorState;
 use crate::model::event::{BufferId, SplitDirection, SplitId};
 use crate::services::terminal::TerminalId;
 use crate::session::{
-    FileExplorerState, SearchOptions, SerializedBookmark, SerializedCursor, SerializedFileState,
-    SerializedScroll, SerializedSplitDirection, SerializedSplitNode, SerializedSplitViewState,
-    SerializedTabRef, SerializedTerminalSession, SerializedViewMode, Session,
-    SessionConfigOverrides, SessionError, SessionHistories, SESSION_VERSION,
+    FileExplorerState, PersistedFileSession, SearchOptions, SerializedBookmark, SerializedCursor,
+    SerializedFileState, SerializedScroll, SerializedSplitDirection, SerializedSplitNode,
+    SerializedSplitViewState, SerializedTabRef, SerializedTerminalSession, SerializedViewMode,
+    Session, SessionConfigOverrides, SessionError, SessionHistories, SESSION_VERSION,
 };
 use crate::state::ViewMode;
 use crate::view::split::{SplitNode, SplitViewState};
@@ -217,6 +217,7 @@ impl Editor {
             syntax_highlighting: Some(self.config.editor.syntax_highlighting),
             enable_inlay_hints: Some(self.config.editor.enable_inlay_hints),
             mouse_enabled: Some(self.mouse_enabled),
+            menu_bar_hidden: Some(!self.menu_bar_visible),
         };
 
         // Capture histories using the items() accessor
@@ -270,11 +271,75 @@ impl Editor {
     ///
     /// Ensures all active terminals have their visible screen synced to
     /// backing files before capturing the session.
+    /// Also saves global file states (scroll/cursor positions per file).
     pub fn save_session(&mut self) -> Result<(), SessionError> {
         // Ensure all terminal backing files have complete state before saving
         self.sync_all_terminal_backing_files();
+
+        // Save global file states for all open file buffers
+        self.save_all_global_file_states();
+
         let session = self.capture_session();
         session.save()
+    }
+
+    /// Save global file states for all open file buffers
+    fn save_all_global_file_states(&self) {
+        // Collect all file states from all splits
+        for (split_id, view_state) in &self.split_view_states {
+            // Get the active buffer for this split
+            let active_buffer = self
+                .split_manager
+                .root()
+                .get_leaves_with_rects(ratatui::layout::Rect::default())
+                .into_iter()
+                .find(|(sid, _, _)| *sid == *split_id)
+                .map(|(_, buffer_id, _)| buffer_id);
+
+            if let Some(buffer_id) = active_buffer {
+                self.save_buffer_file_state(buffer_id, view_state);
+            }
+        }
+    }
+
+    /// Save file state for a specific buffer (used when closing files and saving session)
+    fn save_buffer_file_state(&self, buffer_id: BufferId, view_state: &SplitViewState) {
+        // Get the file path for this buffer
+        let abs_path = match self.buffer_metadata.get(&buffer_id) {
+            Some(metadata) => match metadata.file_path() {
+                Some(path) => path.to_path_buf(),
+                None => return, // Not a file buffer
+            },
+            None => return,
+        };
+
+        // Capture the current state
+        let primary_cursor = view_state.cursors.primary();
+        let file_state = SerializedFileState {
+            cursor: SerializedCursor {
+                position: primary_cursor.position,
+                anchor: primary_cursor.anchor,
+                sticky_column: primary_cursor.sticky_column,
+            },
+            additional_cursors: view_state
+                .cursors
+                .iter()
+                .skip(1)
+                .map(|(_, cursor)| SerializedCursor {
+                    position: cursor.position,
+                    anchor: cursor.anchor,
+                    sticky_column: cursor.sticky_column,
+                })
+                .collect(),
+            scroll: SerializedScroll {
+                top_byte: view_state.viewport.top_byte,
+                top_view_line_offset: view_state.viewport.top_view_line_offset,
+                left_column: view_state.viewport.left_column,
+            },
+        };
+
+        // Save to disk immediately
+        PersistedFileSession::save(&abs_path, file_state);
     }
 
     /// Sync all active terminal visible screens to their backing files.
@@ -362,6 +427,9 @@ impl Editor {
         }
         if let Some(mouse_enabled) = session.config_overrides.mouse_enabled {
             self.mouse_enabled = mouse_enabled;
+        }
+        if let Some(menu_bar_hidden) = session.config_overrides.menu_bar_hidden {
+            self.menu_bar_visible = !menu_bar_hidden;
         }
 
         // 2. Restore search options

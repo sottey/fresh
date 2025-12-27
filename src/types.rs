@@ -13,6 +13,7 @@ pub mod context_keys {
     pub const LINE_WRAP: &str = "line_wrap";
     pub const COMPOSE_MODE: &str = "compose_mode";
     pub const FILE_EXPLORER: &str = "file_explorer";
+    pub const MENU_BAR: &str = "menu_bar";
     pub const FILE_EXPLORER_FOCUSED: &str = "file_explorer_focused";
     pub const MOUSE_CAPTURE: &str = "mouse_capture";
     pub const MOUSE_HOVER: &str = "mouse_hover";
@@ -72,6 +73,7 @@ impl ProcessLimits {
 
 /// LSP server configuration
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-display-field" = "/command"))]
 pub struct LspServerConfig {
     /// Command to spawn the server
     pub command: String,

@@ -22,8 +22,12 @@ let previewBufferId: number | null = null;
 let previewSplitId: number | null = null;
 let originalSplitId: number | null = null;
 let lastQuery: string = "";
-let searchDebounceTimer: number | null = null;
 let previewCreated: boolean = false;
+let currentSearch: ProcessHandle | null = null;
+let pendingKill: Promise<boolean> | null = null;  // Track pending kill globally
+let searchVersion = 0;  // Incremented on each input change for debouncing
+
+const DEBOUNCE_MS = 150;  // Wait 150ms after last keystroke before searching
 
 // Parse ripgrep output line
 // Format: file:line:column:content
@@ -169,22 +173,62 @@ function closePreview(): void {
   }
 }
 
-// Run ripgrep search
+// Run ripgrep search with debouncing
 async function runSearch(query: string): Promise<void> {
+  // Increment version to invalidate any pending debounced search
+  const thisVersion = ++searchVersion;
+  editor.debug(`[live_grep] runSearch called: query="${query}", version=${thisVersion}`);
+
+  // Kill any existing search immediately (don't wait) to stop wasting CPU
+  // Store the kill promise globally so ALL pending searches wait for it
+  if (currentSearch) {
+    editor.debug(`[live_grep] killing existing search immediately`);
+    pendingKill = currentSearch.kill();
+    currentSearch = null;
+  }
+
   if (!query || query.trim().length < 2) {
+    // Wait for any pending kill to complete before returning
+    if (pendingKill) {
+      await pendingKill;
+      pendingKill = null;
+    }
+    editor.debug(`[live_grep] query too short, clearing`);
     editor.setPromptSuggestions([]);
     grepResults = [];
     return;
   }
 
+  // Debounce: wait a bit to see if user is still typing
+  editor.debug(`[live_grep] debouncing for ${DEBOUNCE_MS}ms...`);
+  await editor.delay(DEBOUNCE_MS);
+
+  // Always await any pending kill before continuing - ensures old process is dead
+  if (pendingKill) {
+    editor.debug(`[live_grep] waiting for previous search to terminate`);
+    await pendingKill;
+    pendingKill = null;
+    editor.debug(`[live_grep] previous search terminated`);
+  }
+
+  // If version changed during delay, a newer search was triggered - abort this one
+  if (searchVersion !== thisVersion) {
+    editor.debug(`[live_grep] version mismatch after debounce (${thisVersion} vs ${searchVersion}), aborting`);
+    return;
+  }
+
   // Avoid duplicate searches
   if (query === lastQuery) {
+    editor.debug(`[live_grep] duplicate query, skipping`);
     return;
   }
   lastQuery = query;
 
   try {
-    const result = await editor.spawnProcess("rg", [
+    const cwd = editor.getCwd();
+    editor.debug(`[live_grep] spawning rg for query="${query}" in cwd="${cwd}"`);
+    const searchStartTime = Date.now();
+    const search = editor.spawnProcess("rg", [
       "--line-number",
       "--column",
       "--no-heading",
@@ -197,10 +241,25 @@ async function runSearch(query: string): Promise<void> {
       "-g", "!*.lock",
       "--",
       query,
-    ]);
+    ], cwd);
+
+    currentSearch = search;
+    editor.debug(`[live_grep] awaiting search result...`);
+    const result = await search;
+    const searchDuration = Date.now() - searchStartTime;
+    editor.debug(`[live_grep] rg completed in ${searchDuration}ms, exit_code=${result.exit_code}, stdout_len=${result.stdout.length}`);
+
+    // Check if this search was cancelled (a new search started)
+    if (currentSearch !== search) {
+      editor.debug(`[live_grep] search was superseded, discarding results`);
+      return; // Discard stale results
+    }
+    currentSearch = null;
 
     if (result.exit_code === 0) {
+      const parseStart = Date.now();
       const { results, suggestions } = parseRipgrepOutput(result.stdout);
+      editor.debug(`[live_grep] parsed ${results.length} results in ${Date.now() - parseStart}ms`);
       grepResults = results;
       editor.setPromptSuggestions(suggestions);
 
@@ -213,14 +272,24 @@ async function runSearch(query: string): Promise<void> {
       }
     } else if (result.exit_code === 1) {
       // No matches
+      editor.debug(`[live_grep] no matches (exit_code=1)`);
       grepResults = [];
       editor.setPromptSuggestions([]);
       editor.setStatus("No matches found");
+    } else if (result.exit_code === -1) {
+      // Process was killed, ignore
+      editor.debug(`[live_grep] process was killed`);
     } else {
+      editor.debug(`[live_grep] search error: ${result.stderr}`);
       editor.setStatus(`Search error: ${result.stderr}`);
     }
   } catch (e) {
-    editor.setStatus(`Search error: ${e}`);
+    // Ignore errors from killed processes
+    const errorMsg = String(e);
+    editor.debug(`[live_grep] caught error: ${errorMsg}`);
+    if (!errorMsg.includes("killed") && !errorMsg.includes("not found")) {
+      editor.setStatus(`Search error: ${e}`);
+    }
   }
 }
 
@@ -248,12 +317,9 @@ globalThis.onLiveGrepPromptChanged = function (args: {
     return true;
   }
 
-  // Debounce search to avoid too many requests while typing
-  if (searchDebounceTimer !== null) {
-    // Can't actually cancel in this runtime, but we track it
-  }
+  editor.debug(`[live_grep] onPromptChanged: input="${args.input}"`);
 
-  // Run search (with small delay effect via async)
+  // runSearch handles debouncing internally
   runSearch(args.input);
 
   return true;
@@ -286,6 +352,12 @@ globalThis.onLiveGrepPromptConfirmed = function (args: {
     return true;
   }
 
+  // Kill any running search
+  if (currentSearch) {
+    currentSearch.kill();
+    currentSearch = null;
+  }
+
   // Close preview first
   closePreview();
 
@@ -312,6 +384,12 @@ globalThis.onLiveGrepPromptCancelled = function (args: {
 }): boolean {
   if (args.prompt_type !== "live-grep") {
     return true;
+  }
+
+  // Kill any running search
+  if (currentSearch) {
+    currentSearch.kill();
+    currentSearch = null;
   }
 
   // Close preview and cleanup

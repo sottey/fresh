@@ -1,6 +1,6 @@
 [package]
 name = "fresh-editor"
-version = "0.1.59"
+version = "0.1.64"
 authors = ["Noam Lewis"]
 edition = "2021"
 default-run = "fresh"
@@ -31,8 +31,10 @@ name = "fresh"
 path = "src/lib.rs"
 
 [features]
-default = ["plugins", "runtime"]
+default = ["plugins", "runtime", "embed-plugins"]
 plugins = ["dep:deno_core", "dep:deno_ast", "dep:deno_error"]
+# Embed plugins into the binary as a fallback when no disk plugins are found
+embed-plugins = ["plugins", "dep:include_dir", "dep:tempfile"]
 # Feature for optional development binaries (generate_schema, event_debug)
 dev-bins = []
 # Runtime feature includes all heavy dependencies needed for the actual editor
@@ -82,6 +84,7 @@ runtime = [
     "dep:unicode-width",
     "dep:alacritty_terminal",
     "dep:portable-pty",
+    "dep:trash",
 ]
 # Schema-only feature for minimal builds (just schema generation)
 schema-only = []
@@ -146,6 +149,11 @@ unicode-width = { version = "0.2", optional = true }
 alacritty_terminal = { version = "0.25", optional = true }
 portable-pty = { version = "0.9", optional = true }
 
+# Embedded plugins support (optional)
+include_dir = { version = "0.7", optional = true }
+tempfile = { version = "3.23", optional = true }
+trash = { version = "5.2.5", optional = true }
+
 [dev-dependencies]
 proptest = "1.9"
 tempfile = "3.23.0"
@@ -186,6 +194,7 @@ assets = [
     ["plugins/*", "usr/share/fresh-editor/plugins/", "644"],
     ["plugins/lib/*", "usr/share/fresh-editor/plugins/lib/", "644"],
     ["plugins/examples/*", "usr/share/fresh-editor/plugins/examples/", "644"],
+    ["themes/*", "usr/share/fresh-editor/themes/", "644"],
 ]
 # Maintainer scripts to create/remove symlink at /usr/bin/fresh
 maintainer-scripts = "debian/"
@@ -207,6 +216,7 @@ assets = [
     { source = "plugins/*.md", dest = "/usr/share/fresh-editor/plugins/", mode = "644" },
     { source = "plugins/lib/*", dest = "/usr/share/fresh-editor/plugins/lib/", mode = "644" },
     { source = "plugins/examples/*", dest = "/usr/share/fresh-editor/plugins/examples/", mode = "644" },
+    { source = "themes/*.json", dest = "/usr/share/fresh-editor/themes/", mode = "644" },
 ]
 # posttrans runs after ALL transaction operations complete - needed because older versions
 # (<=0.1.56) had a preuninstall script that removes /usr/bin/fresh, which deletes our wrapper

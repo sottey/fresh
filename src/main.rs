@@ -29,9 +29,13 @@ use std::{
 #[command(about = "A terminal text editor with multi-cursor support", long_about = None)]
 #[command(version)]
 struct Args {
-    /// File to open
-    #[arg(value_name = "FILE")]
-    file: Option<PathBuf>,
+    /// Files to open (use "-" to read from stdin)
+    #[arg(value_name = "FILES")]
+    files: Vec<String>,
+
+    /// Read content from stdin (alternative to using "-" as filename)
+    #[arg(long)]
+    stdin: bool,
 
     /// Disable plugin loading
     #[arg(long)]
@@ -77,23 +81,154 @@ struct SetupState {
     warning_log_handle: Option<WarningLogHandle>,
     terminal: Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     terminal_size: (u16, u16),
-    file_location: Option<FileLocation>,
-    file_to_open: Option<PathBuf>,
+    file_locations: Vec<FileLocation>,
     show_file_explorer: bool,
     dir_context: DirectoryContext,
     current_working_dir: Option<PathBuf>,
+    /// Stdin streaming state (if --stdin flag or "-" file was used)
+    /// Contains temp file path and background thread handle
+    stdin_stream: Option<StdinStreamState>,
     #[cfg(target_os = "linux")]
     gpm_client: Option<GpmClient>,
     #[cfg(not(target_os = "linux"))]
     gpm_client: Option<()>,
 }
 
+/// State for stdin streaming in background
+#[cfg(unix)]
+pub struct StdinStreamState {
+    /// Path to temp file where stdin is being written
+    pub temp_path: PathBuf,
+    /// Handle to background thread (None if completed)
+    pub thread_handle: Option<std::thread::JoinHandle<io::Result<()>>>,
+}
+
+/// Start streaming stdin to temp file in background.
+/// Returns immediately with streaming state. Editor can start while data streams in.
+/// Must be called BEFORE enabling raw terminal mode.
+#[cfg(unix)]
+fn start_stdin_streaming() -> io::Result<StdinStreamState> {
+    use std::fs::File;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    // Duplicate stdin fd BEFORE reopening it as TTY
+    // This preserves access to the pipe for background reading
+    let stdin_fd = io::stdin().as_raw_fd();
+    let pipe_fd = unsafe { libc::dup(stdin_fd) };
+    if pipe_fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Create empty temp file
+    let temp_dir = std::env::temp_dir();
+    let temp_path = temp_dir.join(format!("fresh-stdin-{}.tmp", std::process::id()));
+    File::create(&temp_path)?;
+
+    // Reopen stdin from /dev/tty so crossterm can use it for keyboard input
+    reopen_stdin_from_tty()?;
+    tracing::info!("Reopened stdin from /dev/tty for terminal input");
+
+    // Spawn background thread to drain pipe into temp file
+    let temp_path_clone = temp_path.clone();
+    let thread_handle = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+
+        // SAFETY: pipe_fd is a valid duplicated file descriptor
+        let mut pipe_file = unsafe { File::from_raw_fd(pipe_fd) };
+        let mut temp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&temp_path_clone)?;
+
+        const CHUNK_SIZE: usize = 64 * 1024;
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+
+        loop {
+            let bytes_read = pipe_file.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break; // EOF
+            }
+            temp_file.write_all(&buffer[..bytes_read])?;
+            // Flush each chunk so main thread can see progress
+            temp_file.flush()?;
+        }
+
+        tracing::info!("Stdin streaming complete");
+        Ok(())
+    });
+
+    Ok(StdinStreamState {
+        temp_path,
+        thread_handle: Some(thread_handle),
+    })
+}
+
+/// Placeholder for Windows (not yet implemented)
+#[cfg(windows)]
+pub struct StdinStreamState {
+    pub temp_path: PathBuf,
+    pub thread_handle: Option<std::thread::JoinHandle<io::Result<()>>>,
+}
+
+// TODO(windows): Implement stdin streaming for Windows
+// - Use GetStdHandle(STD_INPUT_HANDLE) to get stdin handle
+// - Use DuplicateHandle to duplicate the pipe handle before reopening as CONIN$
+// - Spawn background thread to read from duplicated handle and write to temp file
+// - Use SetStdHandle or reopen CONIN$ as stdin for keyboard input
+#[cfg(windows)]
+fn start_stdin_streaming() -> io::Result<StdinStreamState> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Reading from stdin is not yet supported on Windows",
+    ))
+}
+
+/// Check if stdin has data available (is a pipe or redirect, not a TTY)
+fn stdin_has_data() -> bool {
+    use std::io::IsTerminal;
+    !io::stdin().is_terminal()
+}
+
+/// Reopen stdin from /dev/tty after reading piped content.
+/// This allows crossterm to use the terminal for keyboard input
+/// even though the original stdin was a pipe.
+#[cfg(unix)]
+fn reopen_stdin_from_tty() -> io::Result<()> {
+    use std::fs::File;
+    use std::os::unix::io::AsRawFd;
+
+    // Open /dev/tty - the controlling terminal
+    let tty = File::open("/dev/tty")?;
+
+    // Duplicate /dev/tty to stdin (fd 0) using libc
+    // SAFETY: dup2 is safe to call with valid file descriptors
+    let result = unsafe { libc::dup2(tty.as_raw_fd(), libc::STDIN_FILENO) };
+
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+// TODO(windows): Implement reopening stdin from CONIN$
+// - Open "CONIN$" which is the console input device
+// - Use SetStdHandle(STD_INPUT_HANDLE, conin_handle) to replace stdin
+// - This allows crossterm to receive keyboard events after stdin was a pipe
+#[cfg(windows)]
+fn reopen_stdin_from_tty() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Reading from stdin is not yet supported on Windows",
+    ))
+}
+
 fn handle_first_run_setup(
     editor: &mut Editor,
     args: &Args,
-    file_to_open: &Option<PathBuf>,
-    file_location: &Option<FileLocation>,
+    file_locations: &[FileLocation],
     show_file_explorer: bool,
+    stdin_stream: &mut Option<StdinStreamState>,
     warning_log_handle: &mut Option<WarningLogHandle>,
     session_enabled: bool,
 ) -> io::Result<()> {
@@ -120,13 +255,21 @@ fn handle_first_run_setup(
         }
     }
 
-    if let Some(path) = &file_to_open {
-        editor.open_file(path)?;
+    // Handle stdin streaming (takes priority over files)
+    // Opens with empty/partial buffer, content streams in background
+    if let Some(mut stream_state) = stdin_stream.take() {
+        tracing::info!("Opening stdin buffer from: {:?}", stream_state.temp_path);
+        editor.open_stdin_buffer(&stream_state.temp_path, stream_state.thread_handle.take())?;
+    }
 
-        if let Some(ref loc) = file_location {
-            if let Some(line) = loc.line {
-                editor.goto_line_col(line, loc.column);
-            }
+    for loc in file_locations {
+        if loc.path.is_dir() {
+            continue;
+        }
+        editor.open_file(&loc.path)?;
+
+        if let Some(line) = loc.line {
+            editor.goto_line_col(line, loc.column);
         }
     }
 
@@ -270,21 +413,61 @@ fn initialize_app(args: &Args) -> io::Result<SetupState> {
         original_hook(panic);
     }));
 
-    // Determine working directory early for config loading
-    let file_location = args
-        .file
-        .as_ref()
-        .map(|p| parse_file_location(p.to_string_lossy().as_ref()));
+    // Check if we should read from stdin
+    // This can be triggered by --stdin flag or by using "-" as a file argument
+    let stdin_requested = args.stdin || args.files.iter().any(|f| f == "-");
 
-    let (working_dir, file_to_open, show_file_explorer) = if let Some(ref loc) = file_location {
-        if loc.path.is_dir() {
-            (Some(loc.path.clone()), None, true)
+    // Start stdin streaming in background BEFORE entering raw mode
+    // This is critical - once raw mode is enabled, stdin is used for terminal events
+    // Background thread streams pipe → temp file while editor runs
+    let stdin_stream = if stdin_requested {
+        if stdin_has_data() {
+            tracing::info!("Starting background stdin streaming");
+            match start_stdin_streaming() {
+                Ok(stream_state) => {
+                    tracing::info!(
+                        "Stdin streaming started, temp file: {:?}",
+                        stream_state.temp_path
+                    );
+                    Some(stream_state)
+                }
+                Err(e) => {
+                    eprintln!("Error: Failed to start stdin streaming: {}", e);
+                    return Err(e);
+                }
+            }
         } else {
-            (None, Some(loc.path.clone()), false)
+            eprintln!("Error: --stdin or \"-\" specified but stdin is a terminal (no piped data)");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "No data piped to stdin",
+            ));
         }
     } else {
-        (None, None, false)
+        None
     };
+
+    // Determine working directory early for config loading
+    // Filter out "-" from files list since it's handled via stdin_stream
+    let file_locations: Vec<FileLocation> = args
+        .files
+        .iter()
+        .filter(|f| *f != "-")
+        .map(|f| parse_file_location(f))
+        .collect();
+
+    let mut working_dir = None;
+    let mut show_file_explorer = false;
+
+    // Only set working_dir if exactly one parameter is passed and it's a directory
+    if file_locations.len() == 1 {
+        if let Some(first_loc) = file_locations.first() {
+            if first_loc.path.is_dir() {
+                working_dir = Some(first_loc.path.clone());
+                show_file_explorer = true;
+            }
+        }
+    }
 
     // Load config - checking working directory first, then system paths
     let effective_working_dir = working_dir
@@ -356,11 +539,11 @@ fn initialize_app(args: &Args) -> io::Result<SetupState> {
         warning_log_handle,
         terminal,
         terminal_size: (size.width, size.height),
-        file_location,
-        file_to_open,
+        file_locations,
         show_file_explorer,
         dir_context,
         current_working_dir,
+        stdin_stream,
         gpm_client,
     })
 }
@@ -431,11 +614,11 @@ fn main() -> io::Result<()> {
         mut warning_log_handle,
         mut terminal,
         terminal_size,
-        file_location,
-        file_to_open,
+        file_locations,
         show_file_explorer,
         dir_context,
         current_working_dir: initial_working_dir,
+        mut stdin_stream,
         #[cfg(target_os = "linux")]
         gpm_client,
         #[cfg(not(target_os = "linux"))]
@@ -455,7 +638,7 @@ fn main() -> io::Result<()> {
     // Returns (loop_result, last_update_result) tuple
     let (result, last_update_result) = loop {
         let first_run = is_first_run;
-        let session_enabled = !args.no_session && file_to_open.is_none();
+        let session_enabled = !args.no_session && file_locations.is_empty();
 
         // Detect terminal color capability
         let color_capability = fresh::view::color_support::ColorCapability::detect();
@@ -479,9 +662,9 @@ fn main() -> io::Result<()> {
             handle_first_run_setup(
                 &mut editor,
                 &args,
-                &file_to_open,
-                &file_location,
+                &file_locations,
                 show_file_explorer,
+                &mut stdin_stream,
                 &mut warning_log_handle,
                 session_enabled,
             )?;
@@ -633,6 +816,11 @@ where
 
         // Check for warnings and open warning log if any occurred
         if editor.check_warning_log() {
+            needs_render = true;
+        }
+
+        // Poll stdin streaming progress (if active)
+        if editor.poll_stdin_streaming() {
             needs_render = true;
         }
 
@@ -862,6 +1050,23 @@ mod tests {
         assert_eq!(loc.path, PathBuf::from("foo.txt"));
         assert_eq!(loc.line, None);
         assert_eq!(loc.column, None);
+    }
+
+    #[test]
+    fn test_parse_multiple_files() {
+        let inputs = vec!["file1.txt", "sub/file2.rs:10", "file3.cpp:20:5"];
+        let locs: Vec<FileLocation> = inputs.iter().map(|i| parse_file_location(i)).collect();
+
+        assert_eq!(locs.len(), 3);
+        assert_eq!(locs[0].path, PathBuf::from("file1.txt"));
+        assert_eq!(locs[0].line, None);
+        assert_eq!(locs[0].column, None);
+        assert_eq!(locs[1].path, PathBuf::from("sub/file2.rs"));
+        assert_eq!(locs[1].line, Some(10));
+        assert_eq!(locs[1].column, None);
+        assert_eq!(locs[2].path, PathBuf::from("file3.cpp"));
+        assert_eq!(locs[2].line, Some(20));
+        assert_eq!(locs[2].column, Some(5));
     }
 
     #[test]

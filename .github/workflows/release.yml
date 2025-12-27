@@ -121,6 +121,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # rust-toolchain.toml overrides the targets parameter above, so we need to explicitly add it
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
       - name: Install cross-compilation tools (Linux ARM)
         if: matrix.cross && matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
@@ -133,6 +137,11 @@ jobs:
           if [ "${{ matrix.cross }}" = "true" ] && [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           fi
+          # Static link the C runtime on Windows MSVC to avoid vcruntime DLL dependency
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
+            export RUSTFLAGS="-C target-feature=+crt-static"
+          fi
+          # embed-plugins is now a default feature - plugins are always embedded as fallback
           cargo build --release --target ${{ matrix.target }}
 
       - name: Create archive (Unix)
@@ -141,8 +150,9 @@ jobs:
           ARCHIVE_NAME="fresh-editor-${{ matrix.target }}"
           mkdir -p "${ARCHIVE_NAME}"
           cp target/${{ matrix.target }}/release/fresh "${ARCHIVE_NAME}/"
-          cp README.md LICENSE CHANGELOG.md "${ARCHIVE_NAME}/" 2>/dev/null || true
-          cp -r plugins "${ARCHIVE_NAME}/" 2>/dev/null || true
+          cp README.md LICENSE CHANGELOG.md "${ARCHIVE_NAME}/"
+          cp -r plugins "${ARCHIVE_NAME}/"
+          cp -r themes "${ARCHIVE_NAME}/"
 
           if [ "${{ matrix.archive_ext }}" = "tar.xz" ]; then
             tar -cJvf "${ARCHIVE_NAME}.tar.xz" "${ARCHIVE_NAME}"
@@ -159,8 +169,9 @@ jobs:
           $ARCHIVE_NAME = "fresh-editor-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $ARCHIVE_NAME -Force
           Copy-Item "target/${{ matrix.target }}/release/fresh.exe" "$ARCHIVE_NAME/"
-          Copy-Item "README.md", "LICENSE", "CHANGELOG.md" "$ARCHIVE_NAME/" -ErrorAction SilentlyContinue
-          Copy-Item -Recurse "plugins" "$ARCHIVE_NAME/" -ErrorAction SilentlyContinue
+          Copy-Item "README.md", "LICENSE", "CHANGELOG.md" "$ARCHIVE_NAME/"
+          Copy-Item -Recurse "plugins" "$ARCHIVE_NAME/"
+          Copy-Item -Recurse "themes" "$ARCHIVE_NAME/"
 
           Compress-Archive -Path "$ARCHIVE_NAME/*" -DestinationPath "$ARCHIVE_NAME.zip"
           $hash = (Get-FileHash "$ARCHIVE_NAME.zip" -Algorithm SHA256).Hash.ToLower()
@@ -233,172 +244,20 @@ jobs:
 
       - name: Create npm package
         run: |
-          mkdir -p npm-package
+          # Copy JS files from npm-package template
+          mkdir -p dist-npm
+          cp npm-package/*.js dist-npm/
 
-          # Create package.json
-          cat > npm-package/package.json << 'PKGJSON'
-          {
-            "name": "@fresh-editor/fresh-editor",
-            "version": "${{ needs.plan.outputs.version }}",
-            "description": "A modern terminal-based text editor with plugin support",
-            "repository": {
-              "type": "git",
-              "url": "https://github.com/sinelaw/fresh.git"
-            },
-            "license": "Apache-2.0",
-            "bin": {
-              "fresh": "run-fresh.js"
-            },
-            "scripts": {
-              "postinstall": "node install.js"
-            },
-            "files": [
-              "binary.js",
-              "binary-install.js",
-              "install.js",
-              "run-fresh.js",
-              "plugins/**/*",
-              "README.md",
-              "LICENSE",
-              "CHANGELOG.md"
-            ],
-            "os": ["darwin", "linux", "win32"],
-            "cpu": ["x64", "arm64"],
-            "keywords": ["editor", "terminal", "cli", "text-editor", "vim"],
-            "engines": {
-              "node": ">=18"
-            }
-          }
-          PKGJSON
-
-          # Fix version in package.json
-          sed -i "s/\${{ needs.plan.outputs.version }}/${VERSION}/g" npm-package/package.json
-
-          # Create binary.js - platform detection and download
-          cat > npm-package/binary.js << 'BINARYJS'
-          const os = require('os');
-          const path = require('path');
-
-          function getBinaryInfo() {
-            const platform = os.platform();
-            const arch = os.arch();
-
-            const targets = {
-              'darwin-x64': { target: 'x86_64-apple-darwin', ext: 'tar.xz' },
-              'darwin-arm64': { target: 'aarch64-apple-darwin', ext: 'tar.xz' },
-              'linux-x64': { target: 'x86_64-unknown-linux-gnu', ext: 'tar.xz' },
-              'linux-arm64': { target: 'aarch64-unknown-linux-gnu', ext: 'tar.xz' },
-              'win32-x64': { target: 'x86_64-pc-windows-msvc', ext: 'zip' }
-            };
-
-            const key = `${platform}-${arch}`;
-            const info = targets[key];
-
-            if (!info) {
-              throw new Error(`Unsupported platform: ${platform}-${arch}`);
-            }
-
-            return {
-              ...info,
-              binaryName: platform === 'win32' ? 'fresh.exe' : 'fresh'
-            };
-          }
-
-          module.exports = { getBinaryInfo };
-          BINARYJS
-
-          # Create binary-install.js - download and extract logic
-          cat > npm-package/binary-install.js << 'INSTALLJS'
-          const https = require('https');
-          const fs = require('fs');
-          const path = require('path');
-          const { execSync } = require('child_process');
-          const { getBinaryInfo } = require('./binary');
-
-          const VERSION = require('./package.json').version;
-          const REPO = 'sinelaw/fresh';
-
-          function download(url, dest) {
-            return new Promise((resolve, reject) => {
-              const file = fs.createWriteStream(dest);
-              https.get(url, (response) => {
-                if (response.statusCode === 302 || response.statusCode === 301) {
-                  download(response.headers.location, dest).then(resolve).catch(reject);
-                  return;
-                }
-                if (response.statusCode !== 200) {
-                  reject(new Error(`Failed to download: ${response.statusCode}`));
-                  return;
-                }
-                response.pipe(file);
-                file.on('finish', () => { file.close(); resolve(); });
-              }).on('error', reject);
-            });
-          }
-
-          async function install() {
-            const info = getBinaryInfo();
-            const archiveName = `fresh-editor-${info.target}.${info.ext}`;
-            const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${archiveName}`;
-            const archivePath = path.join(__dirname, archiveName);
-            const binDir = path.join(__dirname, 'bin');
-
-            console.log(`Downloading ${url}...`);
-            await download(url, archivePath);
-
-            fs.mkdirSync(binDir, { recursive: true });
-
-            if (info.ext === 'tar.xz') {
-              execSync(`tar -xJf "${archivePath}" -C "${binDir}" --strip-components=1`, { stdio: 'inherit' });
-            } else if (info.ext === 'zip') {
-              if (process.platform === 'win32') {
-                execSync(`powershell -Command "Expand-Archive -Path '${archivePath}' -DestinationPath '${binDir}' -Force"`, { stdio: 'inherit' });
-                // Move files from nested directory
-                const nested = path.join(binDir, `fresh-editor-${info.target}`);
-                if (fs.existsSync(nested)) {
-                  fs.readdirSync(nested).forEach(f => {
-                    fs.renameSync(path.join(nested, f), path.join(binDir, f));
-                  });
-                  fs.rmdirSync(nested);
-                }
-              } else {
-                execSync(`unzip -o "${archivePath}" -d "${binDir}"`, { stdio: 'inherit' });
-              }
-            }
-
-            fs.unlinkSync(archivePath);
-            console.log('fresh-editor installed successfully!');
-          }
-
-          module.exports = { install };
-          INSTALLJS
-
-          # Create install.js
-          cat > npm-package/install.js << 'POSTINSTALL'
-          const { install } = require('./binary-install');
-          install().catch(err => { console.error(err); process.exit(1); });
-          POSTINSTALL
-
-          # Create run-fresh.js
-          cat > npm-package/run-fresh.js << 'RUNJS'
-          #!/usr/bin/env node
-          const { spawn } = require('child_process');
-          const path = require('path');
-          const { getBinaryInfo } = require('./binary');
-
-          const info = getBinaryInfo();
-          const binPath = path.join(__dirname, 'bin', info.binaryName);
-
-          const child = spawn(binPath, process.argv.slice(2), { stdio: 'inherit' });
-          child.on('exit', (code) => process.exit(code || 0));
-          RUNJS
+          # Create package.json from template with version
+          sed "s/VERSION_PLACEHOLDER/${VERSION}/g" npm-package/package.json.template > dist-npm/package.json
 
           # Copy supporting files
-          cp README.md LICENSE CHANGELOG.md npm-package/ 2>/dev/null || true
-          cp -r plugins npm-package/ 2>/dev/null || true
+          cp README.md LICENSE CHANGELOG.md dist-npm/
+          cp -r plugins dist-npm/
+          cp -r themes dist-npm/
 
           # Create the tarball
-          cd npm-package
+          cd dist-npm
           npm pack
           mv *.tgz ../fresh-editor-npm-package.tar.gz
           cd ..
@@ -466,6 +325,7 @@ jobs:
             def install
               bin.install "fresh"
               share.install "plugins" if File.directory?("plugins")
+              share.install "themes" if File.directory?("themes")
             end
 
             test do
@@ -620,169 +480,20 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          mkdir -p npm-package
+          # Copy JS files from npm-package template
+          mkdir -p dist-npm
+          cp npm-package/*.js dist-npm/
 
-          # Create package.json
-          cat > npm-package/package.json << PKGJSON
-          {
-            "name": "@fresh-editor/fresh-editor",
-            "version": "${VERSION}",
-            "description": "A modern terminal-based text editor with plugin support",
-            "repository": {
-              "type": "git",
-              "url": "https://github.com/sinelaw/fresh.git"
-            },
-            "license": "Apache-2.0",
-            "bin": {
-              "fresh": "run-fresh.js"
-            },
-            "scripts": {
-              "postinstall": "node install.js"
-            },
-            "files": [
-              "binary.js",
-              "binary-install.js",
-              "install.js",
-              "run-fresh.js",
-              "plugins/**/*",
-              "README.md",
-              "LICENSE",
-              "CHANGELOG.md"
-            ],
-            "os": ["darwin", "linux", "win32"],
-            "cpu": ["x64", "arm64"],
-            "keywords": ["editor", "terminal", "cli", "text-editor", "vim"],
-            "engines": {
-              "node": ">=18"
-            }
-          }
-          PKGJSON
-
-          # Create binary.js - platform detection and download
-          cat > npm-package/binary.js << 'BINARYJS'
-          const os = require('os');
-          const path = require('path');
-
-          function getBinaryInfo() {
-            const platform = os.platform();
-            const arch = os.arch();
-
-            const targets = {
-              'darwin-x64': { target: 'x86_64-apple-darwin', ext: 'tar.xz' },
-              'darwin-arm64': { target: 'aarch64-apple-darwin', ext: 'tar.xz' },
-              'linux-x64': { target: 'x86_64-unknown-linux-gnu', ext: 'tar.xz' },
-              'linux-arm64': { target: 'aarch64-unknown-linux-gnu', ext: 'tar.xz' },
-              'win32-x64': { target: 'x86_64-pc-windows-msvc', ext: 'zip' }
-            };
-
-            const key = `${platform}-${arch}`;
-            const info = targets[key];
-
-            if (!info) {
-              throw new Error(`Unsupported platform: ${platform}-${arch}`);
-            }
-
-            return {
-              ...info,
-              binaryName: platform === 'win32' ? 'fresh.exe' : 'fresh'
-            };
-          }
-
-          module.exports = { getBinaryInfo };
-          BINARYJS
-
-          # Create binary-install.js - download and extract logic
-          cat > npm-package/binary-install.js << 'INSTALLJS'
-          const https = require('https');
-          const fs = require('fs');
-          const path = require('path');
-          const { execSync } = require('child_process');
-          const { getBinaryInfo } = require('./binary');
-
-          const VERSION = require('./package.json').version;
-          const REPO = 'sinelaw/fresh';
-
-          function download(url, dest) {
-            return new Promise((resolve, reject) => {
-              const file = fs.createWriteStream(dest);
-              https.get(url, (response) => {
-                if (response.statusCode === 302 || response.statusCode === 301) {
-                  download(response.headers.location, dest).then(resolve).catch(reject);
-                  return;
-                }
-                if (response.statusCode !== 200) {
-                  reject(new Error(`Failed to download: ${response.statusCode}`));
-                  return;
-                }
-                response.pipe(file);
-                file.on('finish', () => { file.close(); resolve(); });
-              }).on('error', reject);
-            });
-          }
-
-          async function install() {
-            const info = getBinaryInfo();
-            const archiveName = `fresh-editor-${info.target}.${info.ext}`;
-            const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${archiveName}`;
-            const archivePath = path.join(__dirname, archiveName);
-            const binDir = path.join(__dirname, 'bin');
-
-            console.log(`Downloading ${url}...`);
-            await download(url, archivePath);
-
-            fs.mkdirSync(binDir, { recursive: true });
-
-            if (info.ext === 'tar.xz') {
-              execSync(`tar -xJf "${archivePath}" -C "${binDir}" --strip-components=1`, { stdio: 'inherit' });
-            } else if (info.ext === 'zip') {
-              if (process.platform === 'win32') {
-                execSync(`powershell -Command "Expand-Archive -Path '${archivePath}' -DestinationPath '${binDir}' -Force"`, { stdio: 'inherit' });
-                // Move files from nested directory
-                const nested = path.join(binDir, `fresh-editor-${info.target}`);
-                if (fs.existsSync(nested)) {
-                  fs.readdirSync(nested).forEach(f => {
-                    fs.renameSync(path.join(nested, f), path.join(binDir, f));
-                  });
-                  fs.rmdirSync(nested);
-                }
-              } else {
-                execSync(`unzip -o "${archivePath}" -d "${binDir}"`, { stdio: 'inherit' });
-              }
-            }
-
-            fs.unlinkSync(archivePath);
-            console.log('fresh-editor installed successfully!');
-          }
-
-          module.exports = { install };
-          INSTALLJS
-
-          # Create install.js
-          cat > npm-package/install.js << 'POSTINSTALL'
-          const { install } = require('./binary-install');
-          install().catch(err => { console.error(err); process.exit(1); });
-          POSTINSTALL
-
-          # Create run-fresh.js
-          cat > npm-package/run-fresh.js << 'RUNJS'
-          #!/usr/bin/env node
-          const { spawn } = require('child_process');
-          const path = require('path');
-          const { getBinaryInfo } = require('./binary');
-
-          const info = getBinaryInfo();
-          const binPath = path.join(__dirname, 'bin', info.binaryName);
-
-          const child = spawn(binPath, process.argv.slice(2), { stdio: 'inherit' });
-          child.on('exit', (code) => process.exit(code || 0));
-          RUNJS
+          # Create package.json from template with version
+          sed "s/VERSION_PLACEHOLDER/${VERSION}/g" npm-package/package.json.template > dist-npm/package.json
 
           # Copy supporting files
-          cp README.md LICENSE CHANGELOG.md npm-package/ 2>/dev/null || true
-          cp -r plugins npm-package/ 2>/dev/null || true
+          cp README.md LICENSE CHANGELOG.md dist-npm/
+          cp -r plugins dist-npm/
+          cp -r themes dist-npm/
 
           # Create the tarball
-          cd npm-package
+          cd dist-npm
           npm pack
           mv *.tgz ../fresh-editor-npm-package.tar.gz
           cd ..

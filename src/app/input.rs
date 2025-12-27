@@ -247,6 +247,11 @@ impl Editor {
             Action::ToggleAutoRevert => {
                 self.toggle_auto_revert();
             }
+            Action::FormatBuffer => {
+                if let Err(e) = self.format_buffer() {
+                    self.set_status_message(format!("Format failed: {}", e));
+                }
+            }
             Action::Copy => self.copy_selection(),
             Action::CopyWithTheme(theme) => self.copy_selection_with_theme(&theme),
             Action::Cut => {
@@ -478,6 +483,7 @@ impl Editor {
             Action::DecreaseSplitSize => self.adjust_split_size(-0.05),
             Action::ToggleMaximizeSplit => self.toggle_maximize_split(),
             Action::ToggleFileExplorer => self.toggle_file_explorer(),
+            Action::ToggleMenuBar => self.toggle_menu_bar(),
             Action::ToggleLineNumbers => self.toggle_line_numbers(),
             Action::ToggleMouseCapture => self.toggle_mouse_capture(),
             Action::ToggleMouseHover => self.toggle_mouse_hover(),
@@ -610,12 +616,6 @@ impl Editor {
 
             Action::SmartHome => {
                 self.smart_home();
-            }
-            Action::IndentSelection => {
-                self.indent_selection();
-            }
-            Action::DedentSelection => {
-                self.dedent_selection();
             }
             Action::ToggleComment => {
                 self.toggle_comment();
@@ -865,6 +865,14 @@ impl Editor {
                         self.send_terminal_input(text.as_bytes());
                     }
                 }
+            }
+            Action::ShellCommand => {
+                // Run shell command on buffer/selection, output to new buffer
+                self.start_shell_command_prompt(false);
+            }
+            Action::ShellCommandReplace => {
+                // Run shell command on buffer/selection, replace content
+                self.start_shell_command_prompt(true);
             }
             Action::OpenSettings => {
                 self.open_settings();
@@ -2148,7 +2156,6 @@ impl Editor {
                 | Action::DeleteWordBackward
                 | Action::DeleteWordForward
                 | Action::DeleteLine
-                | Action::IndentSelection
                 | Action::DedentSelection
                 | Action::ToggleComment
         );

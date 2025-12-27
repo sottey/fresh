@@ -166,59 +166,53 @@ TODO FIXME HACK NOTE XXX BUG (not in comments)
     // Type "TODO Highlighter: Enable" command
     harness.type_text("TODO Highlighter: Enable").unwrap();
 
+    // Wait for command to appear in palette before executing
+    harness
+        .wait_until(|h| h.screen_to_string().contains("TODO Highlighter: Enable"))
+        .unwrap();
+
     // Execute the command
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
 
-    // Need multiple async processing cycles for plugin to:
+    // Wait for plugin to apply highlighting to at least one TODO keyword
+    // The plugin needs to:
     // 1. Process the RefreshLines command from the channel
     // 2. Clear seen_lines and set plugin_render_requested
     // 3. Re-render to trigger lines_changed hook
     // 4. Process addOverlay commands from the hook
-    harness.process_async_and_render().unwrap();
-    harness.process_async_and_render().unwrap();
-    harness.process_async_and_render().unwrap();
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            let lines: Vec<&str> = screen.lines().collect();
 
-    // Now check that highlights are actually rendered
-    // The TODO keyword should have a background color applied
-    // Let's find the position of "TODO" in the first comment and check its style
-
-    let screen = harness.screen_to_string();
-    println!("Screen after enabling TODO highlighter:\n{}", screen);
-
-    // Find the position of "TODO" on screen
-    let lines: Vec<&str> = screen.lines().collect();
-    let mut found_highlighted_todo = false;
-
-    for (y, line) in lines.iter().enumerate() {
-        if let Some(x) = line.find("TODO") {
-            // Check if this TODO is in a comment (should have "//" before it)
-            if line[..x].contains("//") {
-                // Check the style of the 'T' in "TODO"
-                if let Some(style) = harness.get_cell_style(x as u16, y as u16) {
-                    // Check if foreground color is an actual RGB color (overlays set foreground, not background)
-                    // TODO keywords should be yellow (255, 200, 50)
-                    if let Some(fg) = style.fg {
-                        println!(
-                            "Found TODO at ({}, {}) with foreground color: {:?}",
-                            x, y, fg
-                        );
-                        // Only count as highlighted if it's an actual RGB color
-                        if matches!(fg, ratatui::style::Color::Rgb(_, _, _)) {
-                            found_highlighted_todo = true;
-                            break;
+            // Find the position of "TODO" on screen and check if it's highlighted
+            for (y, line) in lines.iter().enumerate() {
+                if let Some(x) = line.find("TODO") {
+                    // Check if this TODO is in a comment (should have "//" before it)
+                    if line[..x].contains("//") {
+                        // Check the style of the 'T' in "TODO"
+                        if let Some(style) = h.get_cell_style(x as u16, y as u16) {
+                            // Check if foreground color is an actual RGB color (overlays set foreground, not background)
+                            // TODO keywords should be yellow (255, 200, 50)
+                            if let Some(fg) = style.fg {
+                                // Only count as highlighted if it's an actual RGB color
+                                if matches!(fg, ratatui::style::Color::Rgb(_, _, _)) {
+                                    return true;
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
-    }
+            false
+        })
+        .expect("Expected to find at least one highlighted TODO keyword");
 
-    assert!(
-        found_highlighted_todo,
-        "Expected to find at least one highlighted TODO keyword"
-    );
+    // Print screen for debugging
+    let screen = harness.screen_to_string();
+    println!("Screen after enabling TODO highlighter:\n{}", screen);
 }
 
 /// Test TODO Highlighter disable command
@@ -257,6 +251,9 @@ fn test_todo_highlighter_disable() {
         .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
         .unwrap();
     harness.type_text("TODO Highlighter: Enable").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("TODO Highlighter: Enable"))
+        .unwrap();
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
@@ -416,6 +413,9 @@ fn test_todo_highlighter_updates_on_edit() {
         .unwrap();
     harness.type_text("TODO Highlighter: Enable").unwrap();
     harness
+        .wait_until(|h| h.screen_to_string().contains("TODO Highlighter: Enable"))
+        .unwrap();
+    harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
     harness.render().unwrap();
@@ -550,6 +550,9 @@ fn test_todo_highlighter_updates_on_delete() {
         .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
         .unwrap();
     harness.type_text("TODO Highlighter: Enable").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("TODO Highlighter: Enable"))
+        .unwrap();
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
@@ -1189,6 +1192,9 @@ fn test_todo_highlighter_cursor_perf() {
         .unwrap();
     harness.type_text("TODO Highlighter: Enable").unwrap();
     harness
+        .wait_until(|h| h.screen_to_string().contains("TODO Highlighter: Enable"))
+        .unwrap();
+    harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
     harness.render().unwrap();
@@ -1295,6 +1301,11 @@ Color::Rgb(128, 0, 255)
     // Type "Color Highlighter: Enable" command
     harness.type_text("Color Highlighter: Enable").unwrap();
 
+    // Wait for command to appear in palette before executing
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Color Highlighter: Enable"))
+        .unwrap();
+
     // Execute the command
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
@@ -1399,6 +1410,9 @@ fn test_color_highlighter_disable() {
         .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
         .unwrap();
     harness.type_text("Color Highlighter: Enable").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Color Highlighter: Enable"))
+        .unwrap();
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();

@@ -574,7 +574,9 @@ fn test_cursor_position_preserved_after_section_toggle() {
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
-    harness.render().unwrap();
+
+    // Process async operations and render to ensure key is handled
+    harness.process_async_and_render().unwrap();
 
     let (_, cursor_y_after) = harness.screen_cursor_position();
 
@@ -1080,13 +1082,14 @@ fn test_cursor_x_position_preserved_after_section_toggle() {
         .unwrap();
 
     // Navigate down to find "UI Elements" section header (collapsed by default)
-    let mut found_ui_elements = false;
-    for i in 0..30 {
+    // Keep pressing Down until cursor is on the UI Elements line
+    loop {
         harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
         harness.render().unwrap();
         let screen = harness.screen_to_string();
         let (cx, cy) = harness.screen_cursor_position();
-        eprintln!("After down {}: cursor at ({}, {})", i, cx, cy);
+        eprintln!("Navigating down: cursor at ({}, {})", cx, cy);
+
         if screen.contains("> UI Elements") {
             // Check if we're actually on that line
             let lines: Vec<&str> = screen.lines().collect();
@@ -1094,17 +1097,11 @@ fn test_cursor_x_position_preserved_after_section_toggle() {
                 let cursor_line = lines[cy as usize];
                 eprintln!("Cursor line: {}", cursor_line);
                 if cursor_line.contains("> UI Elements") {
-                    found_ui_elements = true;
                     break;
                 }
             }
         }
     }
-
-    assert!(
-        found_ui_elements,
-        "Should find and navigate to UI Elements section"
-    );
 
     // Render and get cursor position before toggle
     harness.render().unwrap();
@@ -1120,7 +1117,9 @@ fn test_cursor_x_position_preserved_after_section_toggle() {
 
     // Press Tab to toggle the section (expand)
     harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
-    harness.render().unwrap();
+
+    // Process async operations and render to ensure key is handled
+    harness.process_async_and_render().unwrap();
 
     let screen_after = harness.screen_to_string();
     let (cursor_x_after, cursor_y_after) = harness.screen_cursor_position();
